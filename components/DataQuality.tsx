@@ -1,87 +1,53 @@
 'use client';
 
-import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { FaExclamationTriangle, FaCheckCircle, FaTimesCircle, FaPlus } from 'react-icons/fa';
+import { FaExclamationTriangle, FaCheckCircle, FaPlus } from 'react-icons/fa';
 
 export default function DataQuality() {
-  const [humanInLoop, setHumanInLoop] = useState<'approve' | 'reject' | null>(null);
-
   return (
     <motion.div
       className="space-y-4"
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.3, delay: 0.1 }}
+      transition={{ duration: 0.4, delay: 0.1, ease: 'easeOut' }}
     >
-      <h3 className="text-sm font-semibold text-slate-700 uppercase tracking-wide mb-3">
+      <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-black/55">
         Data Quality & Validation
       </h3>
 
-      {/* Action Buttons */}
       <div className="space-y-2">
         <motion.button
           whileHover={{ scale: 1.02 }}
           whileTap={{ scale: 0.98 }}
-          className="w-full flex items-center gap-3 px-3 py-2.5 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 hover:border-orange-300 transition-all"
+          className="flex w-full items-center gap-3 rounded-xl border border-black/10 bg-white/85 px-3 py-2.5 text-sm font-medium text-zinc-900 transition-all hover:border-[#0070AD]/25 hover:bg-white"
         >
-          <FaExclamationTriangle className="text-orange-500" />
+          <motion.span whileHover={{ scale: 1.12, rotate: 5 }}>
+            <FaExclamationTriangle className="text-amber-400" />
+          </motion.span>
           View Anomalies
         </motion.button>
 
         <motion.button
           whileHover={{ scale: 1.02 }}
           whileTap={{ scale: 0.98 }}
-          className="w-full flex items-center gap-3 px-3 py-2.5 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 hover:border-green-300 transition-all"
+          className="flex w-full items-center gap-3 rounded-xl border border-black/10 bg-white/85 px-3 py-2.5 text-sm font-medium text-zinc-900 transition-all hover:border-[#0070AD]/25 hover:bg-white"
         >
-          <FaCheckCircle className="text-green-600" />
+          <motion.span whileHover={{ scale: 1.12, rotate: 5 }}>
+            <FaCheckCircle className="text-[#0070AD]" />
+          </motion.span>
           Apply Validation Rules
         </motion.button>
 
         <motion.button
           whileHover={{ scale: 1.02 }}
           whileTap={{ scale: 0.98 }}
-          className="w-full flex items-center gap-3 px-3 py-2.5 text-sm font-medium text-white bg-gradient-to-r from-green-600 to-teal-600 rounded-lg hover:shadow-md transition-all"
+          className="flex w-full items-center gap-3 rounded-xl border border-[#0070AD]/40 bg-[#0070AD]/15 px-3 py-2.5 text-sm font-semibold text-[#0070AD] transition-all hover:bg-[#0070AD]/20"
         >
-          <FaPlus />
+          <motion.span whileHover={{ scale: 1.12, rotate: 5 }}>
+            <FaPlus />
+          </motion.span>
           Add Custom Rule
         </motion.button>
-      </div>
-
-      {/* Human-in-the-Loop Toggle */}
-      <div className="mt-4 p-3 bg-slate-50 rounded-lg border border-slate-200">
-        <label className="block text-xs font-medium text-slate-600 mb-3">
-          Human-in-the-Loop
-        </label>
-        <div className="flex gap-2">
-          <motion.button
-            whileHover={{ scale: 1.05 }}
-            whileTap={{ scale: 0.95 }}
-            onClick={() => setHumanInLoop(humanInLoop === 'approve' ? null : 'approve')}
-            className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium rounded-lg transition-all ${
-              humanInLoop === 'approve'
-                ? 'bg-green-600 text-white shadow-md'
-                : 'bg-white text-slate-700 border border-slate-300 hover:border-green-500'
-            }`}
-          >
-            <FaCheckCircle />
-            Approve
-          </motion.button>
-
-          <motion.button
-            whileHover={{ scale: 1.05 }}
-            whileTap={{ scale: 0.95 }}
-            onClick={() => setHumanInLoop(humanInLoop === 'reject' ? null : 'reject')}
-            className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium rounded-lg transition-all ${
-              humanInLoop === 'reject'
-                ? 'bg-red-600 text-white shadow-md'
-                : 'bg-white text-slate-700 border border-slate-300 hover:border-red-500'
-            }`}
-          >
-            <FaTimesCircle />
-            Reject
-          </motion.button>
-        </div>
       </div>
     </motion.div>
   );

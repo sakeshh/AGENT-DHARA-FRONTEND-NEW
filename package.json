@@ -1,5 +1,5 @@
 {
-  "name": "fluxo-ai",
+  "name": "agentdhara",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@azure/identity": "^4.2.1",
     "framer-motion": "^11.0.0",
     "next": "^14.2.0",
     "react": "^18.3.1",
@@ -25,6 +26,7 @@
     "eslint": "^8.57.0",
     "eslint-config-next": "^14.2.0",
     "postcss": "^8.4.38",
+    "simple-icons": "^16.10.0",
     "tailwindcss": "^3.4.3"
   }
 }

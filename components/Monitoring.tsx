@@ -5,9 +5,9 @@ import { FaCheckCircle, FaExclamationTriangle, FaTachometerAlt, FaClock } from '
 
 export default function Monitoring() {
   const performanceMetrics = [
-    { label: 'Throughput', value: '1.2K/s', icon: FaTachometerAlt, color: 'text-blue-600' },
-    { label: 'Latency', value: '45ms', icon: FaClock, color: 'text-purple-600' },
-    { label: 'Success Rate', value: '99.8%', icon: FaCheckCircle, color: 'text-green-600' },
+    { label: 'Throughput', value: '1.2K/s', icon: FaTachometerAlt, color: 'text-[#12ABDB]/80' },
+    { label: 'Latency', value: '45ms', icon: FaClock, color: 'text-white/50' },
+    { label: 'Success Rate', value: '99.8%', icon: FaCheckCircle, color: 'text-[#0070AD]' },
   ];
 
   const alerts = [
@@ -26,109 +26,111 @@ export default function Monitoring() {
       className="space-y-4"
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.3, delay: 0.4 }}
+      transition={{ duration: 0.4, delay: 0.3, ease: 'easeOut' }}
     >
-      <h3 className="text-sm font-semibold text-slate-700 uppercase tracking-wide mb-3">
+      <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-black/55">
         Monitoring & Optimization
       </h3>
 
-      {/* Pipeline Health */}
-      <div className="p-3 bg-gradient-to-r from-green-50 to-teal-50 rounded-lg border border-green-200">
-        <div className="flex items-center gap-2 mb-1">
-          <FaCheckCircle className="text-green-600" />
-          <span className="text-xs font-semibold text-green-700">Pipeline Health</span>
+      <motion.div
+        initial={{ opacity: 0, x: -10 }}
+        animate={{ opacity: 1, x: 0 }}
+        transition={{ delay: 0.2 }}
+        className="rounded-xl border border-[#0070AD]/30 bg-[#0070AD]/10 p-3"
+      >
+        <div className="mb-1 flex items-center gap-2">
+          <FaCheckCircle className="text-[#0070AD]" />
+          <span className="text-xs font-semibold text-[#0070AD]">Pipeline Health</span>
         </div>
-        <p className="text-lg font-bold text-green-800">Healthy</p>
-      </div>
+        <p className="text-lg font-bold text-[#0070AD]">Healthy</p>
+      </motion.div>
 
-      {/* Performance Metrics */}
       <div>
-        <label className="block text-xs font-medium text-slate-600 mb-2">
-          Performance Metrics
-        </label>
+        <label className="mb-2 block text-xs font-medium text-black/55">Performance Metrics</label>
         <div className="space-y-2">
-          {performanceMetrics.map((metric) => {
+          {performanceMetrics.map((metric, i) => {
             const Icon = metric.icon;
             return (
-              <div
+              <motion.div
                 key={metric.label}
-                className="flex items-center justify-between p-2 bg-white rounded-lg border border-slate-200"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.1 * i }}
+                className="flex items-center justify-between rounded-xl border border-black/10 bg-white/85 p-2"
               >
                 <div className="flex items-center gap-2">
                   <Icon className={`${metric.color} text-sm`} />
-                  <span className="text-xs font-medium text-slate-700">{metric.label}</span>
+                  <span className="text-xs font-medium text-black/70">{metric.label}</span>
                 </div>
-                <span className="text-xs font-bold text-slate-900">{metric.value}</span>
-              </div>
+                <span className="text-xs font-bold text-zinc-900">{metric.value}</span>
+              </motion.div>
             );
           })}
         </div>
       </div>
 
-      {/* Alerts Section */}
       <div>
-        <label className="block text-xs font-medium text-slate-600 mb-2">
-          Recent Alerts
-        </label>
-        <div className="space-y-2 max-h-32 overflow-y-auto">
-          {alerts.map((alert) => (
-            <div
+        <label className="mb-2 block text-xs font-medium text-black/55">Recent Alerts</label>
+        <div className="max-h-32 space-y-2 overflow-y-auto">
+          {alerts.map((alert, i) => (
+            <motion.div
               key={alert.id}
-              className={`p-2 rounded-lg border text-xs ${
+              initial={{ opacity: 0, x: -10 }}
+              animate={{ opacity: 1, x: 0 }}
+              transition={{ delay: 0.05 * i }}
+              className={`rounded-xl border p-2 text-xs ${
                 alert.type === 'warning'
-                  ? 'bg-orange-50 border-orange-200'
-                  : 'bg-blue-50 border-blue-200'
+                  ? 'border-amber-400/40 bg-amber-500/10'
+                  : 'border-black/10 bg-white/85'
               }`}
             >
               <div className="flex items-start gap-2">
                 {alert.type === 'warning' ? (
-                  <FaExclamationTriangle className="text-orange-600 mt-0.5 flex-shrink-0" />
+                  <FaExclamationTriangle className="mt-0.5 flex-shrink-0 text-amber-400" />
                 ) : (
-                  <FaCheckCircle className="text-blue-600 mt-0.5 flex-shrink-0" />
+                  <FaCheckCircle className="mt-0.5 flex-shrink-0 text-black/45" />
                 )}
-                <div className="flex-1 min-w-0">
-                  <p className="font-medium text-slate-700 truncate">{alert.message}</p>
-                  <p className="text-slate-500 text-[10px]">{alert.time}</p>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-medium text-zinc-900">{alert.message}</p>
+                  <p className="text-[10px] text-black/45">{alert.time}</p>
                 </div>
               </div>
-            </div>
+            </motion.div>
           ))}
         </div>
       </div>
 
-      {/* Historical Logs */}
       <div>
-        <label className="block text-xs font-medium text-slate-600 mb-2">
-          Historical Logs
-        </label>
-        <div className="bg-white rounded-lg border border-slate-200 overflow-hidden">
+        <label className="mb-2 block text-xs font-medium text-black/55">Historical Logs</label>
+        <div className="overflow-hidden rounded-xl border border-black/10 bg-white/85">
           <div className="max-h-40 overflow-y-auto">
             <table className="w-full text-xs">
-              <thead className="bg-slate-50 sticky top-0">
+              <thead className="sticky top-0 bg-white">
                 <tr>
-                  <th className="px-2 py-1.5 text-left font-semibold text-slate-600">Time</th>
-                  <th className="px-2 py-1.5 text-left font-semibold text-slate-600">Status</th>
-                  <th className="px-2 py-1.5 text-left font-semibold text-slate-600">Message</th>
+                  <th className="px-2 py-1.5 text-left font-semibold text-black/55">Time</th>
+                  <th className="px-2 py-1.5 text-left font-semibold text-black/55">Status</th>
+                  <th className="px-2 py-1.5 text-left font-semibold text-black/55">Message</th>
                 </tr>
               </thead>
               <tbody>
                 {logs.map((log) => (
-                  <tr key={log.id} className="border-t border-slate-100 hover:bg-slate-50">
-                    <td className="px-2 py-1.5 text-slate-600 whitespace-nowrap">
-                      {log.timestamp}
-                    </td>
+                  <tr
+                    key={log.id}
+                    className="border-t border-black/10 transition-colors hover:bg-black/5"
+                  >
+                    <td className="whitespace-nowrap px-2 py-1.5 text-black/55">{log.timestamp}</td>
                     <td className="px-2 py-1.5">
                       <span
-                        className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-medium ${
+                        className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-medium ${
                           log.status === 'success'
-                            ? 'bg-green-100 text-green-700'
-                            : 'bg-blue-100 text-blue-700'
+                            ? 'bg-[#0070AD]/10 text-[#0070AD]'
+                            : 'bg-black/5 text-black/55'
                         }`}
                       >
                         {log.status}
                       </span>
                     </td>
-                    <td className="px-2 py-1.5 text-slate-700">{log.message}</td>
+                    <td className="px-2 py-1.5 text-black/80">{log.message}</td>
                   </tr>
                 ))}
               </tbody>

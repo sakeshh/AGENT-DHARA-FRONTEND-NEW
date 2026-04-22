@@ -1,4 +1,66 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+## AgentDhara (Launch-ready)
+
+This repo contains:
+- **Frontend**: Next.js app (chat UI)
+- **Backend**: FastAPI + LangGraph + MCP adapters (`Agent Dhara Backend`)
+
+### Production requirements (no compromises)
+
+#### Secrets & auth (required)
+- Rotate any leaked keys and update environment variables.
+- Set a strong shared secret for backend auth:
+  - Backend: `BACKEND_AUTH_TOKEN`
+  - Frontend: `BACKEND_AUTH_TOKEN` (same value)
+
+#### Start backend (FastAPI)
+From `Agent Dhara Backend/`:
+
+```bash
+python -m uvicorn agent.mcp_server:app --host 127.0.0.1 --port 8000
+```
+
+Health:
+- `GET /healthz`
+- `GET /readyz`
+
+#### Start frontend (Next.js)
+From repo root:
+
+```bash
+npm install
+npm run dev
+```
+
+Frontend proxies to backend when `BACKEND_BASE_URL` is set.
+
+#### CORS
+Set backend `CORS_ALLOW_ORIGINS` (comma-separated) to your deployed frontend origins, for example:
+
+```env
+CORS_ALLOW_ORIGINS=https://yourdomain.com
+```
+
+#### Rate limiting
+Set backend `RATE_LIMIT_PER_MINUTE` based on traffic.
+
+### Chat commands
+In `/chat`:
+- `show sources`
+- `list tables`
+- `select table dbo.YourTable`
+- `show schema`
+- `preview`
+- `what are the data quality issues?`
+
+Notes:
+- SQL execution is **SELECT-only**.
+- Preview/query rows are **PII-masked** by default.
+- Conversation memory is persisted in `Agent Dhara Backend/output/chat_sessions.sqlite3`.
+
+---
+
+## Next.js (reference)
+This frontend was originally bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started
 

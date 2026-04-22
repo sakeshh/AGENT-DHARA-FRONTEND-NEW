@@ -8,7 +8,7 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Fluxo AI - Intelligent Data Assessment, Quality & Transformation",
+  title: "AGENT DHARA - Intelligent Data Assessment, Quality & Transformation",
   description: "Modern SaaS platform for intelligent data transformation",
 };
 
@@ -18,8 +18,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
-      <body className={`${inter.variable} antialiased`}>
+    <html lang="en" className="h-full">
+      <body className={`${inter.variable} antialiased h-full min-h-dvh`}>
         {children}
       </body>
     </html>
