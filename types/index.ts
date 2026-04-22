@@ -3,6 +3,12 @@ export interface Message {
   text: string;
   sender: 'user' | 'bot';
   timestamp: Date;
+  options?: Array<{
+    id: string;
+    text: string;
+    /** The exact user text to send when clicked. */
+    send: string;
+  }>;
 }
 
 export interface TransformationStep {

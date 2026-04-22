@@ -40,47 +40,20 @@ const DATA_SOURCE_OPTIONS: ChatOption[] = [
 /* Options shown after selecting a data source — vary by source type */
 const CHAT_OPTIONS_BY_SOURCE: Record<string, ChatOption[]> = {
   sql: [
-    { id: 'sql-1', text: '📊 Start Data Pipeline Workflow', category: 'Pipeline', action: '/data-pipeline' },
-    { id: 'sql-2', text: '💾 Connect to Database', category: 'Database', action: 'connect' },
-    { id: 'sql-3', text: '🔍 Query & Analyze Data', category: 'Analysis', action: 'analyze' },
-    { id: 'sql-4', text: '📈 Generate Data Report', category: 'Reports', action: 'report' },
-    { id: 'sql-4b', text: '📄 View Report', category: 'Reports', action: 'view-report' },
-    { id: 'sql-5', text: '⚙️ ETL Code Generation', category: 'ETL', action: 'etl' },
-    { id: 'sql-6', text: '🔄 Transform Data', category: 'Transform', action: 'transform' },
-    { id: 'sql-7', text: '🎯 Data Validation', category: 'Validation', action: 'validate' },
-    { id: 'sql-8', text: '📤 Export Data', category: 'Export', action: 'export' },
-    { id: 'sql-9', text: '🔐 Data Security Check', category: 'Security', action: 'security' },
+    { id: 'sql-view', text: '👁️ View data in files/tables', category: 'Explore', action: 'guided-view' },
+    { id: 'sql-report', text: '📄 Extract report from files/tables', category: 'Reports', action: 'guided-report' },
   ],
   local: [
-    { id: 'local-1', text: '📊 Start Data Pipeline Workflow', category: 'Pipeline', action: '/data-pipeline' },
-    { id: 'local-2', text: '📁 Upload CSV / Excel / JSON', category: 'Files', action: 'upload' },
-    { id: 'local-2b', text: '📄 View Report', category: 'Reports', action: 'view-report' },
-    { id: 'local-3', text: '🔍 Analyze Data Quality', category: 'Analysis', action: 'analyze' },
-    { id: 'local-4', text: '🧹 Clean Duplicate Records', category: 'Cleaning', action: 'clean' },
-    { id: 'local-5', text: '📉 Remove Outliers', category: 'Cleaning', action: 'outliers' },
-    { id: 'local-6', text: '🔄 Transform Data', category: 'Transform', action: 'transform' },
-    { id: 'local-7', text: '🔗 Merge Datasets', category: 'Transform', action: 'merge' },
-    { id: 'local-8', text: '📤 Export Data', category: 'Export', action: 'export' },
-    { id: 'local-9', text: '📝 Create Custom Rule', category: 'Rules', action: 'rule' },
+    { id: 'local-view', text: '👁️ View data in files', category: 'Explore', action: 'guided-view' },
+    { id: 'local-report', text: '📄 Extract report from files', category: 'Reports', action: 'guided-report' },
   ],
   blob: [
-    { id: 'blob-1', text: '📊 Start Data Pipeline Workflow', category: 'Pipeline', action: '/data-pipeline' },
-    { id: 'blob-2', text: '☁️ Connect to Azure Blob / S3 / GCS', category: 'Storage', action: 'connect' },
-    { id: 'blob-2b', text: '📄 View Report', category: 'Reports', action: 'view-report' },
-    { id: 'blob-3', text: '📥 Sync Data from Blob', category: 'Import', action: 'sync' },
-    { id: 'blob-4', text: '🔍 Analyze Data Quality', category: 'Analysis', action: 'analyze' },
-    { id: 'blob-5', text: '⚙️ ETL Code Generation', category: 'ETL', action: 'etl' },
-    { id: 'blob-6', text: '🔄 Transform Data', category: 'Transform', action: 'transform' },
-    { id: 'blob-7', text: '📤 Export Data', category: 'Export', action: 'export' },
+    { id: 'blob-view', text: '👁️ View data in files', category: 'Explore', action: 'guided-view' },
+    { id: 'blob-report', text: '📄 Extract report from files', category: 'Reports', action: 'guided-report' },
   ],
   streams: [
-    { id: 'streams-1', text: '📊 Start Data Pipeline Workflow', category: 'Pipeline', action: '/data-pipeline' },
-    { id: 'streams-2', text: '⚡ Connect to Event Hubs / Kafka', category: 'Streaming', action: 'connect' },
-    { id: 'streams-2b', text: '📄 View Report', category: 'Reports', action: 'view-report' },
-    { id: 'streams-3', text: '📥 Ingest Streaming Data', category: 'Ingest', action: 'ingest' },
-    { id: 'streams-4', text: '📊 Real-time Dashboard', category: 'Dashboard', action: 'dashboard' },
-    { id: 'streams-5', text: '🎯 Data Validation', category: 'Validation', action: 'validate' },
-    { id: 'streams-6', text: '🔄 Transform Streams', category: 'Transform', action: 'transform' },
+    { id: 'streams-view', text: '👁️ View data in stream files', category: 'Explore', action: 'guided-view' },
+    { id: 'streams-report', text: '📄 Extract report from stream files', category: 'Reports', action: 'guided-report' },
   ],
   apis: [
     { id: 'apis-1', text: '📊 Start Data Pipeline Workflow', category: 'Pipeline', action: '/data-pipeline' },
@@ -122,6 +95,7 @@ export default function ChatWindow() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState<string>('');
   const [localFolderFiles, setLocalFolderFiles] = useState<File[]>([]);
+  const [guidedMode, setGuidedMode] = useState<'none' | 'view' | 'report'>('none');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -183,7 +157,9 @@ export default function ChatWindow() {
     }));
 
   /** Call our API route which invokes your Azure AI Foundry agent (threads + runs). */
-  const fetchAgentReply = async (msgs: Message[]): Promise<{ content: string; threadId: string | null }> => {
+  const fetchAgentReply = async (
+    msgs: Message[]
+  ): Promise<{ content: string; threadId: string | null; payload: any }> => {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -200,6 +176,7 @@ export default function ChatWindow() {
     const data = await res.json();
     const content = typeof data?.content === 'string' ? data.content : '';
     const threadId = data?.threadId ?? null;
+    const payload = data?.payload ?? null;
     if (!res.ok || !content.trim()) {
       const errText =
         typeof data?.error === 'string'
@@ -209,7 +186,7 @@ export default function ChatWindow() {
             : 'EMPTY_REPLY';
       throw new Error(errText);
     }
-    return { content, threadId };
+    return { content, threadId, payload };
   };
 
   const stopGeneration = () => {
@@ -325,6 +302,7 @@ export default function ChatWindow() {
     if (hasSelectedDataSource) {
       setHasSelectedDataSource(false);
       setSelectedDataSource(null);
+      setGuidedMode('none');
       const userMessage: Message = {
         id: Date.now().toString(),
         text: '← Back',
@@ -334,6 +312,66 @@ export default function ChatWindow() {
       setMessages((prev) => [...prev, userMessage]);
     }
     setShowOptions(false);
+  };
+
+  const sendUserText = async (text: string) => {
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      text,
+      sender: 'user',
+      timestamp: new Date(),
+    };
+    setMessages((prev) => [...prev, userMessage]);
+    setIsLoadingAgent(true);
+    setAgentError(null);
+    try {
+      const messagesWithUser = [...messages, userMessage];
+      const { content, threadId, payload } = await fetchAgentReply(messagesWithUser);
+      if (threadId) setAgentThreadId(threadId);
+
+      const interactiveOptions: Message['options'] = Array.isArray(payload?.tables)
+        ? payload.tables.slice(0, 12).map((t: any, i: number) => ({
+            id: `table-${i}`,
+            text: String(t?.name ?? t ?? `Table ${i + 1}`),
+            send: `select table ${Number(t?.index ?? i) + 1}`,
+          }))
+        : Array.isArray(payload?.files)
+          ? [
+              ...payload.files.slice(0, 12).map((f: any, i: number) => ({
+                id: `file-${i}`,
+                text: String(f),
+                send:
+                  selectedDataSource === 'blob'
+                    ? `select files ${i + 1}`
+                    : selectedDataSource === 'streams'
+                      ? `select local files ${i + 1}`
+                      : `select local files ${i + 1}`,
+              })),
+              ...(payload.files.length > 0
+                ? [
+                    {
+                      id: 'select-all',
+                      text: 'Select all',
+                      send: selectedDataSource === 'blob' ? 'select files all' : 'select local files all',
+                    },
+                  ]
+                : []),
+            ]
+          : undefined;
+
+      const botResponse: Message = {
+        id: (Date.now() + 1).toString(),
+        text: content,
+        sender: 'bot',
+        timestamp: new Date(),
+        options: interactiveOptions,
+      };
+      setMessages((prev) => [...prev, botResponse]);
+    } catch (err) {
+      setAgentError("Couldn't reach the agent. Check your backend/agent configuration and try again.");
+    } finally {
+      setIsLoadingAgent(false);
+    }
   };
 
   const handleOptionSelect = async (option: ChatOption) => {
@@ -348,6 +386,7 @@ export default function ChatWindow() {
     if (isDataSourceSelection) {
       setHasSelectedDataSource(true);
       setSelectedDataSource(option.id);
+      setGuidedMode('none');
     }
 
     setMessages((prev) => [...prev, userMessage]);
@@ -370,24 +409,24 @@ export default function ChatWindow() {
       return;
     }
 
-    setIsLoadingAgent(true);
-    setAgentError(null);
-    try {
-      const messagesWithUser = [...messages, userMessage];
-      const { content, threadId } = await fetchAgentReply(messagesWithUser);
-      if (threadId) setAgentThreadId(threadId);
-      const botResponse: Message = {
-        id: (Date.now() + 1).toString(),
-        text: content,
-        sender: 'bot',
-        timestamp: new Date(),
-      };
-      setMessages((prev) => [...prev, botResponse]);
-    } catch (err) {
-      setAgentError("Couldn't reach the agent. Check your backend/agent configuration and try again.");
-    } finally {
-      setIsLoadingAgent(false);
+    // Guided UX: for SQL/Blob/Streams/Local, turn "View" and "Report" into deterministic steps.
+    if (option.action === 'guided-view') {
+      setGuidedMode('view');
+      // Ask backend to list selectable entities
+      const cmd =
+        option.id.startsWith('sql') ? 'list tables' : option.id.startsWith('blob') ? 'list files' : 'list local files';
+      await sendUserText(cmd);
+      return;
     }
+    if (option.action === 'guided-report') {
+      setGuidedMode('report');
+      const cmd =
+        option.id.startsWith('sql') ? 'list tables' : option.id.startsWith('blob') ? 'list files' : 'list local files';
+      await sendUserText(cmd);
+      return;
+    }
+
+    await sendUserText(option.text);
   };
 
   return (
@@ -453,7 +492,31 @@ export default function ChatWindow() {
                       </div>
                     </div>
                   ) : (
-                    <p className="text-sm leading-relaxed">{message.text}</p>
+                    <div className="space-y-3">
+                      <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.text}</p>
+                      {message.sender === 'bot' && Array.isArray(message.options) && message.options.length > 0 && (
+                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                          {message.options.map((opt) => (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              onClick={() => sendUserText(opt.send)}
+                              className="rounded-lg border border-black/10 bg-white/90 px-3 py-2 text-left text-xs font-semibold text-zinc-900 hover:bg-white hover:border-[#0070AD]/30"
+                              title={opt.send}
+                            >
+                              {opt.text}
+                            </button>
+                          ))}
+                          <button
+                            type="button"
+                            onClick={handleBack}
+                            className="rounded-lg border border-black/10 bg-white/90 px-3 py-2 text-left text-xs font-semibold text-zinc-900 hover:bg-white hover:border-[#0070AD]/30"
+                          >
+                            ← Back
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   )}
                   <span className={`mt-2 block text-xs ${message.sender === 'user' ? 'text-white/80' : 'text-black/45'}`}>
                     {formatTime(message.timestamp)}
@@ -766,33 +829,7 @@ export default function ChatWindow() {
                 if (e.key === 'Enter' && chatInput.trim()) {
                   const text = chatInput.trim();
                   setChatInput('');
-                  const userMessage: Message = {
-                    id: Date.now().toString(),
-                    text,
-                    sender: 'user',
-                    timestamp: new Date(),
-                  };
-                  setMessages((prev) => [...prev, userMessage]);
-                  setIsLoadingAgent(true);
-                  setAgentError(null);
-                  try {
-                    const messagesWithUser = [...messages, userMessage];
-                    const { content, threadId } = await fetchAgentReply(messagesWithUser);
-                    if (threadId) setAgentThreadId(threadId);
-                    setMessages((prev) => [
-                      ...prev,
-                      {
-                        id: (Date.now() + 1).toString(),
-                        text: content,
-                        sender: 'bot',
-                        timestamp: new Date(),
-                      },
-                    ]);
-                  } catch {
-                    setAgentError("Couldn't reach the agent. Check your backend/agent configuration and try again.");
-                  } finally {
-                    setIsLoadingAgent(false);
-                  }
+                  await sendUserText(text);
                 }
               }}
               placeholder="Type a message or choose an option..."
@@ -807,33 +844,7 @@ export default function ChatWindow() {
                 if (!chatInput.trim() || isLoadingAgent) return;
                 const text = chatInput.trim();
                 setChatInput('');
-                const userMessage: Message = {
-                  id: Date.now().toString(),
-                  text,
-                  sender: 'user',
-                  timestamp: new Date(),
-                };
-                setMessages((prev) => [...prev, userMessage]);
-                setIsLoadingAgent(true);
-                setAgentError(null);
-                try {
-                  const messagesWithUser = [...messages, userMessage];
-                  const { content, threadId } = await fetchAgentReply(messagesWithUser);
-                  if (threadId) setAgentThreadId(threadId);
-                  setMessages((prev) => [
-                    ...prev,
-                    {
-                      id: (Date.now() + 1).toString(),
-                      text: content,
-                      sender: 'bot',
-                      timestamp: new Date(),
-                    },
-                  ]);
-                } catch {
-                  setAgentError("Couldn't reach the agent. Check your backend/agent configuration and try again.");
-                } finally {
-                  setIsLoadingAgent(false);
-                }
+                await sendUserText(text);
               }}
               className="flex shrink-0 items-center justify-center rounded-lg border border-[#0070AD]/50 bg-[#0070AD] px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-[#12ABDB] disabled:cursor-not-allowed disabled:opacity-40"
             >

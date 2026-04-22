@@ -60,6 +60,8 @@ list_local_files
 select_local_files
 assess_selected_local_files
 assess_selected_tables
+preview_local_file
+preview_blob_file
 
 Output schema:
 {
@@ -504,6 +506,185 @@ def _node_assess_selected_files(state: ChatState) -> ChatState:
     return {"reply": reply, "payload": {"selected_files": selected, "result": result, "report_markdown": report_md}}
 
 
+def _parse_view_mode(user_text: str) -> str:
+    t = (user_text or "").strip().lower()
+    if "first row" in t or "1st row" in t:
+        return "first_row"
+    if "last row" in t:
+        return "last_row"
+    if "columns" in t or "fields" in t:
+        return "columns"
+    if "shape" in t or ("rows" in t and "columns" in t):
+        return "shape"
+    if "tail" in t or "bottom" in t:
+        return "tail"
+    return "head"
+
+
+def _node_preview_local_file(state: ChatState) -> ChatState:
+    ctx = state["session"].setdefault("context", {})
+    args = state.get("action_args") or {}
+    available = ctx.get("last_local_file_list") or []
+    root = ctx.get("local_files_root") or ""
+    if not root:
+        return {"reply": "No local root selected. Run 'list local files' first.", "payload": {}}
+
+    index = args.get("index")
+    name = args.get("name")
+    if name:
+        fname = str(name)
+        if fname not in available:
+            return {"reply": f"File not found in the last list: {fname}. Run 'list local files' again.", "payload": {}}
+    else:
+        if not available:
+            return {"reply": "No local file list cached. Run 'list local files' first.", "payload": {}}
+        try:
+            i = int(index) - 1
+        except Exception:
+            i = 0
+        i = max(0, min(i, len(available) - 1))
+        fname = str(available[i])
+
+    import os
+    import json
+    import pandas as pd
+
+    p = os.path.join(root, fname)
+    if not os.path.isfile(p):
+        return {"reply": f"File not found: {p}", "payload": {"file": fname}}
+    low = p.lower()
+
+    n = args.get("n")
+    try:
+        n = int(n) if n is not None else 5
+    except Exception:
+        n = 5
+    n = max(1, min(n, 50))
+
+    if low.endswith(".csv"):
+        df = pd.read_csv(p, low_memory=False)
+    elif low.endswith(".tsv"):
+        df = pd.read_csv(p, sep="\t", low_memory=False)
+    elif low.endswith(".jsonl"):
+        rows = []
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    rows.append({"value": line})
+                if len(rows) >= 500:
+                    break
+        df = pd.json_normalize(rows, max_level=1) if rows else pd.DataFrame()
+    elif low.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(p)
+    elif low.endswith(".parquet"):
+        df = pd.read_parquet(p)
+    else:
+        df = pd.read_json(p)
+
+    mode = str(args.get("mode") or "") or _parse_view_mode(state.get("message", ""))
+    if mode == "columns":
+        reply = f"Columns in `{fname}` ({len(df.columns)}):\n" + "\n".join([f"- {c}" for c in df.columns.tolist()])
+        return {"reply": reply, "payload": {"file": fname, "columns": df.columns.tolist()}}
+    if mode == "shape":
+        reply = f"Shape of `{fname}`: rows={len(df)}, columns={len(df.columns)}"
+        return {"reply": reply, "payload": {"file": fname, "rows": len(df), "columns": len(df.columns)}}
+    if mode == "first_row":
+        row = df.head(1).to_dict(orient="records")
+        return {
+            "reply": json.dumps(row[0] if row else {}, ensure_ascii=False, indent=2),
+            "payload": {"file": fname, "row": row[0] if row else {}},
+        }
+    if mode == "last_row":
+        row = df.tail(1).to_dict(orient="records")
+        return {
+            "reply": json.dumps(row[0] if row else {}, ensure_ascii=False, indent=2),
+            "payload": {"file": fname, "row": row[0] if row else {}},
+        }
+    if mode == "tail":
+        out = df.tail(n).to_dict(orient="records")
+        return {"reply": json.dumps(out, ensure_ascii=False, indent=2), "payload": {"file": fname, "rows": out}}
+
+    out = df.head(n).to_dict(orient="records")
+    return {"reply": json.dumps(out, ensure_ascii=False, indent=2), "payload": {"file": fname, "rows": out}}
+
+
+def _node_preview_blob_file(state: ChatState) -> ChatState:
+    ctx = state["session"].setdefault("context", {})
+    args = state.get("action_args") or {}
+    available = ctx.get("last_blob_list") or []
+    if not available:
+        return {"reply": "No blob list cached. Run 'list files' first.", "payload": {}}
+
+    index = args.get("index")
+    name = args.get("name")
+    if name:
+        blob_name = str(name)
+        if blob_name not in available:
+            return {"reply": f"Blob not found in the last list: {blob_name}. Run 'list files' again.", "payload": {}}
+    else:
+        try:
+            i = int(index) - 1
+        except Exception:
+            i = 0
+        i = max(0, min(i, len(available) - 1))
+        blob_name = str(available[i])
+
+    sources_path = ctx.get("sources_path") or "config/sources.yaml"
+    source_root = load_sources_config(sources_path)
+    blob_locs = _azure_blob_locations(source_root)
+    if not blob_locs:
+        return {"reply": "No Azure Blob source configured in sources.yaml.", "payload": {}}
+    blob_loc_idx = int(ctx.get("selected_blob_location_index") or 0)
+    blob_loc_idx = max(0, min(blob_loc_idx, len(blob_locs) - 1))
+
+    from agent.mcp_clients import _single_location_config  # type: ignore
+    from agent.mcp_interface import load_selected_blob_datasets  # type: ignore
+
+    cfg_text = _single_location_config({"name": source_root.get("name") or "source"}, blob_locs[blob_loc_idx])
+    dfs = load_selected_blob_datasets(cfg_text, location_index=0, blob_names=[blob_name], max_rows=500, max_bytes=None)
+    df = dfs.get(blob_name)
+    if df is None:
+        return {"reply": f"Couldn't load blob as a dataset: {blob_name}", "payload": {"file": blob_name}}
+
+    n = args.get("n")
+    try:
+        n = int(n) if n is not None else 5
+    except Exception:
+        n = 5
+    n = max(1, min(n, 50))
+
+    mode = str(args.get("mode") or "") or _parse_view_mode(state.get("message", ""))
+    if mode == "columns":
+        reply = f"Columns in `{blob_name}` ({len(df.columns)}):\n" + "\n".join([f"- {c}" for c in df.columns.tolist()])
+        return {"reply": reply, "payload": {"file": blob_name, "columns": df.columns.tolist()}}
+    if mode == "shape":
+        reply = f"Shape of `{blob_name}`: rows={len(df)}, columns={len(df.columns)}"
+        return {"reply": reply, "payload": {"file": blob_name, "rows": len(df), "columns": len(df.columns)}}
+    if mode == "first_row":
+        row = df.head(1).to_dict(orient="records")
+        return {
+            "reply": json.dumps(row[0] if row else {}, ensure_ascii=False, indent=2),
+            "payload": {"file": blob_name, "row": row[0] if row else {}},
+        }
+    if mode == "last_row":
+        row = df.tail(1).to_dict(orient="records")
+        return {
+            "reply": json.dumps(row[0] if row else {}, ensure_ascii=False, indent=2),
+            "payload": {"file": blob_name, "row": row[0] if row else {}},
+        }
+    if mode == "tail":
+        out = df.tail(n).to_dict(orient="records")
+        return {"reply": json.dumps(out, ensure_ascii=False, indent=2), "payload": {"file": blob_name, "rows": out}}
+
+    out = df.head(n).to_dict(orient="records")
+    return {"reply": json.dumps(out, ensure_ascii=False, indent=2), "payload": {"file": blob_name, "rows": out}}
+
+
 def _node_list_tables(state: ChatState) -> ChatState:
     # List tables for selected database source (default: first).
     sources_path = state["session"].get("context", {}).get("sources_path") or "config/sources.yaml"
@@ -748,6 +929,8 @@ def build_chat_graph():
     g.add_node("list_local_files", _node_list_local_files)
     g.add_node("select_local_files", _node_select_local_files)
     g.add_node("assess_selected_local_files", _node_assess_selected_local_files)
+    g.add_node("preview_local_file", _node_preview_local_file)
+    g.add_node("preview_blob_file", _node_preview_blob_file)
     g.add_node("show_schema", _node_show_schema)
     g.add_node("preview_table", _node_preview_table)
     g.add_node("dq_table", _node_dq_table)
@@ -777,6 +960,8 @@ def build_chat_graph():
             "list_local_files": "list_local_files",
             "select_local_files": "select_local_files",
             "assess_selected_local_files": "assess_selected_local_files",
+            "preview_local_file": "preview_local_file",
+            "preview_blob_file": "preview_blob_file",
             "show_schema": "show_schema",
             "preview_table": "preview_table",
             "dq_table": "dq_table",
@@ -798,6 +983,8 @@ def build_chat_graph():
         "list_local_files",
         "select_local_files",
         "assess_selected_local_files",
+        "preview_local_file",
+        "preview_blob_file",
         "show_schema",
         "preview_table",
         "dq_table",

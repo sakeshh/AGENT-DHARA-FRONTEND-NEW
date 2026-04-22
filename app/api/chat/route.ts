@@ -40,6 +40,7 @@ export async function POST(request: NextRequest) {
             content: `Backend error (${backendRes.status}): ${backendJson?.detail ?? backendJson?.error ?? 'Unknown'}`,
             error: 'BACKEND_ERROR',
             threadId: null,
+            payload: backendJson?.payload ?? null,
           },
           { status: 200 }
         );
@@ -49,6 +50,7 @@ export async function POST(request: NextRequest) {
         content: backendJson?.reply ?? 'No reply from backend.',
         error: null,
         threadId: null,
+        payload: backendJson?.payload ?? null,
         backend: process.env.DEBUG_BACKEND_PAYLOAD === 'true' ? backendJson : undefined,
       });
     }
@@ -59,11 +61,12 @@ export async function POST(request: NextRequest) {
       content: result.content,
       error: result.error ?? null,
       threadId: result.threadId ?? threadId ?? null,
+      payload: null,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
-      { content: `Server error: ${message}`, error: 'SERVER_ERROR', threadId: null },
+      { content: `Server error: ${message}`, error: 'SERVER_ERROR', threadId: null, payload: null },
       { status: 500 }
     );
   }
