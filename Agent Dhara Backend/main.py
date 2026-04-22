@@ -8,6 +8,12 @@ main.py — SQL Runner + Intelligent Data Assessment (DB + Filesystem + Azure Bl
 - Improvements: structured logging, config-driven DQ thresholds, sorted blob order (idempotent), --skip-azure.
 """
 
+
+
+
+
+
+
 import os
 import sys
 import re
