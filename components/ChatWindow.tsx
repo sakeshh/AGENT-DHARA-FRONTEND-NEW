@@ -8,6 +8,7 @@ import {
   FaStream,
   FaPlug,
   FaFolder,
+  FaChevronDown,
   FaPaperPlane,
   FaArrowLeft,
   FaCopy,
@@ -20,10 +21,81 @@ import {
 import { Message } from '@/types';
 import Image from 'next/image';
 
-type AgentUiOption = { id: string; label: string; action: string; args?: Record<string, any> };
+interface ChatOption {
+  id: string;
+  text: string;
+  category: string;
+  action?: string;
+  icon?: React.ReactNode;
+}
 
-function buildUiAction(opt: AgentUiOption): string {
-  return `__ui__:${JSON.stringify({ action: opt.action, args: opt.args || {} })}`;
+const DATA_SOURCE_OPTIONS: ChatOption[] = [
+  { id: 'local', text: 'Local data', category: 'Data Source', action: 'local-data', icon: <FaFolder className="text-[#0070AD]/80" /> },
+  { id: 'sql', text: 'SQL data', category: 'Data Source', action: 'sql-data', icon: <FaDatabase className="text-[#0070AD]/80" /> },
+  { id: 'blob', text: 'Blob data', category: 'Data Source', action: 'blob-data', icon: <FaCloud className="text-[#12ABDB]/80" /> },
+  { id: 'streams', text: 'Real-time streams', category: 'Data Source', action: 'realtime-streams', icon: <FaStream className="text-[#0070AD]/80" /> },
+  { id: 'apis', text: 'APIs', category: 'Data Source', action: 'apis', icon: <FaPlug className="text-[#12ABDB]/80" /> },
+];
+
+/* Options shown after selecting a data source — vary by source type */
+const CHAT_OPTIONS_BY_SOURCE: Record<string, ChatOption[]> = {
+  sql: [
+    { id: 'sql-1', text: '📊 Start Data Pipeline Workflow', category: 'Pipeline', action: '/data-pipeline' },
+    { id: 'sql-2', text: '💾 Connect to Database', category: 'Database', action: 'connect' },
+    { id: 'sql-3', text: '🔍 Query & Analyze Data', category: 'Analysis', action: 'analyze' },
+    { id: 'sql-4', text: '📈 Generate Data Report', category: 'Reports', action: 'report' },
+    { id: 'sql-4b', text: '📄 View Report', category: 'Reports', action: 'view-report' },
+    { id: 'sql-5', text: '⚙️ ETL Code Generation', category: 'ETL', action: 'etl' },
+    { id: 'sql-6', text: '🔄 Transform Data', category: 'Transform', action: 'transform' },
+    { id: 'sql-7', text: '🎯 Data Validation', category: 'Validation', action: 'validate' },
+    { id: 'sql-8', text: '📤 Export Data', category: 'Export', action: 'export' },
+    { id: 'sql-9', text: '🔐 Data Security Check', category: 'Security', action: 'security' },
+  ],
+  local: [
+    { id: 'local-1', text: '📊 Start Data Pipeline Workflow', category: 'Pipeline', action: '/data-pipeline' },
+    { id: 'local-2', text: '📁 Upload CSV / Excel / JSON', category: 'Files', action: 'upload' },
+    { id: 'local-2b', text: '📄 View Report', category: 'Reports', action: 'view-report' },
+    { id: 'local-3', text: '🔍 Analyze Data Quality', category: 'Analysis', action: 'analyze' },
+    { id: 'local-4', text: '🧹 Clean Duplicate Records', category: 'Cleaning', action: 'clean' },
+    { id: 'local-5', text: '📉 Remove Outliers', category: 'Cleaning', action: 'outliers' },
+    { id: 'local-6', text: '🔄 Transform Data', category: 'Transform', action: 'transform' },
+    { id: 'local-7', text: '🔗 Merge Datasets', category: 'Transform', action: 'merge' },
+    { id: 'local-8', text: '📤 Export Data', category: 'Export', action: 'export' },
+    { id: 'local-9', text: '📝 Create Custom Rule', category: 'Rules', action: 'rule' },
+  ],
+  blob: [
+    { id: 'blob-1', text: '📊 Start Data Pipeline Workflow', category: 'Pipeline', action: '/data-pipeline' },
+    { id: 'blob-2', text: '☁️ Connect to Azure Blob / S3 / GCS', category: 'Storage', action: 'connect' },
+    { id: 'blob-2b', text: '📄 View Report', category: 'Reports', action: 'view-report' },
+    { id: 'blob-3', text: '📥 Sync Data from Blob', category: 'Import', action: 'sync' },
+    { id: 'blob-4', text: '🔍 Analyze Data Quality', category: 'Analysis', action: 'analyze' },
+    { id: 'blob-5', text: '⚙️ ETL Code Generation', category: 'ETL', action: 'etl' },
+    { id: 'blob-6', text: '🔄 Transform Data', category: 'Transform', action: 'transform' },
+    { id: 'blob-7', text: '📤 Export Data', category: 'Export', action: 'export' },
+  ],
+  streams: [
+    { id: 'streams-1', text: '📊 Start Data Pipeline Workflow', category: 'Pipeline', action: '/data-pipeline' },
+    { id: 'streams-2', text: '⚡ Connect to Event Hubs / Kafka', category: 'Streaming', action: 'connect' },
+    { id: 'streams-2b', text: '📄 View Report', category: 'Reports', action: 'view-report' },
+    { id: 'streams-3', text: '📥 Ingest Streaming Data', category: 'Ingest', action: 'ingest' },
+    { id: 'streams-4', text: '📊 Real-time Dashboard', category: 'Dashboard', action: 'dashboard' },
+    { id: 'streams-5', text: '🎯 Data Validation', category: 'Validation', action: 'validate' },
+    { id: 'streams-6', text: '🔄 Transform Streams', category: 'Transform', action: 'transform' },
+  ],
+  apis: [
+    { id: 'apis-1', text: '📊 Start Data Pipeline Workflow', category: 'Pipeline', action: '/data-pipeline' },
+    { id: 'apis-2', text: '🔗 Connect to REST / GraphQL API', category: 'API', action: 'connect' },
+    { id: 'apis-2b', text: '📄 View Report', category: 'Reports', action: 'view-report' },
+    { id: 'apis-3', text: '📥 Fetch API Data', category: 'Import', action: 'fetch' },
+    { id: 'apis-4', text: '🔄 Transform Data', category: 'Transform', action: 'transform' },
+    { id: 'apis-5', text: '📤 Export Data', category: 'Export', action: 'export' },
+    { id: 'apis-6', text: '🔍 Analyze API Response', category: 'Analysis', action: 'analyze' },
+  ],
+};
+
+function getChatOptionsForSource(sourceId: string | null): ChatOption[] {
+  if (!sourceId) return [];
+  return CHAT_OPTIONS_BY_SOURCE[sourceId] ?? CHAT_OPTIONS_BY_SOURCE.local;
 }
 
 /** Format time the same on server and client to avoid hydration mismatch (e.g. "pm" vs "PM"). */
@@ -39,8 +111,10 @@ function formatTime(d: Date): string {
 export default function ChatWindow() {
   // Important: do not inject canned "bot" content. Bot messages should come only from the agent/backend.
   const [messages, setMessages] = useState<Message[]>([]);
+  const [hasSelectedDataSource, setHasSelectedDataSource] = useState(false);
+  const [selectedDataSource, setSelectedDataSource] = useState<string | null>(null);
   const [agentError, setAgentError] = useState<string | null>(null);
-  const [agentOptions, setAgentOptions] = useState<AgentUiOption[]>([]);
+  const [showOptions, setShowOptions] = useState(false);
   const [chatInput, setChatInput] = useState('');
   const [isLoadingAgent, setIsLoadingAgent] = useState(false);
   const [agentThreadId, setAgentThreadId] = useState<string | null>(null);
@@ -105,13 +179,11 @@ export default function ChatWindow() {
   const getMessagesForApi = (msgs: Message[]) =>
     msgs.map((m) => ({
       role: m.sender === 'user' ? ('user' as const) : ('assistant' as const),
-      content: m.sender === 'user' ? (m.apiContent ?? m.text) : m.text,
+      content: m.text,
     }));
 
   /** Call our API route which invokes your Azure AI Foundry agent (threads + runs). */
-  const fetchAgentReply = async (
-    msgs: Message[]
-  ): Promise<{ content: string; threadId: string | null; payload?: any }> => {
+  const fetchAgentReply = async (msgs: Message[]): Promise<{ content: string; threadId: string | null }> => {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -128,7 +200,6 @@ export default function ChatWindow() {
     const data = await res.json();
     const content = typeof data?.content === 'string' ? data.content : '';
     const threadId = data?.threadId ?? null;
-    const payload = data?.payload ?? null;
     if (!res.ok || !content.trim()) {
       const errText =
         typeof data?.error === 'string'
@@ -138,7 +209,7 @@ export default function ChatWindow() {
             : 'EMPTY_REPLY';
       throw new Error(errText);
     }
-    return { content, threadId, payload };
+    return { content, threadId };
   };
 
   const stopGeneration = () => {
@@ -221,10 +292,8 @@ export default function ChatWindow() {
     setIsLoadingAgent(true);
     setAgentError(null);
     try {
-      const { content, threadId, payload } = await fetchAgentReply(base);
+      const { content, threadId } = await fetchAgentReply(base);
       if (threadId) setAgentThreadId(threadId);
-      const opts = Array.isArray(payload?.options) ? payload.options : [];
-      setAgentOptions(opts);
       setMessages((prev) => [
         ...prev,
         { id: (Date.now() + 1).toString(), text: content, sender: 'bot', timestamp: new Date() },
@@ -252,56 +321,70 @@ export default function ChatWindow() {
     scrollMessagesToBottom();
   }, [messages, isLoadingAgent]);
 
-  // Note: legacy static option dropdown has been removed. All actions should be driven by agentOptions.
+  const handleBack = () => {
+    if (hasSelectedDataSource) {
+      setHasSelectedDataSource(false);
+      setSelectedDataSource(null);
+      const userMessage: Message = {
+        id: Date.now().toString(),
+        text: '← Back',
+        sender: 'user',
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, userMessage]);
+    }
+    setShowOptions(false);
+  };
 
-  const handleAgentOptionClick = async (opt: AgentUiOption) => {
+  const handleOptionSelect = async (option: ChatOption) => {
     const userMessage: Message = {
       id: Date.now().toString(),
-      text: opt.label,
-      apiContent: buildUiAction(opt),
+      text: option.text,
       sender: 'user',
       timestamp: new Date(),
     };
+
+    const isDataSourceSelection = DATA_SOURCE_OPTIONS.some(ds => ds.id === option.id);
+    if (isDataSourceSelection) {
+      setHasSelectedDataSource(true);
+      setSelectedDataSource(option.id);
+    }
+
     setMessages((prev) => [...prev, userMessage]);
+
+    // Local data: open folder picker (dynamic path selection)
+    if (option.id === 'local') {
+      // Ensure user sees the local panel options, but open explorer immediately.
+      setHasSelectedDataSource(true);
+      setSelectedDataSource('local');
+      setShowOptions(false);
+      setTimeout(() => localFolderInputRef.current?.click(), 0);
+      return;
+    }
+
+    // Redirect to data pipeline without calling agent
+    if (option.action === '/data-pipeline') {
+      setTimeout(() => {
+        window.location.href = '/data-pipeline';
+      }, 1500);
+      return;
+    }
+
     setIsLoadingAgent(true);
     setAgentError(null);
     try {
       const messagesWithUser = [...messages, userMessage];
-      const { content, threadId, payload } = await fetchAgentReply(messagesWithUser);
+      const { content, threadId } = await fetchAgentReply(messagesWithUser);
       if (threadId) setAgentThreadId(threadId);
-      const opts = Array.isArray(payload?.options) ? payload.options : [];
-      setAgentOptions(opts);
-      setMessages((prev) => [...prev, { id: (Date.now() + 1).toString(), text: content, sender: 'bot', timestamp: new Date() }]);
-    } catch {
-      setAgentError("Couldn't reach the agent. Check your backend/agent configuration and try again.");
-    } finally {
-      setIsLoadingAgent(false);
-    }
-  };
-
-  const startOver = async () => {
-    // Cancel current view and reset backend session context to the beginning (source selection).
-    setMessages([]);
-    setAgentOptions([]);
-    setAgentError(null);
-    setIsLoadingAgent(true);
-    try {
-      const userMessage: Message = {
-        id: Date.now().toString(),
-        text: 'Start over',
-        apiContent: `__ui__:${JSON.stringify({ action: 'reset_session', args: {} })}`,
-        sender: 'user',
+      const botResponse: Message = {
+        id: (Date.now() + 1).toString(),
+        text: content,
+        sender: 'bot',
         timestamp: new Date(),
       };
-      const { content, payload } = await fetchAgentReply([userMessage]);
-      const opts = Array.isArray(payload?.options) ? payload.options : [];
-      setAgentOptions(opts);
-      setMessages([
-        userMessage,
-        { id: (Date.now() + 1).toString(), text: content, sender: 'bot', timestamp: new Date() },
-      ]);
-    } catch {
-      setAgentError("Couldn't reset right now. Check your backend and try again.");
+      setMessages((prev) => [...prev, botResponse]);
+    } catch (err) {
+      setAgentError("Couldn't reach the agent. Check your backend/agent configuration and try again.");
     } finally {
       setIsLoadingAgent(false);
     }
@@ -546,7 +629,104 @@ export default function ChatWindow() {
           }}
         />
         {/* Options dropdown - shown when "Choose option" is clicked */}
-        {/* Agent-driven options are rendered as buttons below the composer. */}
+        <AnimatePresence>
+          {showOptions && (
+            <>
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onClick={() => setShowOptions(false)}
+                className="fixed inset-0 z-[5] bg-black/50"
+                style={{ margin: 0, top: 0, left: 0, right: 0, bottom: 0 }}
+              />
+              <motion.div
+                initial={{ opacity: 0, height: 0, scale: 0.96, y: -8 }}
+                animate={{ opacity: 1, height: 'auto', scale: 1, y: 0 }}
+                exit={{ opacity: 0, height: 0, scale: 0.96, y: -8 }}
+                transition={{ duration: 0.28, ease: [0.25, 0.46, 0.45, 0.94] }}
+                style={{ transformOrigin: 'top left' }}
+                className="mb-4 relative z-[6] rounded-xl border border-black/10 bg-white/85 backdrop-blur-xl"
+              >
+                {!hasSelectedDataSource ? (
+                  <>
+                    <div className="p-3 flex flex-wrap items-center gap-3 border-b border-black/10">
+                      <motion.button
+                        whileHover={{ scale: 1.05, x: -2 }}
+                        whileTap={{ scale: 0.95 }}
+                        onClick={() => setShowOptions(false)}
+                        className="flex items-center gap-1.5 px-2 py-1 text-xs font-medium text-black/55 transition-colors hover:text-black"
+                      >
+                        <FaArrowLeft className="w-3 h-3" />
+                        Back
+                      </motion.button>
+                      <p className="text-sm font-medium text-zinc-900">Choose one:</p>
+                    </div>
+                    <div className="options-scroll p-3 max-h-48 scroll-smooth">
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                        {DATA_SOURCE_OPTIONS.map((option, idx) => (
+                          <motion.button
+                            key={option.id}
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            transition={{ delay: idx * 0.03 }}
+                            whileHover={{ scale: 1.02 }}
+                            whileTap={{ scale: 0.98 }}
+                            onClick={() => {
+                              handleOptionSelect(option);
+                              setShowOptions(false);
+                            }}
+                            className="flex items-center gap-2 rounded-lg border border-black/10 bg-white/90 p-3 text-left text-sm font-medium text-zinc-900 transition-all hover:border-[#0070AD]/30 hover:bg-white"
+                          >
+                            {option.icon && <span className="flex-shrink-0">{option.icon}</span>}
+                            <span>{option.text}</span>
+                          </motion.button>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="p-3 flex flex-wrap items-center gap-3 border-b border-black/10">
+                      <motion.button
+                        whileHover={{ scale: 1.05, x: -2 }}
+                        whileTap={{ scale: 0.95 }}
+                        onClick={handleBack}
+                        className="flex items-center gap-1.5 px-2 py-1 text-xs font-medium text-black/55 transition-colors hover:text-black"
+                      >
+                        <FaArrowLeft className="w-3 h-3" />
+                        Back
+                      </motion.button>
+                      <p className="text-sm font-medium text-zinc-900">What would you like to do next?</p>
+                    </div>
+                    <div className="options-scroll p-3 max-h-52 scroll-smooth">
+                      <div className="space-y-2">
+                        {getChatOptionsForSource(selectedDataSource).map((option, idx) => (
+                          <motion.button
+                            key={option.id}
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            transition={{ delay: Math.min(idx * 0.02, 0.2) }}
+                            whileHover={{ scale: 1.01, x: 4 }}
+                            whileTap={{ scale: 0.99 }}
+                            onClick={() => {
+                              handleOptionSelect(option);
+                              setShowOptions(false);
+                            }}
+                            className="w-full flex items-center gap-3 rounded-lg border border-black/10 bg-white/90 px-4 py-3 text-left text-sm font-medium text-zinc-900 transition-all hover:border-[#0070AD]/30 hover:bg-white"
+                          >
+                            {option.icon && <span className="flex-shrink-0">{option.icon}</span>}
+                            <span>{option.text}</span>
+                          </motion.button>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </motion.div>
+            </>
+          )}
+        </AnimatePresence>
 
         {/* Chat input with options trigger */}
         <div className="flex gap-2 items-center">
@@ -566,16 +746,17 @@ export default function ChatWindow() {
           <motion.button
             whileHover={{ scale: 1.02, y: -1 }}
             whileTap={{ scale: 0.98 }}
-            onClick={startOver}
-            disabled={isLoadingAgent}
-            className="flex shrink-0 items-center justify-center gap-2 rounded-lg border border-black/10 bg-white/90 px-3 py-2.5 text-sm font-medium text-zinc-900 transition-all hover:border-[#0070AD]/30 hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
-            title="Start over"
-            aria-label="Start over"
+            onClick={() => setShowOptions(!showOptions)}
+            className="flex shrink-0 items-center gap-2 rounded-lg border border-black/10 bg-white/90 px-4 py-2.5 text-sm font-medium text-zinc-900 transition-all hover:border-[#0070AD]/30 hover:bg-white"
           >
-            <FaArrowLeft className="w-4 h-4" />
-            <span className="hidden sm:inline">Start over</span>
+            <motion.div
+              animate={{ rotate: showOptions ? 180 : 0 }}
+              transition={{ duration: 0.25 }}
+            >
+              <FaChevronDown className="w-4 h-4" />
+            </motion.div>
+            Choose option
           </motion.button>
-
           <div className="flex-1 flex gap-2">
             <input
               type="text"
@@ -596,10 +777,8 @@ export default function ChatWindow() {
                   setAgentError(null);
                   try {
                     const messagesWithUser = [...messages, userMessage];
-                    const { content, threadId, payload } = await fetchAgentReply(messagesWithUser);
+                    const { content, threadId } = await fetchAgentReply(messagesWithUser);
                     if (threadId) setAgentThreadId(threadId);
-                    const opts = Array.isArray(payload?.options) ? payload.options : [];
-                    setAgentOptions(opts);
                     setMessages((prev) => [
                       ...prev,
                       {
@@ -639,10 +818,8 @@ export default function ChatWindow() {
                 setAgentError(null);
                 try {
                   const messagesWithUser = [...messages, userMessage];
-                  const { content, threadId, payload } = await fetchAgentReply(messagesWithUser);
+                  const { content, threadId } = await fetchAgentReply(messagesWithUser);
                   if (threadId) setAgentThreadId(threadId);
-                  const opts = Array.isArray(payload?.options) ? payload.options : [];
-                  setAgentOptions(opts);
                   setMessages((prev) => [
                     ...prev,
                     {
@@ -671,21 +848,6 @@ export default function ChatWindow() {
             </motion.button>
           </div>
         </div>
-
-        {agentOptions.length > 0 && (
-          <div className="mt-3 flex flex-wrap gap-2">
-            {agentOptions.slice(0, 12).map((opt) => (
-              <button
-                key={opt.id}
-                type="button"
-                onClick={() => handleAgentOptionClick(opt)}
-                className="rounded-xl border border-[#0070AD]/25 bg-white/85 px-3 py-2 text-sm font-medium text-zinc-900 hover:border-[#0070AD]/40 hover:bg-white"
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
-        )}
       </motion.div>
     </div>
   );

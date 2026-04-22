@@ -49,7 +49,6 @@ export async function POST(request: NextRequest) {
         content: backendJson?.reply ?? 'No reply from backend.',
         error: null,
         threadId: null,
-        payload: backendJson?.payload ?? null,
         backend: process.env.DEBUG_BACKEND_PAYLOAD === 'true' ? backendJson : undefined,
       });
     }

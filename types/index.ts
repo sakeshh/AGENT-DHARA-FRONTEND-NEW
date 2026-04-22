@@ -1,11 +1,6 @@
 export interface Message {
   id: string;
   text: string;
-  /**
-   * Optional hidden payload sent to the API instead of `text`.
-   * Used for deterministic UI button actions (no hardcoded replies).
-   */
-  apiContent?: string;
   sender: 'user' | 'bot';
   timestamp: Date;
 }

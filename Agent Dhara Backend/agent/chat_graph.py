@@ -44,7 +44,6 @@ Your job:
 
 Allowed actions (exact strings):
 help
-reset_session
 list_sources
 select_source
 list_tables
@@ -52,7 +51,6 @@ select_tables
 select_table
 show_schema
 preview_table
-row_detail
 nl_query
 dq_table
 list_blob_files
@@ -70,7 +68,7 @@ Output schema:
 }
 
 Argument rules:
-- Prefer explicit names (table/blob/file) when possible.
+- For selections, prefer numeric indices when available lists are provided.
 - If the user references a specific name (table/blob/file), you may pass it directly by name.
 - Never invent sources/tables/files that are not listed in the provided context.
 
@@ -82,69 +80,14 @@ Behavior rules:
 
 Examples (JSON only):
 {"action":"list_sources","args":{}}
-{"action":"reset_session","args":{}}
 {"action":"select_source","args":{"index":0}}
 {"action":"list_tables","args":{}}
 {"action":"select_tables","args":{"indices":[1,3,4]}}
 {"action":"assess_selected_tables","args":{}}
-{"action":"row_detail","args":{"row_number":50}}
 {"action":"list_blob_files","args":{}}
 {"action":"select_blob_files","args":{"all":true}}
 {"action":"assess_selected_files","args":{}}
 """
-
-
-UI_ACTION_PREFIX = "__ui__:"
-
-
-def _ui_action_options(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Standard UI option schema consumed by the frontend.
-    Each option:
-      { id, label, action, args }
-    """
-    out: List[Dict[str, Any]] = []
-    for it in items or []:
-        if not isinstance(it, dict):
-            continue
-        label = str(it.get("label") or "").strip()
-        action = str(it.get("action") or "").strip()
-        args = it.get("args") if isinstance(it.get("args"), dict) else {}
-        if not label or not action:
-            continue
-        out.append(
-            {
-                "id": str(it.get("id") or f"{action}:{label}")[:120],
-                "label": label,
-                "action": action,
-                "args": args,
-            }
-        )
-    return out
-
-
-def _try_parse_ui_action(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Deterministic bypass for button clicks.
-    Expected format: "__ui__:{...json...}" where JSON matches {"action": "...", "args": {...}}.
-    """
-    t = (text or "").strip()
-    if not t.startswith(UI_ACTION_PREFIX):
-        return None
-    raw = t[len(UI_ACTION_PREFIX) :].strip()
-    try:
-        obj = json.loads(raw)
-    except Exception:
-        return None
-    if not isinstance(obj, dict):
-        return None
-    action = str(obj.get("action") or "").strip()
-    args = obj.get("args")
-    if not isinstance(args, dict):
-        args = {}
-    if not action:
-        return None
-    return {"action": action, "args": args}
 
 
 def _render_report_markdown(result: Dict[str, Any]) -> Optional[str]:
@@ -253,9 +196,6 @@ def _node_load_session(state: ChatState) -> ChatState:
 
 
 def _node_route(state: ChatState) -> ChatState:
-    direct = _try_parse_ui_action(state.get("message", "") or "")
-    if direct:
-        return {"action": str(direct.get("action") or "help"), "action_args": dict(direct.get("args") or {})}
     plan = _llm_plan(user_text=state.get("message", ""), session=state.get("session") or {})
     return {"action": str(plan.get("action") or "help"), "action_args": dict(plan.get("args") or {})}
 
@@ -263,40 +203,11 @@ def _node_route(state: ChatState) -> ChatState:
 def _node_help(state: ChatState) -> ChatState:
     err = (state.get("action_args") or {}).get("error")
     if err:
-        return {"reply": f"I had trouble interpreting that. Please rephrase. (router_error={err})", "payload": {"options": []}}
-
-    sources_path = state["session"].get("context", {}).get("sources_path") or "config/sources.yaml"
-    source_root = load_sources_config(sources_path)
-    locs = source_root.get("locations", []) or []
-    opts = []
-    for i, loc in enumerate(locs):
-        typ = (loc.get("type") or "").strip() or "source"
-        sid = (loc.get("id") or loc.get("label") or loc.get("name") or "").strip()
-        label = f"{typ}" + (f" — {sid}" if sid else "")
-        opts.append({"id": f"src:{i}", "label": label, "action": "select_source", "args": {"index": i}})
-
-    base_opts = [{"id": "reset", "label": "Start over", "action": "reset_session", "args": {}}]
+        return {"reply": f"I had trouble interpreting that. Please rephrase. (router_error={err})", "payload": {}}
     return {
-        "reply": "Tell me what you want to do, or pick a data source to start.",
-        "payload": {"options": _ui_action_options(base_opts + opts)},
+        "reply": "Tell me what you want to do (e.g., explore sources, pick a table, preview data, or run a data quality assessment).",
+        "payload": {},
     }
-
-
-def _node_reset_session(state: ChatState) -> ChatState:
-    """
-    Clear current selections and cached lists so user can start from the beginning.
-    """
-    sess = state.get("session") or {}
-    ctx = sess.get("context") if isinstance(sess.get("context"), dict) else {}
-    sources_path = (ctx.get("sources_path") or "config/sources.yaml") if isinstance(ctx, dict) else "config/sources.yaml"
-
-    # Reset session state
-    sess["messages"] = []
-    sess["context"] = {"sources_path": sources_path}
-
-    # Reuse help flow to return initial source buttons
-    state = {"session_id": state.get("session_id") or "default", "session": sess, "action_args": {}}
-    return _node_help(state)  # type: ignore
 
 
 def _node_list_sources(state: ChatState) -> ChatState:
@@ -312,11 +223,8 @@ def _node_list_sources(state: ChatState) -> ChatState:
                 "type": loc.get("type"),
             }
         )
-    opts = []
-    for x in out:
-        label = f"{x.get('type')}" + (f" — {x.get('id')}" if x.get("id") else "")
-        opts.append({"id": f"src:{x['index']}", "label": label, "action": "select_source", "args": {"index": x["index"]}})
-    return {"reply": "Select a data source.", "payload": {"sources": out, "options": _ui_action_options(opts)}}
+    reply = "Available sources:\n" + "\n".join([f"- {x['index']}: {x['type']} ({x['id'] or 'no-id'})" for x in out])
+    return {"reply": reply, "payload": {"sources": out}}
 
 
 def _node_select_source(state: ChatState) -> ChatState:
@@ -358,17 +266,8 @@ def _node_select_source(state: ChatState) -> ChatState:
         fs_abs = [i for i, l in enumerate(locs) if (l.get("type") or "").lower() == "filesystem"]
         if idx in fs_abs:
             ctx["selected_fs_location_index"] = fs_abs.index(idx)
-    typ = (loc.get("type") or "").lower()
-    sid = (loc.get("id") or loc.get("label") or "no-id")
-    next_opts: List[Dict[str, Any]] = []
-    if typ == "database":
-        next_opts = [{"id": "sql:list", "label": "List tables", "action": "list_tables", "args": {}}]
-    elif typ == "azure_blob":
-        next_opts = [{"id": "blob:list", "label": "List files", "action": "list_blob_files", "args": {}}]
-    elif typ == "filesystem":
-        next_opts = [{"id": "fs:list", "label": "List local files", "action": "list_local_files", "args": {}}]
-    reply = f"Selected source: **{typ}** ({sid}). Choose what to do next."
-    return {"reply": reply, "payload": {"selected_source_index": idx, "options": _ui_action_options(next_opts)}}
+    reply = f"Selected source {idx}: {(loc.get('type') or '').lower()} ({loc.get('id') or loc.get('label') or 'no-id'})."
+    return {"reply": reply, "payload": {"selected_source_index": idx}}
 
 
 def _azure_blob_locations(source_root: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -393,12 +292,16 @@ def _node_list_blob_files(state: ChatState) -> ChatState:
     ctx["last_blob_list"] = names
     ctx["selected_blob_location_index"] = blob_loc_idx
     if not names:
-        return {"reply": "No blobs found in the selected container.", "payload": {"files": [], "count": 0, "options": []}}
-    opts = [{"id": "blob:all", "label": "Select all files", "action": "select_blob_files", "args": {"all": True}}]
-    for n in names[:30]:
-        opts.append({"id": f"blob:{n}", "label": n, "action": "select_blob_files", "args": {"names": [n]}})
-    reply = f"Found **{len(names)}** blob file(s). Select file(s) to assess."
-    return {"reply": reply, "payload": {"files": names, "count": len(names), "location_index": blob_loc_idx, "options": _ui_action_options(opts)}}
+        return {"reply": "No blobs found in the selected container.", "payload": {"files": [], "count": 0}}
+    # Show first 50 with indices
+    preview = "\n".join([f"- {i+1}: {n}" for i, n in enumerate(names[:50])])
+    if len(names) > 50:
+        preview += f"\n…(+{len(names)-50} more)"
+    reply = (
+        f"Blob files in container (location_index={blob_loc_idx}):\n{preview}\n\n"
+        "Select with: 'select files 1,3-5' or 'select files all'."
+    )
+    return {"reply": reply, "payload": {"files": names, "count": len(names), "location_index": blob_loc_idx}}
 
 
 def _node_select_blob_files(state: ChatState) -> ChatState:
@@ -426,12 +329,8 @@ def _node_select_blob_files(state: ChatState) -> ChatState:
         if not selected:
             return {"reply": "Tell me which files to select (by indices or exact names) after running 'list files'.", "payload": {}}
     ctx["selected_blob_files"] = selected
-    next_opts = [
-        {"id": "blob:assess", "label": "Run data quality assessment", "action": "assess_selected_files", "args": {}},
-        {"id": "blob:list", "label": "List files again", "action": "list_blob_files", "args": {}},
-    ]
-    reply = f"Selected **{len(selected)}** blob file(s)."
-    return {"reply": reply, "payload": {"selected_files": selected, "count": len(selected), "options": _ui_action_options(next_opts)}}
+    reply = f"Selected {len(selected)} file(s) for assessment."
+    return {"reply": reply, "payload": {"selected_files": selected, "count": len(selected)}}
 
 
 def _filesystem_locations(source_root: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -457,11 +356,11 @@ def _node_list_local_files(state: ChatState) -> ChatState:
     ctx["last_local_file_list"] = files
     ctx["local_files_root"] = root_abs
     ctx["selected_fs_location_index"] = fs_idx
-    opts = [{"id": "fs:all", "label": "Select all local files", "action": "select_local_files", "args": {"all": True}}]
-    for n in files[:30]:
-        opts.append({"id": f"fs:{n}", "label": n, "action": "select_local_files", "args": {"names": [n]}})
-    reply = f"Found **{len(files)}** local file(s) under `{root_abs}`. Select file(s) to assess."
-    return {"reply": reply, "payload": {"files": files, "count": len(files), "root": root_abs, "location_index": fs_idx, "options": _ui_action_options(opts)}}
+    preview = "\n".join([f"- {i+1}: {n}" for i, n in enumerate(files[:50])])
+    if len(files) > 50:
+        preview += f"\n…(+{len(files)-50} more)"
+    reply = f"Local files in `{root_abs}`:\n{preview}\n\nSelect with: 'select local files 1,3-5' or 'select local files all'."
+    return {"reply": reply, "payload": {"files": files, "count": len(files), "root": root_abs, "location_index": fs_idx}}
 
 
 def _node_select_local_files(state: ChatState) -> ChatState:
@@ -489,11 +388,7 @@ def _node_select_local_files(state: ChatState) -> ChatState:
         if not selected:
             return {"reply": "Tell me which local files to select (by indices or exact names) after running 'list local files'.", "payload": {}}
     ctx["selected_local_files"] = selected
-    next_opts = [
-        {"id": "fs:assess", "label": "Run data quality assessment", "action": "assess_selected_local_files", "args": {}},
-        {"id": "fs:list", "label": "List local files again", "action": "list_local_files", "args": {}},
-    ]
-    return {"reply": f"Selected **{len(selected)}** local file(s).", "payload": {"selected_local_files": selected, "count": len(selected), "options": _ui_action_options(next_opts)}}
+    return {"reply": f"Selected {len(selected)} local file(s).", "payload": {"selected_local_files": selected, "count": len(selected)}}
 
 
 def _node_assess_selected_local_files(state: ChatState) -> ChatState:
@@ -549,15 +444,11 @@ def _node_assess_selected_local_files(state: ChatState) -> ChatState:
         dfs[name] = df
     result = load_and_profile({"name": "local", "locations": []}, additional_data=dfs)
     sampled = f" (sampled up to {max_rows} rows/file where applicable)" if max_rows > 0 else ""
-    from agent.deterministic_report_formatter import format_assessment_report
-    reply = format_assessment_report(result)
+    report_md = _render_report_markdown(result)
+    reply = report_md or f"Assessment complete for {len(dfs)} local file(s){sampled}."
     return {
         "reply": reply,
-        "payload": {
-            "selected_local_files": selected,
-            "result": result,
-            "options": _ui_action_options([{"id": "reset", "label": "Start over", "action": "reset_session", "args": {}}]),
-        },
+        "payload": {"selected_local_files": selected, "result": result, "report_markdown": report_md},
     }
 
 
@@ -595,16 +486,22 @@ def _node_assess_selected_files(state: ChatState) -> ChatState:
     )
     # Run assessment purely over the loaded blobs (via additional_data).
     result = run_assessment(cfg_text, additional_data=dfs)
-    from agent.deterministic_report_formatter import format_assessment_report
-    reply = format_assessment_report(result)
-    return {
-        "reply": reply,
-        "payload": {
-            "selected_files": selected,
-            "result": result,
-            "options": _ui_action_options([{"id": "reset", "label": "Start over", "action": "reset_session", "args": {}}]),
-        },
-    }
+    report_md = _render_report_markdown(result)
+    if report_md:
+        reply = report_md
+    else:
+        dq = result.get("data_quality_issues", {}) or {}
+        ds = dq.get("datasets", {}) or {}
+        issue_count = 0
+        high = med = low = 0
+        for b in ds.values():
+            s = b.get("summary") or {}
+            issue_count += int(s.get("issue_count") or 0)
+            high += int(s.get("high_severity") or 0)
+            med += int(s.get("medium_severity") or 0)
+            low += int(s.get("low_severity") or 0)
+        reply = f"Assessment complete for {len(dfs)} file(s). Issues={issue_count} (high={high}, medium={med}, low={low})."
+    return {"reply": reply, "payload": {"selected_files": selected, "result": result, "report_markdown": report_md}}
 
 
 def _node_list_tables(state: ChatState) -> ChatState:
@@ -624,11 +521,10 @@ def _node_list_tables(state: ChatState) -> ChatState:
     ctx = state["session"].setdefault("context", {})
     ctx["last_table_list"] = tables
     ctx["selected_db_location_index"] = db_idx
-    opts = [{"id": "sql:select_all", "label": "Select all tables", "action": "select_tables", "args": {"all": True}}]
-    for t in tables[:40]:
-        opts.append({"id": f"sql:{t}", "label": t, "action": "select_table", "args": {"name": t}})
-    reply = f"Found **{len(tables)}** table(s). Select a table to explore, or select tables for assessment."
-    return {"reply": reply, "payload": {"tables": tables, "location_index": db_idx, "options": _ui_action_options(opts)}}
+    reply = "Available SQL tables:\n" + "\n".join([f"- {t}" for t in tables[:200]])
+    if len(tables) > 200:
+        reply += f"\n…(+{len(tables)-200} more)"
+    return {"reply": reply, "payload": {"tables": tables, "location_index": db_idx}}
 
 
 def _node_select_tables(state: ChatState) -> ChatState:
@@ -656,11 +552,7 @@ def _node_select_tables(state: ChatState) -> ChatState:
         if not selected:
             return {"reply": "Tell me which tables to select (by indices or exact names) after running 'list tables'.", "payload": {}}
     ctx["selected_tables"] = selected
-    next_opts = [
-        {"id": "sql:assess", "label": "Run data quality assessment", "action": "assess_selected_tables", "args": {}},
-        {"id": "sql:list", "label": "List tables again", "action": "list_tables", "args": {}},
-    ]
-    return {"reply": f"Selected **{len(selected)}** table(s).", "payload": {"selected_tables": selected, "count": len(selected), "options": _ui_action_options(next_opts)}}
+    return {"reply": f"Selected {len(selected)} table(s).", "payload": {"selected_tables": selected, "count": len(selected)}}
 
 
 def _node_assess_selected_tables(state: ChatState) -> ChatState:
@@ -690,16 +582,10 @@ def _node_assess_selected_tables(state: ChatState) -> ChatState:
     rows = (max_rows if max_rows > 0 else 10_000)
     dfs = {t: conn.preview_table(t, rows) for t in selected}
     result = load_and_profile({"name": source_root.get("name") or "source", "locations": []}, additional_data=dfs)
-    from agent.deterministic_report_formatter import format_assessment_report
-    reply = format_assessment_report(result)
-    return {
-        "reply": reply,
-        "payload": {
-            "selected_tables": selected,
-            "result": result,
-            "options": _ui_action_options([{"id": "reset", "label": "Start over", "action": "reset_session", "args": {}}]),
-        },
-    }
+    sampled = f" (sampled up to {rows} rows/table)" if max_rows > 0 else " (sampled up to 10,000 rows/table)"
+    report_md = _render_report_markdown(result)
+    reply = report_md or f"Assessment complete for {len(dfs)} table(s){sampled}."
+    return {"reply": reply, "payload": {"selected_tables": selected, "result": result, "report_markdown": report_md}}
 
 
 def _node_select_table(state: ChatState) -> ChatState:
@@ -709,15 +595,7 @@ def _node_select_table(state: ChatState) -> ChatState:
         return {"reply": "Tell me which table to use (exact name from 'list tables').", "payload": {}}
     ctx = state["session"].setdefault("context", {})
     ctx["selected_table"] = str(tname)
-    next_opts = [
-        {"id": "tbl:schema", "label": "Show schema", "action": "show_schema", "args": {}},
-        {"id": "tbl:preview", "label": "Preview rows", "action": "preview_table", "args": {}},
-        {"id": "tbl:dq", "label": "Data quality (sample)", "action": "dq_table", "args": {}},
-    ]
-    return {
-        "reply": f"Selected table: **{tname}**. Choose what to do next.",
-        "payload": {"selected_table": str(tname), "options": _ui_action_options(next_opts)},
-    }
+    return {"reply": f"Selected table: {tname}", "payload": {"selected_table": str(tname)}}
 
 
 def _node_show_schema(state: ChatState) -> ChatState:
@@ -858,7 +736,6 @@ def build_chat_graph():
     g.add_node("load_session", _node_load_session)
     g.add_node("route", _node_route)
     g.add_node("help", _node_help)
-    g.add_node("reset_session", _node_reset_session)
     g.add_node("list_sources", _node_list_sources)
     g.add_node("select_source", _node_select_source)
     g.add_node("list_tables", _node_list_tables)
@@ -888,7 +765,6 @@ def build_chat_graph():
         _branch,
         {
             "help": "help",
-            "reset_session": "reset_session",
             "list_sources": "list_sources",
             "select_source": "select_source",
             "list_tables": "list_tables",
@@ -910,7 +786,6 @@ def build_chat_graph():
 
     for n in (
         "help",
-        "reset_session",
         "list_sources",
         "select_source",
         "list_tables",
