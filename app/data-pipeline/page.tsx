@@ -42,6 +42,7 @@ export default function DataPipelinePage() {
   const [currentStep, setCurrentStep] = useState<Step>('database');
   const [selectedDatabase, setSelectedDatabase] = useState<string | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
+  const [availableFiles, setAvailableFiles] = useState<string[]>([]);
   const [businessRequirements, setBusinessRequirements] = useState<string>('');
   const [assessmentData, setAssessmentData] = useState<any>(null);
   const [reportFormat, setReportFormat] = useState<string | null>(null);
@@ -69,8 +70,9 @@ export default function DataPipelinePage() {
     setCurrentStep('files');
   };
 
-  const handleFilesSelect = (files: string[]) => {
+  const handleFilesSelect = (files: string[], available: string[]) => {
     setSelectedFiles(files);
+    setAvailableFiles(available);
   };
 
   const handleStartAssessment = () => {
@@ -92,7 +94,7 @@ export default function DataPipelinePage() {
     if (!assessmentData || !reportFormat) return;
     const blob = reportFormat === 'JSON'
       ? new Blob([JSON.stringify(assessmentData, null, 2)], { type: 'application/json' })
-      : new Blob([generateHtmlReport(assessmentData)], { type: 'text/html' });
+      : new Blob([generateHtmlReport(Array.isArray(assessmentData) ? assessmentData : [])], { type: 'text/html' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -304,30 +306,36 @@ export default function DataPipelinePage() {
                         </pre>
                       ) : (
                         <div className="overflow-x-auto">
-                          <table className="w-full text-sm">
-                            <thead>
-                              <tr className="border-b border-white/20">
-                                <th className="text-left py-3 px-2 text-[#0070AD]">File</th>
-                                <th className="text-left py-3 px-2 text-[#0070AD]">Rows</th>
-                                <th className="text-left py-3 px-2 text-[#0070AD]">Columns</th>
-                                <th className="text-left py-3 px-2 text-[#0070AD]">Missing</th>
-                                <th className="text-left py-3 px-2 text-[#0070AD]">Duplicates</th>
-                                <th className="text-left py-3 px-2 text-[#0070AD]">Quality</th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {assessmentData.map((r: any, i: number) => (
-                                <tr key={i} className="border-b border-white/10">
-                                  <td className="py-2 px-2 text-zinc-900">{r.fileName}</td>
-                                  <td className="py-2 px-2 text-black/70">{(r.totalRows ?? 0).toLocaleString()}</td>
-                                  <td className="py-2 px-2 text-black/70">{r.totalColumns ?? '-'}</td>
-                                  <td className="py-2 px-2 text-amber-400">{(r.missingValues ?? 0).toLocaleString()}</td>
-                                  <td className="py-2 px-2 text-red-400">{(r.duplicates ?? 0).toLocaleString()}</td>
-                                  <td className="py-2 px-2 text-[#0070AD]">{r.dataQualityScore ?? '-'}%</td>
+                          {Array.isArray(assessmentData) ? (
+                            <table className="w-full text-sm">
+                              <thead>
+                                <tr className="border-b border-white/20">
+                                  <th className="text-left py-3 px-2 text-[#0070AD]">File</th>
+                                  <th className="text-left py-3 px-2 text-[#0070AD]">Rows</th>
+                                  <th className="text-left py-3 px-2 text-[#0070AD]">Columns</th>
+                                  <th className="text-left py-3 px-2 text-[#0070AD]">Missing</th>
+                                  <th className="text-left py-3 px-2 text-[#0070AD]">Duplicates</th>
+                                  <th className="text-left py-3 px-2 text-[#0070AD]">Quality</th>
                                 </tr>
-                              ))}
-                            </tbody>
-                          </table>
+                              </thead>
+                              <tbody>
+                                {assessmentData.map((r: any, i: number) => (
+                                  <tr key={i} className="border-b border-white/10">
+                                    <td className="py-2 px-2 text-zinc-900">{r.fileName}</td>
+                                    <td className="py-2 px-2 text-black/70">{(r.totalRows ?? 0).toLocaleString()}</td>
+                                    <td className="py-2 px-2 text-black/70">{r.totalColumns ?? '-'}</td>
+                                    <td className="py-2 px-2 text-amber-400">{(r.missingValues ?? 0).toLocaleString()}</td>
+                                    <td className="py-2 px-2 text-red-400">{(r.duplicates ?? 0).toLocaleString()}</td>
+                                    <td className="py-2 px-2 text-[#0070AD]">{r.dataQualityScore ?? '-'}%</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          ) : (
+                            <div className="text-sm text-black/70">
+                              HTML view is available when assessment output is a row-summary list. Use JSON view for full details.
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>

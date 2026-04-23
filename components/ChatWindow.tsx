@@ -329,7 +329,13 @@ export default function ChatWindow() {
       const { content, threadId, payload } = await fetchAgentReply(messagesWithUser);
       if (threadId) setAgentThreadId(threadId);
 
-      const interactiveOptions: Message['options'] = Array.isArray(payload?.tables)
+      const interactiveOptions: Message['options'] = Array.isArray(payload?.options)
+        ? payload.options.map((o: any, i: number) => ({
+            id: String(o?.id ?? `opt-${i}`),
+            text: String(o?.text ?? ''),
+            send: String(o?.send ?? ''),
+          })).filter((o: any) => o.text && o.send)
+        : Array.isArray(payload?.tables)
         ? payload.tables.slice(0, 12).map((t: any, i: number) => ({
             id: `table-${i}`,
             text: String(t?.name ?? t ?? `Table ${i + 1}`),

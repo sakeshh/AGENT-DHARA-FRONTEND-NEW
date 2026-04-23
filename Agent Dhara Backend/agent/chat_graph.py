@@ -34,6 +34,45 @@ class ChatState(TypedDict, total=False):
     payload: Dict[str, Any]
 
 
+def _flow_options(*items: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Options are consumed by the frontend to render buttons.
+    Each option: {id, text, send}
+    """
+    out: List[Dict[str, str]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        if not it.get("text") or not it.get("send"):
+            continue
+        out.append({"id": str(it.get("id") or it["text"]), "text": str(it["text"]), "send": str(it["send"])})
+    return out
+
+
+def _prompt_choose_action() -> Dict[str, Any]:
+    reply = "📌 Choose Action:\n1. View Data in Files\n2. Generate Report"
+    return {
+        "reply": reply,
+        "payload": {
+            "step": "action",
+            "options": _flow_options(
+                {"id": "view", "text": "👁️ View Data", "send": "view data"},
+                {"id": "report", "text": "📑 Generate Report", "send": "generate report"},
+                {"id": "back", "text": "🔙 Back", "send": "back"},
+                {"id": "restart", "text": "✅ Restart", "send": "restart"},
+            ),
+        },
+    }
+
+
+def _first_location_index(source_root: Dict[str, Any], want_type: str) -> Optional[int]:
+    locs = list(((source_root or {}).get("locations") or []))
+    for i, loc in enumerate(locs):
+        if str(loc.get("type") or "").lower() == want_type:
+            return i
+    return None
+
+
 _MASTER_SYSTEM = """You are the Master (Supervisor) agent for a data exploration + data quality assistant.
 You MUST return ONLY valid JSON and nothing else.
 
@@ -44,6 +83,9 @@ Your job:
 
 Allowed actions (exact strings):
 help
+reset_flow
+back_flow
+set_action
 list_sources
 select_source
 list_tables
@@ -75,6 +117,9 @@ Argument rules:
 - Never invent sources/tables/files that are not listed in the provided context.
 
 Behavior rules:
+- If the user says "restart", choose action=reset_flow.
+- If the user says "back", choose action=back_flow.
+- If the user picks an action ("view data" or "generate report"), choose action=set_action with {"action":"view"} or {"action":"report"}.
 - If the user asks to "run data quality assessment" or "check data quality issues" for the *currently selected blob files*,
   choose action=assess_selected_files.
 - If the user asks to assess the *currently selected local files*, choose action=assess_selected_local_files.
@@ -198,6 +243,32 @@ def _node_load_session(state: ChatState) -> ChatState:
 
 
 def _node_route(state: ChatState) -> ChatState:
+    # Deterministic navigation commands (do not send to LLM router).
+    raw = (state.get("message", "") or "").strip().lower()
+    if raw in ("back", "go back", "← back"):
+        return {"action": "back_flow", "action_args": {}}
+    if raw in ("restart", "reset", "start over"):
+        return {"action": "reset_flow", "action_args": {}}
+
+    # Step 1 shortcuts: data source selection by NL or number.
+    sess = state.get("session") or {}
+    ctx = sess.get("context", {}) if isinstance(sess, dict) else {}
+    if not (ctx or {}).get("selected_source_index"):
+        want = None
+        if raw in ("1", "sql", "sql database", "database"):
+            want = "database"
+        elif raw in ("2", "blob", "azure blob", "azure blob storage"):
+            want = "azure_blob"
+        elif raw in ("3", "file stream", "filesystem", "file", "stream"):
+            want = "filesystem"
+        if want:
+            sources_path = (ctx.get("sources_path") or "config/sources.yaml") if isinstance(ctx, dict) else "config/sources.yaml"
+            source_root = load_sources_config(sources_path)
+            idx = _first_location_index(source_root, want)
+            if idx is None:
+                return {"action": "help", "action_args": {}}
+            return {"action": "select_source", "action_args": {"index": idx}}
+
     plan = _llm_plan(user_text=state.get("message", ""), session=state.get("session") or {})
     return {"action": str(plan.get("action") or "help"), "action_args": dict(plan.get("args") or {})}
 
@@ -206,9 +277,104 @@ def _node_help(state: ChatState) -> ChatState:
     err = (state.get("action_args") or {}).get("error")
     if err:
         return {"reply": f"I had trouble interpreting that. Please rephrase. (router_error={err})", "payload": {}}
+    # Guided mode default
+    reply = (
+        "📌 Select Data Source:\n"
+        "1. SQL\n"
+        "2. Blob\n"
+        "3. File Stream"
+    )
     return {
-        "reply": "Tell me what you want to do (e.g., explore sources, pick a table, preview data, or run a data quality assessment).",
-        "payload": {},
+        "reply": reply,
+        "payload": {
+            "step": "data_source",
+            "options": _flow_options(
+                {"id": "sql", "text": "1. SQL", "send": "sql"},
+                {"id": "blob", "text": "2. Blob", "send": "blob"},
+                {"id": "fs", "text": "3. File Stream", "send": "file stream"},
+            ),
+        },
+    }
+
+
+def _node_reset_flow(state: ChatState) -> ChatState:
+    ctx = state["session"].setdefault("context", {})
+    for k in (
+        "selected_source_index",
+        "selected_db_location_index",
+        "selected_blob_location_index",
+        "selected_fs_location_index",
+        "selected_table",
+        "selected_tables",
+        "selected_blob_files",
+        "selected_local_files",
+        "last_table_list",
+        "last_blob_list",
+        "last_local_file_list",
+    ):
+        ctx.pop(k, None)
+    reply = (
+        "✅ Restarted\n\n"
+        "📌 Select Data Source:\n"
+        "1. SQL\n"
+        "2. Blob\n"
+        "3. File Stream"
+    )
+    return {
+        "reply": reply,
+        "payload": {
+            "step": "data_source",
+            "options": _flow_options(
+                {"id": "sql", "text": "1. SQL", "send": "sql"},
+                {"id": "blob", "text": "2. Blob", "send": "blob"},
+                {"id": "fs", "text": "3. File Stream", "send": "file stream"},
+            ),
+        },
+    }
+
+
+def _node_back_flow(state: ChatState) -> ChatState:
+    """
+    One-step back navigation:
+    - If files/tables were selected → clear selection and go back to file/table list step
+    - Else if source was selected → clear source and go back to data source step
+    """
+    ctx = state["session"].setdefault("context", {})
+    if ctx.get("selected_tables") or ctx.get("selected_table"):
+        ctx.pop("selected_tables", None)
+        ctx.pop("selected_table", None)
+        reply = "🔙 Moved back to file/table selection.\n\n👉 List again with: `list tables`"
+        return {"reply": reply, "payload": {"step": "choose_files"}}
+    if ctx.get("selected_blob_files"):
+        ctx.pop("selected_blob_files", None)
+        reply = "🔙 Moved back to file selection.\n\n👉 List again with: `list files`"
+        return {"reply": reply, "payload": {"step": "choose_files"}}
+    if ctx.get("selected_local_files"):
+        ctx.pop("selected_local_files", None)
+        reply = "🔙 Moved back to file selection.\n\n👉 List again with: `list local files`"
+        return {"reply": reply, "payload": {"step": "choose_files"}}
+    # Back to source selection
+    ctx.pop("selected_source_index", None)
+    ctx.pop("selected_db_location_index", None)
+    ctx.pop("selected_blob_location_index", None)
+    ctx.pop("selected_fs_location_index", None)
+    reply = (
+        "🔙 Moved back to Data Source.\n\n"
+        "📌 Select Data Source:\n"
+        "1. SQL\n"
+        "2. Blob\n"
+        "3. File Stream"
+    )
+    return {
+        "reply": reply,
+        "payload": {
+            "step": "data_source",
+            "options": _flow_options(
+                {"id": "sql", "text": "1. SQL", "send": "sql"},
+                {"id": "blob", "text": "2. Blob", "send": "blob"},
+                {"id": "fs", "text": "3. File Stream", "send": "file stream"},
+            ),
+        },
     }
 
 
@@ -268,8 +434,67 @@ def _node_select_source(state: ChatState) -> ChatState:
         fs_abs = [i for i, l in enumerate(locs) if (l.get("type") or "").lower() == "filesystem"]
         if idx in fs_abs:
             ctx["selected_fs_location_index"] = fs_abs.index(idx)
-    reply = f"Selected source {idx}: {(loc.get('type') or '').lower()} ({loc.get('id') or loc.get('label') or 'no-id'})."
-    return {"reply": reply, "payload": {"selected_source_index": idx}}
+    reply = f"✅ Selected: {(loc.get('type') or '').lower()} ({loc.get('id') or loc.get('label') or 'no-id'})"
+    out = _prompt_choose_action()
+    out["reply"] = reply + "\n\n" + out["reply"]
+    out["payload"]["selected_source_index"] = idx
+    return out
+
+
+def _node_set_action(state: ChatState) -> ChatState:
+    """
+    Step 2: user chooses View vs Report.
+    Immediately lists available files/tables for the selected source.
+    """
+    ctx = state["session"].setdefault("context", {})
+    args = state.get("action_args") or {}
+    a = str(args.get("action") or "").strip().lower()
+    if a in ("1", "view", "view data", "view_data"):
+        ctx["selected_action"] = "view"
+    elif a in ("2", "report", "generate report", "generate_report"):
+        ctx["selected_action"] = "report"
+    else:
+        # try infer from raw user text
+        raw = (state.get("message", "") or "").strip().lower()
+        if "view" in raw:
+            ctx["selected_action"] = "view"
+        elif "report" in raw or "generate" in raw:
+            ctx["selected_action"] = "report"
+        else:
+            return _prompt_choose_action()
+
+    # Determine selected source type and list the right entities
+    sources_path = ctx.get("sources_path") or "config/sources.yaml"
+    source_root = load_sources_config(sources_path)
+    locs = list(source_root.get("locations", []) or [])
+    sel_idx = ctx.get("selected_source_index")
+    if sel_idx is None:
+        return {"reply": "📌 Select Data Source:\n1. SQL\n2. Blob\n3. File Stream", "payload": {"step": "data_source"}}
+    try:
+        sel_idx = int(sel_idx)
+    except Exception:
+        sel_idx = 0
+    sel_idx = max(0, min(sel_idx, len(locs) - 1)) if locs else 0
+    sel_type = str((locs[sel_idx].get("type") if locs else "") or "").lower()
+
+    if sel_type == "database":
+        out = _node_list_tables(state)
+        out["reply"] = "✅ Action: " + ("View Data" if ctx["selected_action"] == "view" else "Generate Report") + "\n\n📂 Available Tables:\n" + out["reply"].split("Available SQL tables:\n", 1)[-1] + "\n\n👉 Select table(s) by number"
+        out["payload"]["step"] = "choose_files"
+        return out
+    if sel_type == "azure_blob":
+        out = _node_list_blob_files(state)
+        # keep text clean and add selection hint
+        out["reply"] = "✅ Action: " + ("View Data" if ctx["selected_action"] == "view" else "Generate Report") + "\n\n📂 Available Files:\n" + out["reply"].split(":\n", 1)[-1] + "\n\n👉 Select file(s) by number"
+        out["payload"]["step"] = "choose_files"
+        return out
+    if sel_type == "filesystem":
+        out = _node_list_local_files(state)
+        out["reply"] = "✅ Action: " + ("View Data" if ctx["selected_action"] == "view" else "Generate Report") + "\n\n📂 Available Files:\n" + out["reply"].split(":\n", 1)[-1] + "\n\n👉 Select file(s) by number"
+        out["payload"]["step"] = "choose_files"
+        return out
+
+    return {"reply": "I only support SQL, Blob, and File Stream right now.", "payload": {"step": "data_source"}}
 
 
 def _azure_blob_locations(source_root: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -917,6 +1142,9 @@ def build_chat_graph():
     g.add_node("load_session", _node_load_session)
     g.add_node("route", _node_route)
     g.add_node("help", _node_help)
+    g.add_node("reset_flow", _node_reset_flow)
+    g.add_node("back_flow", _node_back_flow)
+    g.add_node("set_action", _node_set_action)
     g.add_node("list_sources", _node_list_sources)
     g.add_node("select_source", _node_select_source)
     g.add_node("list_tables", _node_list_tables)
@@ -948,6 +1176,9 @@ def build_chat_graph():
         _branch,
         {
             "help": "help",
+            "reset_flow": "reset_flow",
+            "back_flow": "back_flow",
+            "set_action": "set_action",
             "list_sources": "list_sources",
             "select_source": "select_source",
             "list_tables": "list_tables",
@@ -971,6 +1202,9 @@ def build_chat_graph():
 
     for n in (
         "help",
+        "reset_flow",
+        "back_flow",
+        "set_action",
         "list_sources",
         "select_source",
         "list_tables",

@@ -9,75 +9,71 @@ interface DatabaseSelectorProps {
   onBack?: () => void;
 }
 
-/* Data source options matching the chat "Choose one" box */
-const DATA_SOURCE_OPTIONS = [
-  { id: 'local', text: 'Local data', icon: FaFolder },
-  { id: 'sql', text: 'SQL data', icon: FaDatabase },
-  { id: 'blob', text: 'Blob data', icon: FaCloud },
-  { id: 'streams', text: 'Real-time streams', icon: FaStream },
-  { id: 'apis', text: 'APIs', icon: FaPlug },
-];
+type SourceLocation = { index: number; id?: string | null; type?: string | null };
 
-const SQL_DATABASES = [
-  { id: 'postgres-prod', name: 'PostgreSQL Production', type: 'postgresql' },
-  { id: 'mysql-analytics', name: 'MySQL Analytics', type: 'mysql' },
-  { id: 'azure-sql-db', name: 'Azure SQL Database', type: 'azure-sql' },
-  { id: 'mongodb-logs', name: 'MongoDB Logs', type: 'mongodb' },
-  { id: 'mssql-sales', name: 'SQL Server Sales', type: 'mssql' },
-  { id: 'oracle-erp', name: 'Oracle ERP', type: 'oracle' },
-  { id: 'postgres-dev', name: 'PostgreSQL Development', type: 'postgresql' },
-];
-
-const LOCAL_OPTIONS = [
-  { id: 'local-csv', name: 'CSV Files', type: 'csv' },
-  { id: 'local-excel', name: 'Excel Files', type: 'xlsx' },
-  { id: 'local-json', name: 'JSON Files', type: 'json' },
-  { id: 'local-parquet', name: 'Parquet Files', type: 'parquet' },
-  { id: 'local-other', name: 'Other', type: 'other' },
-];
-
-const BLOB_OPTIONS = [
-  { id: 'blob-azure', name: 'Azure Blob Storage', type: 'azure' },
-  { id: 'blob-s3', name: 'AWS S3', type: 's3' },
-  { id: 'blob-gcs', name: 'Google Cloud Storage', type: 'gcs' },
-];
-
-const STREAMS_OPTIONS = [
-  { id: 'streams-eventhubs', name: 'Azure Event Hubs', type: 'eventhubs' },
-  { id: 'streams-kafka', name: 'Apache Kafka', type: 'kafka' },
-  { id: 'streams-kinesis', name: 'AWS Kinesis', type: 'kinesis' },
-];
-
-const API_OPTIONS = [
-  { id: 'api-rest', name: 'REST API', type: 'rest' },
-  { id: 'api-graphql', name: 'GraphQL API', type: 'graphql' },
-  { id: 'api-soap', name: 'SOAP API', type: 'soap' },
-];
-
-const getOptionsForDataSource = (sourceId: string | null) => {
-  switch (sourceId) {
-    case 'sql': return SQL_DATABASES;
-    case 'local': return LOCAL_OPTIONS;
-    case 'blob': return BLOB_OPTIONS;
-    case 'streams': return STREAMS_OPTIONS;
-    case 'apis': return API_OPTIONS;
-    default: return [];
-  }
+const SOURCE_TYPE_TO_CARD: Record<string, { id: string; text: string; icon: any }> = {
+  database: { id: 'sql', text: 'SQL data', icon: FaDatabase },
+  azure_blob: { id: 'blob', text: 'Blob data', icon: FaCloud },
+  filesystem: { id: 'streams', text: 'File stream', icon: FaStream },
+  local: { id: 'local', text: 'Local data', icon: FaFolder },
 };
+
+function normalizeType(t: any): string {
+  const s = String(t || '').toLowerCase();
+  if (s.includes('azure_blob')) return 'azure_blob';
+  if (s.includes('filesystem')) return 'filesystem';
+  if (s.includes('database')) return 'database';
+  return s || 'unknown';
+}
 
 export default function DatabaseSelector({ onSelect, onBack }: DatabaseSelectorProps) {
   const [selectedDataSource, setSelectedDataSource] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [loading, setLoading] = useState(true);
+  const [locations, setLocations] = useState<SourceLocation[]>([]);
 
-  const options = getOptionsForDataSource(selectedDataSource);
-  const filteredOptions = options.filter(item =>
-    item.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    item.type.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const filteredLocations = locations
+    .filter((l) => normalizeType(l.type) !== 'azure_blob_output') // pipeline inputs only
+    .filter((l) => {
+      if (!selectedDataSource) return false;
+      const nt = normalizeType(l.type);
+      if (selectedDataSource === 'sql') return nt === 'database';
+      if (selectedDataSource === 'blob') return nt === 'azure_blob';
+      if (selectedDataSource === 'streams') return nt === 'filesystem';
+      return false;
+    })
+    .filter((l) => {
+      const q = searchTerm.trim().toLowerCase();
+      if (!q) return true;
+      const label = String(l.id || '').toLowerCase();
+      const tp = normalizeType(l.type);
+      return label.includes(q) || tp.includes(q) || String(l.index).includes(q);
+    });
 
   useEffect(() => {
-    setTimeout(() => setLoading(false), 600);
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch('/api/sources');
+        const data = await res.json().catch(() => null);
+        const locs = Array.isArray(data?.locations) ? data.locations : [];
+        if (!alive) return;
+        setLocations(
+          locs.map((x: any) => ({
+            index: Number(x?.index ?? 0),
+            id: x?.id ?? null,
+            type: x?.type ?? null,
+          }))
+        );
+      } catch {
+        // ignore
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -109,14 +105,20 @@ export default function DatabaseSelector({ onSelect, onBack }: DatabaseSelectorP
       {/* Choose one - Data source type options (matching chat choose box) */}
       <div>
         <p className="text-sm font-medium text-black/70 mb-3">Choose one:</p>
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
-          {DATA_SOURCE_OPTIONS.map((option, idx) => {
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-3 gap-3">
+          {(['sql', 'blob', 'streams'] as const).map((id, idx) => {
+            const option =
+              id === 'sql'
+                ? SOURCE_TYPE_TO_CARD.database
+                : id === 'blob'
+                  ? SOURCE_TYPE_TO_CARD.azure_blob
+                  : SOURCE_TYPE_TO_CARD.filesystem;
             const Icon = option.icon;
-            const isSelected = selectedDataSource === option.id;
+            const isSelected = selectedDataSource === id;
             return (
               <motion.button
-                key={option.id}
-                onClick={() => setSelectedDataSource(option.id)}
+                key={id}
+                onClick={() => setSelectedDataSource(id)}
                 className={`flex items-center gap-3 p-4 text-sm font-medium text-left rounded-xl border transition-all ${
                   isSelected
                     ? 'bg-[#0070AD]/15 border-[#0070AD]/50 text-zinc-900'
@@ -174,13 +176,13 @@ export default function DatabaseSelector({ onSelect, onBack }: DatabaseSelectorP
             className="space-y-4"
           >
             <p className="text-sm font-medium text-black/70">
-              Select {selectedDataSource === 'sql' ? 'database' : 'connection'}:
+              Select {selectedDataSource === 'sql' ? 'database' : selectedDataSource === 'blob' ? 'blob source' : 'filesystem source'}:
             </p>
             <div className="relative">
               <FaSearch className="absolute left-4 top-1/2 -translate-y-1/2 text-black/45" />
               <input
                 type="text"
-                placeholder={`Search ${selectedDataSource === 'sql' ? 'databases' : 'options'}...`}
+                placeholder={`Search ${selectedDataSource} sources...`}
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 className="w-full pl-12 pr-4 py-3 border border-black/10 rounded-xl focus:ring-2 focus:ring-[#0070AD]/25 focus:border-[#0070AD]/40 outline-none bg-white/90 text-zinc-900 placeholder-black/40"
@@ -194,10 +196,10 @@ export default function DatabaseSelector({ onSelect, onBack }: DatabaseSelectorP
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {filteredOptions.map((item, index) => (
+                {filteredLocations.map((item, index) => (
                   <motion.button
-                    key={item.id}
-                    onClick={() => onSelect(item.id)}
+                    key={`${item.index}-${item.id ?? item.type ?? 'src'}`}
+                    onClick={() => onSelect(`src:${selectedDataSource}:${item.index}`)}
                     className="p-6 bg-white/85 border border-black/10 rounded-xl hover:border-[#0070AD]/30 hover:bg-white transition-all text-left group"
                     initial={{ opacity: 0, y: 20 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -210,15 +212,19 @@ export default function DatabaseSelector({ onSelect, onBack }: DatabaseSelectorP
                         <FaDatabase className="text-2xl text-[#0070AD]/80" />
                       </div>
                       <div className="flex-1">
-                        <h3 className="font-semibold text-zinc-900 mb-1">{item.name}</h3>
-                        <p className="text-sm text-black/60 capitalize">{item.type}</p>
+                        <h3 className="font-semibold text-zinc-900 mb-1">
+                          {item.id ? String(item.id) : `Source #${item.index}`}
+                        </h3>
+                        <p className="text-sm text-black/60 capitalize">
+                          {normalizeType(item.type)}
+                        </p>
                       </div>
                     </div>
                   </motion.button>
                 ))}
               </div>
             )}
-            {filteredOptions.length === 0 && !loading && (
+            {filteredLocations.length === 0 && !loading && (
               <div className="text-center py-12">
                 <FaDatabase className="text-6xl text-black/30 mx-auto mb-4" />
                 <p className="text-black/60">No options found matching your search</p>
