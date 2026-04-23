@@ -253,7 +253,7 @@ def _node_route(state: ChatState) -> ChatState:
     # Step 1 shortcuts: data source selection by NL or number.
     sess = state.get("session") or {}
     ctx = sess.get("context", {}) if isinstance(sess, dict) else {}
-    if not (ctx or {}).get("selected_source_index"):
+    if (ctx or {}).get("selected_source_index") is None:
         want = None
         if raw in ("1", "sql", "sql database", "database"):
             want = "database"
@@ -268,6 +268,13 @@ def _node_route(state: ChatState) -> ChatState:
             if idx is None:
                 return {"action": "help", "action_args": {}}
             return {"action": "select_source", "action_args": {"index": idx}}
+
+    # Step 2 shortcuts: action selection without LLM.
+    if (ctx or {}).get("selected_source_index") is not None and (ctx or {}).get("selected_action") is None:
+        if raw in ("view data", "view", "1"):
+            return {"action": "set_action", "action_args": {"action": "view"}}
+        if raw in ("generate report", "report", "2"):
+            return {"action": "set_action", "action_args": {"action": "report"}}
 
     plan = _llm_plan(user_text=state.get("message", ""), session=state.get("session") or {})
     return {"action": str(plan.get("action") or "help"), "action_args": dict(plan.get("args") or {})}
@@ -556,8 +563,38 @@ def _node_select_blob_files(state: ChatState) -> ChatState:
         if not selected:
             return {"reply": "Tell me which files to select (by indices or exact names) after running 'list files'.", "payload": {}}
     ctx["selected_blob_files"] = selected
-    reply = f"Selected {len(selected)} file(s) for assessment."
-    return {"reply": reply, "payload": {"selected_files": selected, "count": len(selected)}}
+    # If user previously chose "Generate Report", run it now.
+    if str(ctx.get("selected_action") or "").lower() == "report":
+        out = _node_assess_selected_files(state)
+        out["reply"] = "✅ Selected File(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n📑 Report:\n" + (out.get("reply") or "")
+        out["payload"]["step"] = "report"
+        out["payload"]["selected_files"] = selected
+        out["payload"]["options"] = _flow_options(
+            {"id": "back", "text": "🔙 Back", "send": "back"},
+            {"id": "restart", "text": "✅ Restart", "send": "restart"},
+        )
+        return out
+
+    reply = (
+        "✅ Selected File(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n"
+        "👉 What would you like to see? (e.g., first row, columns, last 5 rows)\n"
+        "You can also type: back / restart"
+    )
+    return {
+        "reply": reply,
+        "payload": {
+            "step": "view_query",
+            "selected_files": selected,
+            "count": len(selected),
+            "options": _flow_options(
+                {"id": "first", "text": "📊 Show first row", "send": "show first row"},
+                {"id": "cols", "text": "📊 Show columns", "send": "show columns"},
+                {"id": "head5", "text": "📊 Show top 5", "send": "show top 5 rows"},
+                {"id": "back", "text": "🔙 Back", "send": "back"},
+                {"id": "restart", "text": "✅ Restart", "send": "restart"},
+            ),
+        },
+    }
 
 
 def _filesystem_locations(source_root: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -615,7 +652,37 @@ def _node_select_local_files(state: ChatState) -> ChatState:
         if not selected:
             return {"reply": "Tell me which local files to select (by indices or exact names) after running 'list local files'.", "payload": {}}
     ctx["selected_local_files"] = selected
-    return {"reply": f"Selected {len(selected)} local file(s).", "payload": {"selected_local_files": selected, "count": len(selected)}}
+    if str(ctx.get("selected_action") or "").lower() == "report":
+        out = _node_assess_selected_local_files(state)
+        out["reply"] = "✅ Selected File(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n📑 Report:\n" + (out.get("reply") or "")
+        out["payload"]["step"] = "report"
+        out["payload"]["selected_local_files"] = selected
+        out["payload"]["options"] = _flow_options(
+            {"id": "back", "text": "🔙 Back", "send": "back"},
+            {"id": "restart", "text": "✅ Restart", "send": "restart"},
+        )
+        return out
+
+    reply = (
+        "✅ Selected File(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n"
+        "👉 What would you like to see? (e.g., first row, columns, last 5 rows)\n"
+        "You can also type: back / restart"
+    )
+    return {
+        "reply": reply,
+        "payload": {
+            "step": "view_query",
+            "selected_local_files": selected,
+            "count": len(selected),
+            "options": _flow_options(
+                {"id": "first", "text": "📊 Show first row", "send": "show first row"},
+                {"id": "cols", "text": "📊 Show columns", "send": "show columns"},
+                {"id": "head5", "text": "📊 Show top 5", "send": "show top 5 rows"},
+                {"id": "back", "text": "🔙 Back", "send": "back"},
+                {"id": "restart", "text": "✅ Restart", "send": "restart"},
+            ),
+        },
+    }
 
 
 def _node_assess_selected_local_files(state: ChatState) -> ChatState:
@@ -958,7 +1025,36 @@ def _node_select_tables(state: ChatState) -> ChatState:
         if not selected:
             return {"reply": "Tell me which tables to select (by indices or exact names) after running 'list tables'.", "payload": {}}
     ctx["selected_tables"] = selected
-    return {"reply": f"Selected {len(selected)} table(s).", "payload": {"selected_tables": selected, "count": len(selected)}}
+    if str(ctx.get("selected_action") or "").lower() == "report":
+        out = _node_assess_selected_tables(state)
+        out["reply"] = "✅ Selected Table(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n📑 Report:\n" + (out.get("reply") or "")
+        out["payload"]["step"] = "report"
+        out["payload"]["selected_tables"] = selected
+        out["payload"]["options"] = _flow_options(
+            {"id": "back", "text": "🔙 Back", "send": "back"},
+            {"id": "restart", "text": "✅ Restart", "send": "restart"},
+        )
+        return out
+
+    reply = (
+        "✅ Selected Table(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n"
+        "👉 What would you like to see? (e.g., first row, columns, last 5 rows)\n"
+        "You can also type: back / restart"
+    )
+    return {
+        "reply": reply,
+        "payload": {
+            "step": "view_query",
+            "selected_tables": selected,
+            "count": len(selected),
+            "options": _flow_options(
+                {"id": "head", "text": "📊 Preview top rows", "send": "preview table"},
+                {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+                {"id": "back", "text": "🔙 Back", "send": "back"},
+                {"id": "restart", "text": "✅ Restart", "send": "restart"},
+            ),
+        },
+    }
 
 
 def _node_assess_selected_tables(state: ChatState) -> ChatState:

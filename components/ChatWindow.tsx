@@ -102,6 +102,12 @@ export default function ChatWindow() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const localFolderInputRef = useRef<HTMLInputElement | null>(null);
 
+  const getPersistedSelectedSource = (): string | null => {
+    if (typeof window === 'undefined') return null;
+    const v = window.localStorage.getItem('dharaSelectedDataSource');
+    return v && typeof v === 'string' ? v : null;
+  };
+
   const getEffectiveSessionId = (): string => {
     if (typeof window === 'undefined') return 'default';
     return window.localStorage.getItem('dharaSessionId') || 'default';
@@ -112,8 +118,20 @@ export default function ChatWindow() {
     const saved = window.localStorage.getItem('agentThreadId');
     if (saved && !agentThreadId) setAgentThreadId(saved);
     setSessionId(getEffectiveSessionId());
+    const persistedSource = getPersistedSelectedSource();
+    if (persistedSource && !selectedDataSource) {
+      setSelectedDataSource(persistedSource);
+      setHasSelectedDataSource(true);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (selectedDataSource) {
+      window.localStorage.setItem('dharaSelectedDataSource', selectedDataSource);
+    }
+  }, [selectedDataSource]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -329,6 +347,24 @@ export default function ChatWindow() {
       const { content, threadId, payload } = await fetchAgentReply(messagesWithUser);
       if (threadId) setAgentThreadId(threadId);
 
+      // If the user typed "blob"/"sql"/etc. directly (instead of selecting via UI),
+      // the backend may return files/tables without the UI having a selectedDataSource yet.
+      // Infer source from payload shape to ensure our interactive buttons send correct commands.
+      let inferredSource: string | null = null;
+      if (payload && typeof payload === 'object') {
+        const hasFiles = Array.isArray((payload as any)?.files);
+        const hasTables = Array.isArray((payload as any)?.tables);
+        const hasRoot = typeof (payload as any)?.root === 'string' && String((payload as any).root).length > 0;
+        if (hasTables) inferredSource = 'sql';
+        else if (hasFiles) inferredSource = hasRoot ? 'streams' : 'blob';
+      }
+
+      const effectiveSource = selectedDataSource || inferredSource;
+      if (!selectedDataSource && inferredSource) {
+        setSelectedDataSource(inferredSource);
+        setHasSelectedDataSource(true);
+      }
+
       const interactiveOptions: Message['options'] = Array.isArray(payload?.options)
         ? payload.options.map((o: any, i: number) => ({
             id: String(o?.id ?? `opt-${i}`),
@@ -347,9 +383,9 @@ export default function ChatWindow() {
                 id: `file-${i}`,
                 text: String(f),
                 send:
-                  selectedDataSource === 'blob'
+                  effectiveSource === 'blob'
                     ? `select files ${i + 1}`
-                    : selectedDataSource === 'streams'
+                    : effectiveSource === 'streams'
                       ? `select local files ${i + 1}`
                       : `select local files ${i + 1}`,
               })),
@@ -358,7 +394,7 @@ export default function ChatWindow() {
                     {
                       id: 'select-all',
                       text: 'Select all',
-                      send: selectedDataSource === 'blob' ? 'select files all' : 'select local files all',
+                      send: effectiveSource === 'blob' ? 'select files all' : 'select local files all',
                     },
                   ]
                 : []),
