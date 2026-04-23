@@ -78,7 +78,7 @@ You MUST return ONLY valid JSON and nothing else.
 
 Your job:
 - Understand the user request in natural language.
-- Decide what action to take next.
+- Decide what action to take next (route to the right "agent": extraction vs data quality vs navigation).
 - Provide the minimal arguments needed to execute it.
 
 Allowed actions (exact strings):
@@ -95,6 +95,10 @@ show_schema
 preview_table
 nl_query
 dq_table
+show_null_columns
+extract_columns
+dq_overview
+dq_duplicates
 list_blob_files
 select_blob_files
 assess_selected_files
@@ -124,6 +128,9 @@ Behavior rules:
   choose action=assess_selected_files.
 - If the user asks to assess the *currently selected local files*, choose action=assess_selected_local_files.
 - If the user asks to assess the *currently selected tables*, choose action=assess_selected_tables.
+- If the user asks a data-quality question (nulls, duplicates, outliers, issues, quality summary) AFTER a report was generated,
+  choose a DQ action (dq_overview / show_null_columns / dq_duplicates) and answer from the latest assessment.
+- If the user asks for extraction (show columns, show top rows, preview data) for selected datasets, choose an extraction action.
 
 Examples (JSON only):
 {"action":"list_sources","args":{}}
@@ -134,6 +141,8 @@ Examples (JSON only):
 {"action":"list_blob_files","args":{}}
 {"action":"select_blob_files","args":{"all":true}}
 {"action":"assess_selected_files","args":{}}
+{"action":"dq_overview","args":{}}
+{"action":"extract_columns","args":{}}
 """
 
 
@@ -149,6 +158,358 @@ def _render_report_markdown(result: Dict[str, Any]) -> Optional[str]:
     except Exception:
         return None
     return None
+
+
+def _write_report_artifacts(
+    *,
+    result: Dict[str, Any],
+    report_markdown: Optional[str] = None,
+    report_html: Optional[str] = None,
+    base_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Persist "fresh" report artifacts for the chat workflow.
+
+    The CLI (`main.py --reports-dir`) writes `output/reports/report.*`, but the chat API historically
+    returned reports without writing files. Users expect the output folder to update on each run.
+
+    This function overwrites `report.json/.md/.html` and also writes timestamped copies.
+    """
+    import os
+    from datetime import datetime, timezone
+
+    if not isinstance(result, dict):
+        return {}
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    default_dir = os.path.abspath(os.path.join(here, "..", "output", "reports"))
+    reports_dir = os.path.abspath(base_dir) if base_dir else default_dir
+    os.makedirs(reports_dir, exist_ok=True)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    meta = result.setdefault("run_metadata", {}) if isinstance(result.get("run_metadata"), dict) or result.get("run_metadata") is None else {}
+    if isinstance(meta, dict):
+        meta["generated_at"] = datetime.now(timezone.utc).isoformat()
+        meta["reports_dir"] = reports_dir
+
+    json_bytes = json.dumps(result, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    paths = {
+        "json": os.path.join(reports_dir, "report.json"),
+        "json_ts": os.path.join(reports_dir, f"report_{ts}.json"),
+    }
+    with open(paths["json"], "wb") as f:
+        f.write(json_bytes)
+    with open(paths["json_ts"], "wb") as f:
+        f.write(json_bytes)
+
+    if report_markdown:
+        md_path = os.path.join(reports_dir, "report.md")
+        md_ts_path = os.path.join(reports_dir, f"report_{ts}.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(report_markdown)
+        with open(md_ts_path, "w", encoding="utf-8") as f:
+            f.write(report_markdown)
+        paths["md"] = md_path
+        paths["md_ts"] = md_ts_path
+
+    if report_html:
+        html_path = os.path.join(reports_dir, "report.html")
+        html_ts_path = os.path.join(reports_dir, f"report_{ts}.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(report_html)
+        with open(html_ts_path, "w", encoding="utf-8") as f:
+            f.write(report_html)
+        paths["html"] = html_path
+        paths["html_ts"] = html_ts_path
+
+    return {"reports_dir": reports_dir, "paths": paths}
+
+
+def _pick_single_active_dataset(ctx: Dict[str, Any]) -> Optional[str]:
+    """
+    Choose a single dataset key to answer follow-up DQ questions.
+    Priority:
+    - selected_table
+    - exactly 1 selected_local_files
+    - exactly 1 selected_blob_files
+    - exactly 1 selected_tables
+    - last_assessment_datasets if exactly 1
+    """
+    t = (ctx or {}).get("selected_table")
+    if t:
+        return str(t)
+
+    for k in ("selected_local_files", "selected_blob_files", "selected_tables"):
+        lst = (ctx or {}).get(k) or []
+        if isinstance(lst, list) and len(lst) == 1:
+            return str(lst[0])
+
+    last_ds = (ctx or {}).get("last_assessment_datasets") or []
+    if isinstance(last_ds, list) and len(last_ds) == 1:
+        return str(last_ds[0])
+    return None
+
+
+def _assessment_signature(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    def _norm_list(x: Any) -> List[str]:
+        if not isinstance(x, list):
+            return []
+        return sorted([str(v) for v in x if str(v).strip()])
+
+    return {
+        "selected_table": str(ctx.get("selected_table") or ""),
+        "selected_tables": _norm_list(ctx.get("selected_tables")),
+        "selected_blob_files": _norm_list(ctx.get("selected_blob_files")),
+        "selected_local_files": _norm_list(ctx.get("selected_local_files")),
+        "selected_db_location_index": int(ctx.get("selected_db_location_index") or 0),
+        "selected_blob_location_index": int(ctx.get("selected_blob_location_index") or 0),
+        "selected_fs_location_index": int(ctx.get("selected_fs_location_index") or 0),
+        "local_files_root": str(ctx.get("local_files_root") or ""),
+    }
+
+
+def _ensure_latest_assessment(state: ChatState) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Ensure we have a fresh assessment for the current selection (single source, multiple datasets allowed).
+    Returns (result, error_message).
+    """
+    ctx = state["session"].setdefault("context", {})
+    sig = _assessment_signature(ctx)
+    prev_sig = ctx.get("last_assessment_signature")
+    prev = ctx.get("last_assessment_result")
+    if isinstance(prev, dict) and isinstance(prev_sig, dict) and prev_sig == sig:
+        return prev, None
+
+    # Prefer explicit multi-selection
+    if ctx.get("selected_tables") or ctx.get("selected_table"):
+        if not ctx.get("selected_tables") and ctx.get("selected_table"):
+            ctx["selected_tables"] = [str(ctx["selected_table"])]
+        out = _node_assess_selected_tables(state)
+        res = out.get("payload", {}).get("result")
+        if isinstance(res, dict):
+            ctx["last_assessment_signature"] = sig
+            return res, None
+        return None, out.get("reply") or "Failed to assess selected tables."
+
+    if ctx.get("selected_blob_files"):
+        out = _node_assess_selected_files(state)
+        res = out.get("payload", {}).get("result")
+        if isinstance(res, dict):
+            ctx["last_assessment_signature"] = sig
+            return res, None
+        return None, out.get("reply") or "Failed to assess selected files."
+
+    if ctx.get("selected_local_files"):
+        out = _node_assess_selected_local_files(state)
+        res = out.get("payload", {}).get("result")
+        if isinstance(res, dict):
+            ctx["last_assessment_signature"] = sig
+            return res, None
+        return None, out.get("reply") or "Failed to assess selected local files."
+
+    return None, "No datasets selected. Select one or more tables/files first, then ask again."
+
+
+def _node_show_null_columns(state: ChatState) -> ChatState:
+    """
+    Show columns that have nulls / placeholder-nulls based on the latest assessment result.
+    Works for either a selected SQL table or a selected file (blob/local), as long as we have
+    the latest assessment cached in session context.
+    """
+    ctx = state["session"].setdefault("context", {})
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+    datasets = result.get("datasets") or {}
+    if not isinstance(datasets, dict) or not datasets:
+        return {"reply": "No dataset profiles found in the last assessment.", "payload": {}}
+
+    args = state.get("action_args") or {}
+    dataset = args.get("dataset") or args.get("table") or args.get("file")
+    dataset_key = str(dataset) if dataset else _pick_single_active_dataset(ctx)
+    if not dataset_key:
+        choices = list(datasets.keys())[:20]
+        hint = "Select one dataset first (e.g. `select table ...` or select a single file), then ask again."
+        return {"reply": f"I need a specific table/file to check. {hint}\n\nKnown datasets:\n- " + "\n- ".join(choices), "payload": {"datasets": list(datasets.keys())}}
+    if dataset_key not in datasets:
+        # Try fallback: sometimes selected file/table isn't the dataset key (e.g. prefixes). Best-effort contains match.
+        matches = [k for k in datasets.keys() if dataset_key.lower() in str(k).lower()]
+        if len(matches) == 1:
+            dataset_key = matches[0]
+        else:
+            return {"reply": f"Couldn't find `{dataset_key}` in the last assessment datasets.", "payload": {"datasets": list(datasets.keys())}}
+
+    prof = datasets.get(dataset_key) or {}
+    cols = (prof.get("columns") or {}) if isinstance(prof, dict) else {}
+    if not isinstance(cols, dict) or not cols:
+        return {"reply": f"No column profile found for `{dataset_key}`.", "payload": {}}
+
+    null_cols: List[Tuple[str, float]] = []
+    for col, meta in cols.items():
+        if not isinstance(meta, dict):
+            continue
+        try:
+            pct = float(meta.get("null_percentage") or 0.0)
+        except Exception:
+            pct = 0.0
+        if pct > 0:
+            null_cols.append((str(col), pct))
+    null_cols.sort(key=lambda x: x[1], reverse=True)
+
+    if not null_cols:
+        return {"reply": f"✅ `{dataset_key}`: No null values detected in any column (based on the last assessment sample).", "payload": {"dataset": dataset_key, "null_columns": []}}
+
+    top = null_cols[:50]
+    lines = [f"- {c}: {round(p*100, 2)}%" for c, p in top]
+    more = f"\n…(+{len(null_cols)-len(top)} more)" if len(null_cols) > len(top) else ""
+    return {
+        "reply": f"Columns with null values in `{dataset_key}` (showing {len(top)}/{len(null_cols)}):\n" + "\n".join(lines) + more,
+        "payload": {"dataset": dataset_key, "null_columns": [{"name": c, "null_percentage": p} for c, p in null_cols]},
+    }
+
+
+def _node_dq_overview(state: ChatState) -> ChatState:
+    """
+    DQ Agent: summarize quality issues across all selected datasets for the active source.
+    Auto-runs assessment if needed.
+    """
+    ctx = state["session"].setdefault("context", {})
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+
+    dq = (result.get("data_quality_issues") or {}) if isinstance(result, dict) else {}
+    per = (dq.get("datasets") or {}) if isinstance(dq, dict) else {}
+    if not isinstance(per, dict) or not per:
+        return {"reply": "No data quality section found in the latest assessment.", "payload": {}}
+
+    rows = []
+    total = {"issues": 0, "high": 0, "medium": 0, "low": 0}
+    for ds_name, block in per.items():
+        summ = (block or {}).get("summary") or {}
+        try:
+            ic = int(summ.get("issue_count") or 0)
+            hi = int(summ.get("high_severity") or 0)
+            me = int(summ.get("medium_severity") or 0)
+            lo = int(summ.get("low_severity") or 0)
+        except Exception:
+            ic = hi = me = lo = 0
+        total["issues"] += ic
+        total["high"] += hi
+        total["medium"] += me
+        total["low"] += lo
+        rows.append((str(ds_name), ic, hi, me, lo))
+
+    rows.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    top = rows[:20]
+    lines = [f"- {n}: issues={ic} (high={hi}, medium={me}, low={lo})" for n, ic, hi, me, lo in top]
+    more = f"\n…(+{len(rows)-len(top)} more)" if len(rows) > len(top) else ""
+
+    # Relationships and global issues are where multi-dataset value shows up.
+    rels = result.get("relationships") or []
+    global_issues = (dq.get("global_issues") or {}) if isinstance(dq, dict) else {}
+    orphan_fk = (global_issues.get("orphan_foreign_keys") or []) if isinstance(global_issues, dict) else []
+
+    rel_note = f"Relationships detected: {len(rels)}" if isinstance(rels, list) else "Relationships detected: 0"
+    orphan_note = f"Orphan-FK hints: {len(orphan_fk)}" if isinstance(orphan_fk, list) else "Orphan-FK hints: 0"
+
+    reply = (
+        f"Data quality overview (selected datasets={len(rows)}): total_issues={total['issues']} "
+        f"(high={total['high']}, medium={total['medium']}, low={total['low']}).\n\n"
+        f"{rel_note}; {orphan_note}.\n\n"
+        "Per-dataset summary:\n" + "\n".join(lines) + more
+    )
+    ctx["last_dq_answer"] = {"kind": "overview", "total": total, "datasets": rows}
+    return {"reply": reply, "payload": {"dq_total": total, "per_dataset": [{"dataset": n, "issue_count": ic, "high": hi, "medium": me, "low": lo} for n, ic, hi, me, lo in rows]}}
+
+
+def _node_dq_duplicates(state: ChatState) -> ChatState:
+    """
+    DQ Agent: show duplicate-row and duplicate-PK issues across selected datasets.
+    Auto-runs assessment if needed.
+    """
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+    dq = (result.get("data_quality_issues") or {}) if isinstance(result, dict) else {}
+    per = (dq.get("datasets") or {}) if isinstance(dq, dict) else {}
+    if not isinstance(per, dict) or not per:
+        return {"reply": "No data quality section found in the latest assessment.", "payload": {}}
+
+    hits = []
+    for ds_name, block in per.items():
+        issues = (block or {}).get("issues") or []
+        if not isinstance(issues, list):
+            continue
+        for iss in issues:
+            if not isinstance(iss, dict):
+                continue
+            t = str(iss.get("type") or "")
+            if t in ("duplicate_rows", "duplicate_primary_key"):
+                hits.append(
+                    {
+                        "dataset": str(ds_name),
+                        "type": t,
+                        "severity": str(iss.get("severity") or ""),
+                        "message": str(iss.get("message") or iss.get("detail") or ""),
+                        "column": iss.get("column"),
+                        "count": iss.get("count"),
+                    }
+                )
+    if not hits:
+        return {"reply": "✅ No duplicate-row or duplicate-PK issues detected in the latest assessment sample.", "payload": {"duplicates": []}}
+
+    # Sort high severity first, then count desc if present.
+    sev_rank = {"high": 0, "medium": 1, "low": 2}
+    def _rk(x: Dict[str, Any]) -> Tuple[int, int]:
+        r = sev_rank.get(str(x.get("severity") or "").lower(), 9)
+        try:
+            c = int(x.get("count") or 0)
+        except Exception:
+            c = 0
+        return (r, -c)
+    hits.sort(key=_rk)
+    top = hits[:30]
+    lines = []
+    for h in top:
+        col = f".{h['column']}" if h.get("column") else ""
+        cnt = f" count={h['count']}" if h.get("count") is not None else ""
+        lines.append(f"- [{h['severity']}] {h['dataset']}{col}: {h['type']}{cnt} — {h['message']}")
+    more = f"\n…(+{len(hits)-len(top)} more)" if len(hits) > len(top) else ""
+    return {"reply": "Duplicate issues found:\n" + "\n".join(lines) + more, "payload": {"duplicates": hits}}
+
+
+def _node_extract_columns(state: ChatState) -> ChatState:
+    """
+    Extraction Agent: list columns for all selected datasets (tables/files) from the latest assessment profile.
+    Auto-runs assessment if needed.
+    """
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+
+    datasets = (result.get("datasets") or {}) if isinstance(result, dict) else {}
+    if not isinstance(datasets, dict) or not datasets:
+        return {"reply": "No dataset profiles found in the latest assessment.", "payload": {}}
+
+    out = []
+    for ds_name, prof in datasets.items():
+        cols = (prof or {}).get("columns") or {}
+        if isinstance(cols, dict):
+            out.append((str(ds_name), list(cols.keys())))
+    out.sort(key=lambda x: x[0].lower())
+
+    lines = []
+    for ds, cols in out[:20]:
+        show = cols[:40]
+        more = f" …(+{len(cols)-len(show)} more)" if len(cols) > len(show) else ""
+        lines.append(f"- {ds} ({len(cols)}): " + ", ".join(map(str, show)) + more)
+    more_ds = f"\n…(+{len(out)-20} more datasets)" if len(out) > 20 else ""
+
+    return {
+        "reply": "Columns per selected dataset:\n" + "\n".join(lines) + more_ds,
+        "payload": {"columns_by_dataset": [{"dataset": ds, "columns": cols} for ds, cols in out]},
+    }
 
 
 def _llm_plan(*, user_text: str, session: Dict[str, Any]) -> Dict[str, Any]:
@@ -245,29 +606,60 @@ def _node_load_session(state: ChatState) -> ChatState:
 def _node_route(state: ChatState) -> ChatState:
     # Deterministic navigation commands (do not send to LLM router).
     raw = (state.get("message", "") or "").strip().lower()
+    # Greetings / empty chatter should start the guided flow (avoid LLM picking list_sources).
+    if raw in ("hi", "hello", "hey", "hii", "hlo", "start", "menu", "help"):
+        return {"action": "help", "action_args": {}}
     if raw in ("back", "go back", "← back"):
         return {"action": "back_flow", "action_args": {}}
     if raw in ("restart", "reset", "start over"):
         return {"action": "reset_flow", "action_args": {}}
 
+    # DQ shortcuts: allow follow-up questions after a report without forcing "select table".
+    if ("null" in raw or "missing" in raw) and ("column" in raw or "columns" in raw or "fields" in raw):
+        return {"action": "show_null_columns", "action_args": {}}
+    if any(k in raw for k in ("data quality", "dq", "quality issues", "issues summary", "quality summary", "dq summary")):
+        return {"action": "dq_overview", "action_args": {}}
+    if "duplicate" in raw:
+        return {"action": "dq_duplicates", "action_args": {}}
+    if ("show columns" in raw or "list columns" in raw or (("columns" in raw or "fields" in raw) and "show" in raw)) and "null" not in raw:
+        return {"action": "extract_columns", "action_args": {}}
+
     # Step 1 shortcuts: data source selection by NL or number.
+    # These should ALWAYS work (even mid-flow) so the UI buttons can't accidentally
+    # route into NL→SQL or other actions based on stale session context.
     sess = state.get("session") or {}
     ctx = sess.get("context", {}) if isinstance(sess, dict) else {}
-    if (ctx or {}).get("selected_source_index") is None:
-        want = None
-        if raw in ("1", "sql", "sql database", "database"):
-            want = "database"
-        elif raw in ("2", "blob", "azure blob", "azure blob storage"):
-            want = "azure_blob"
-        elif raw in ("3", "file stream", "filesystem", "file", "stream"):
-            want = "filesystem"
-        if want:
-            sources_path = (ctx.get("sources_path") or "config/sources.yaml") if isinstance(ctx, dict) else "config/sources.yaml"
-            source_root = load_sources_config(sources_path)
-            idx = _first_location_index(source_root, want)
-            if idx is None:
-                return {"action": "help", "action_args": {}}
-            return {"action": "select_source", "action_args": {"index": idx}}
+    want = None
+    if raw in ("1", "sql", "sql database", "database"):
+        want = "database"
+    elif raw in ("2", "blob", "azure blob", "azure blob storage"):
+        want = "azure_blob"
+    elif raw in ("3", "file stream", "filesystem", "file", "stream"):
+        want = "filesystem"
+    if want:
+        # Clear stale selections so the new data source starts cleanly.
+        if isinstance(ctx, dict):
+            for k in (
+                "selected_source_index",
+                "selected_db_location_index",
+                "selected_blob_location_index",
+                "selected_fs_location_index",
+                "selected_action",
+                "selected_table",
+                "selected_tables",
+                "selected_blob_files",
+                "selected_local_files",
+                "last_table_list",
+                "last_blob_list",
+                "last_local_file_list",
+            ):
+                ctx.pop(k, None)
+        sources_path = (ctx.get("sources_path") or "config/sources.yaml") if isinstance(ctx, dict) else "config/sources.yaml"
+        source_root = load_sources_config(sources_path)
+        idx = _first_location_index(source_root, want)
+        if idx is None:
+            return {"action": "help", "action_args": {}}
+        return {"action": "select_source", "action_args": {"index": idx}}
 
     # Step 2 shortcuts: action selection without LLM.
     if (ctx or {}).get("selected_source_index") is not None and (ctx or {}).get("selected_action") is None:
@@ -740,9 +1132,13 @@ def _node_assess_selected_local_files(state: ChatState) -> ChatState:
     sampled = f" (sampled up to {max_rows} rows/file where applicable)" if max_rows > 0 else ""
     report_md = _render_report_markdown(result)
     reply = report_md or f"Assessment complete for {len(dfs)} local file(s){sampled}."
+    artifacts = _write_report_artifacts(result=result, report_markdown=report_md)
+    # Cache for follow-up DQ questions
+    ctx["last_assessment_result"] = result
+    ctx["last_assessment_datasets"] = list((result.get("datasets") or {}).keys()) if isinstance(result, dict) else []
     return {
         "reply": reply,
-        "payload": {"selected_local_files": selected, "result": result, "report_markdown": report_md},
+        "payload": {"selected_local_files": selected, "result": result, "report_markdown": report_md, "report_files": artifacts},
     }
 
 
@@ -795,7 +1191,11 @@ def _node_assess_selected_files(state: ChatState) -> ChatState:
             med += int(s.get("medium_severity") or 0)
             low += int(s.get("low_severity") or 0)
         reply = f"Assessment complete for {len(dfs)} file(s). Issues={issue_count} (high={high}, medium={med}, low={low})."
-    return {"reply": reply, "payload": {"selected_files": selected, "result": result, "report_markdown": report_md}}
+    artifacts = _write_report_artifacts(result=result, report_markdown=report_md)
+    # Cache for follow-up DQ questions
+    ctx["last_assessment_result"] = result
+    ctx["last_assessment_datasets"] = list((result.get("datasets") or {}).keys()) if isinstance(result, dict) else []
+    return {"reply": reply, "payload": {"selected_files": selected, "result": result, "report_markdown": report_md, "report_files": artifacts}}
 
 
 def _parse_view_mode(user_text: str) -> str:
@@ -994,10 +1394,11 @@ def _node_list_tables(state: ChatState) -> ChatState:
     ctx = state["session"].setdefault("context", {})
     ctx["last_table_list"] = tables
     ctx["selected_db_location_index"] = db_idx
-    reply = "Available SQL tables:\n" + "\n".join([f"- {t}" for t in tables[:200]])
+    preview_items = [{"index": i, "name": str(t)} for i, t in enumerate(tables)]
+    reply = "Available SQL tables:\n" + "\n".join([f"- {i+1}: {t}" for i, t in enumerate(tables[:200])])
     if len(tables) > 200:
         reply += f"\n…(+{len(tables)-200} more)"
-    return {"reply": reply, "payload": {"tables": tables, "location_index": db_idx}}
+    return {"reply": reply, "payload": {"tables": preview_items, "count": len(tables), "location_index": db_idx}}
 
 
 def _node_select_tables(state: ChatState) -> ChatState:
@@ -1025,6 +1426,9 @@ def _node_select_tables(state: ChatState) -> ChatState:
         if not selected:
             return {"reply": "Tell me which tables to select (by indices or exact names) after running 'list tables'.", "payload": {}}
     ctx["selected_tables"] = selected
+    # Convenience: if exactly one table is selected, treat it as the active table for schema/preview/NL queries.
+    if len(selected) == 1:
+        ctx["selected_table"] = str(selected[0])
     if str(ctx.get("selected_action") or "").lower() == "report":
         out = _node_assess_selected_tables(state)
         out["reply"] = "✅ Selected Table(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n📑 Report:\n" + (out.get("reply") or "")
@@ -1087,23 +1491,45 @@ def _node_assess_selected_tables(state: ChatState) -> ChatState:
     sampled = f" (sampled up to {rows} rows/table)" if max_rows > 0 else " (sampled up to 10,000 rows/table)"
     report_md = _render_report_markdown(result)
     reply = report_md or f"Assessment complete for {len(dfs)} table(s){sampled}."
-    return {"reply": reply, "payload": {"selected_tables": selected, "result": result, "report_markdown": report_md}}
+    artifacts = _write_report_artifacts(result=result, report_markdown=report_md)
+    # Cache for follow-up DQ questions
+    ctx["last_assessment_result"] = result
+    ctx["last_assessment_datasets"] = list((result.get("datasets") or {}).keys()) if isinstance(result, dict) else []
+    return {"reply": reply, "payload": {"selected_tables": selected, "result": result, "report_markdown": report_md, "report_files": artifacts}}
 
 
 def _node_select_table(state: ChatState) -> ChatState:
     args = state.get("action_args") or {}
-    tname = args.get("name") or args.get("table")
-    if not tname:
-        return {"reply": "Tell me which table to use (exact name from 'list tables').", "payload": {}}
     ctx = state["session"].setdefault("context", {})
+    available = ctx.get("last_table_list") or []
+
+    tname = args.get("name") or args.get("table")
+    idx = args.get("index")
+    if not tname and idx is not None and available:
+        try:
+            j = int(idx) - 1
+        except Exception:
+            j = -1
+        if 0 <= j < len(available):
+            tname = available[j]
+
+    if not tname:
+        hint = "Run 'list tables' then use: select table 1 (or select table dbo.TableName)."
+        return {"reply": f"Tell me which table to use. {hint}", "payload": {}}
     ctx["selected_table"] = str(tname)
     return {"reply": f"Selected table: {tname}", "payload": {"selected_table": str(tname)}}
 
 
 def _node_show_schema(state: ChatState) -> ChatState:
-    table = state["session"].get("context", {}).get("selected_table")
+    ctx = state["session"].setdefault("context", {})
+    table = ctx.get("selected_table")
     if not table:
-        return {"reply": "No table selected. Use 'select table <schema.table>' first.", "payload": {}}
+        sel = ctx.get("selected_tables") or []
+        if isinstance(sel, list) and len(sel) == 1:
+            table = sel[0]
+            ctx["selected_table"] = str(table)
+    if not table:
+        return {"reply": "No table selected. Use 'select table <schema.table>' (or select exactly one table) first.", "payload": {}}
     sources_path = state["session"].get("context", {}).get("sources_path") or "config/sources.yaml"
     source_root = load_sources_config(sources_path)
     db_locs = [loc for loc in (source_root.get("locations") or []) if (loc.get("type") or "").lower() == "database"]
@@ -1122,27 +1548,45 @@ def _node_show_schema(state: ChatState) -> ChatState:
 
 
 def _node_preview_table(state: ChatState) -> ChatState:
-    table = state["session"].get("context", {}).get("selected_table")
+    ctx = state["session"].setdefault("context", {})
+    table = ctx.get("selected_table")
     if not table:
-        return {"reply": "No table selected. Use 'select table <schema.table>' first.", "payload": {}}
+        sel = ctx.get("selected_tables") or []
+        if isinstance(sel, list) and len(sel) == 1:
+            table = sel[0]
+            ctx["selected_table"] = str(table)
+    if not table:
+        return {"reply": "No table selected. Use 'select table <schema.table>' (or select exactly one table) first.", "payload": {}}
     sources_path = state["session"].get("context", {}).get("sources_path") or "config/sources.yaml"
     source_root = load_sources_config(sources_path)
     db_locs = [loc for loc in (source_root.get("locations") or []) if (loc.get("type") or "").lower() == "database"]
     if not db_locs:
         return {"reply": "No database source configured.", "payload": {}}
-    conn_cfg = db_locs[0].get("connection") or {}
+    db_idx = int(ctx.get("selected_db_location_index") or 0)
+    db_idx = max(0, min(db_idx, len(db_locs) - 1))
+    conn_cfg = db_locs[db_idx].get("connection") or {}
     from connectors.azure_sql_pythonnet import AzureSQLPythonNetConnector
 
     conn = AzureSQLPythonNetConnector(conn_cfg)
-    df = conn.preview_table(table, 10)
+    args = state.get("action_args") or {}
+    n = args.get("n") or args.get("rows") or args.get("limit")
+    try:
+        n = int(n) if n is not None else 10
+    except Exception:
+        n = 10
+    n = max(1, min(n, 50))
+
+    df = conn.preview_table(table, n)
     # lightweight preview
     cols = list(df.columns)
-    rows = df.head(10).to_dict(orient="records")
+    rows = df.head(n).to_dict(orient="records")
     from agent.pii_masking import mask_rows
     rows = mask_rows(rows)
+
+    rows_text = json.dumps(rows, ensure_ascii=False, indent=2)
     return {
-        "reply": f"Preview of {table} (10 rows). Columns: {', '.join(cols[:30])}",
-        "payload": {"columns": cols, "rows": rows},
+        "reply": f"Preview of {table} ({n} rows). Columns: {', '.join(cols[:30])}\n\n{rows_text}",
+        "payload": {"table": str(table), "columns": cols, "rows": rows, "count": len(rows)},
     }
 
 
@@ -1259,6 +1703,10 @@ def build_chat_graph():
     g.add_node("preview_table", _node_preview_table)
     g.add_node("dq_table", _node_dq_table)
     g.add_node("nl_query", _node_nl_query)
+    g.add_node("show_null_columns", _node_show_null_columns)
+    g.add_node("dq_overview", _node_dq_overview)
+    g.add_node("dq_duplicates", _node_dq_duplicates)
+    g.add_node("extract_columns", _node_extract_columns)
     g.add_node("save_session", _node_save_session)
 
     g.set_entry_point("load_session")
@@ -1293,6 +1741,10 @@ def build_chat_graph():
             "preview_table": "preview_table",
             "dq_table": "dq_table",
             "nl_query": "nl_query",
+            "show_null_columns": "show_null_columns",
+            "dq_overview": "dq_overview",
+            "dq_duplicates": "dq_duplicates",
+            "extract_columns": "extract_columns",
         },
     )
 
@@ -1319,6 +1771,10 @@ def build_chat_graph():
         "preview_table",
         "dq_table",
         "nl_query",
+        "show_null_columns",
+        "dq_overview",
+        "dq_duplicates",
+        "extract_columns",
     ):
         g.add_edge(n, "save_session")
     g.add_edge("save_session", END)

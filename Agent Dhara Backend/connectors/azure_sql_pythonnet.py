@@ -220,11 +220,17 @@ class AzureSQLPythonNetConnector:
         Execute a SELECT query (read-only). Reject non-SELECT statements.
         """
         q = (sql or "").strip()
-        # Basic hardening: single statement, SELECT-only, no dangerous keywords.
+        # Basic hardening: single statement, SELECT-only (CTE allowed), no dangerous keywords.
+        # Allow a *trailing* semicolon, but reject multi-statement queries.
+        q = q.rstrip().rstrip(";").rstrip()
         if ";" in q:
             raise ValueError("Only a single SELECT statement is allowed.")
-        q_norm = q.strip().lower()
-        if not q_norm.startswith("select"):
+        q_norm = q.lower()
+        # SQL Server batch separator can also be used for multi-statement scripts.
+        if re.search(r"(?im)^[ \t]*go[ \t]*$", q):
+            raise ValueError("Only a single SELECT statement is allowed.")
+        # Allow common-table-expressions: WITH ... SELECT ...
+        if not (q_norm.startswith("select") or q_norm.startswith("with")):
             raise ValueError("Only SELECT queries are allowed.")
         banned = ("insert", "update", "delete", "merge", "drop", "alter", "create", "exec", "execute", "truncate")
         if any(re.search(rf"\\b{kw}\\b", q_norm) for kw in banned):

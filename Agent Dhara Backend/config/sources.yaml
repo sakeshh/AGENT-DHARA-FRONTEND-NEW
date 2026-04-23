@@ -1,8 +1,5 @@
-# Data sources for Intelligent Data Assessment (NO secrets in repo).
-#
-# This file intentionally reads credentials from environment variables like ${VAR}.
-# On your office laptop, you should only change env vars (or your local `.env`),
-# not this file.
+# Data sources for Intelligent Data Assessment.
+# Use environment variables or Azure Key Vault for secrets in production.
 #
 # Multiple databases or Blob containers: add another - type: database / azure_blob block.
 # Optional per block: id: crm   or   label: warehouse   (used in dataset names when multiples exist).
@@ -11,28 +8,25 @@ source:
   name: enterprise_data
   locations:
     - type: database
-      id: primary
+      id: sql db
       connector: azure_sql_pythonnet
       connection:
-        server: ${AZURE_SQL_SERVER}
-        database: ${AZURE_SQL_DATABASE}
-        username: ${AZURE_SQL_USERNAME}
-        password: ${AZURE_SQL_PASSWORD}
+        server: newserversdgsdfg.database.windows.net
+        database: newdbb
+        username: user
+        password: Pass@123
 
     - type: azure_blob
       id: assessment_input
       connector: azure_blob_storage
       connection:
-        account_name: ${AZURE_STORAGE_ACCOUNT_NAME}
-        account_key: ${AZURE_STORAGE_ACCOUNT_KEY}
-        # If you prefer connection string auth, set AZURE_STORAGE_CONNECTION_STRING and you can leave account_key blank.
-        connection_string: ${AZURE_STORAGE_CONNECTION_STRING:}
-        container: ${AZURE_ASSESSMENT_CONTAINER:assessment}
+        account_name: storagegjuhg
+        account_key: eUC9IgUGh0InG9HitceV5LhyueXAmdriJGTn2MLAISZ7LjiUvnt0AW8sRLXYGOSuYDf5PrqI01PB+AStjNC1PA==
+        container: datasets
 
     - type: azure_blob_output
       connector: azure_blob_storage
       connection:
-        account_name: ${AZURE_STORAGE_ACCOUNT_NAME}
-        account_key: ${AZURE_STORAGE_ACCOUNT_KEY}
-        connection_string: ${AZURE_STORAGE_CONNECTION_STRING:}
-        container: ${AZURE_OUTPUT_CONTAINER:output}
+        account_name: storagegjuhg
+        account_key: YOUR_ACCOUNT_KEY
+        container: output

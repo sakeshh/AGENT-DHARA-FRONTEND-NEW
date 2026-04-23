@@ -291,6 +291,17 @@ def api_chat(payload: ChatPayload) -> Dict[str, Any]:
 
     sid = (payload.session_id or "default").strip() or "default"
     out = run_chat(session_id=sid, message=payload.message)
+    try:
+        logger.info(
+            "chat_routed",
+            extra={
+                "session_id": sid,
+                "message": (payload.message or "")[:200],
+                "action": out.get("action"),
+            },
+        )
+    except Exception:
+        pass
     return {"ok": True, "reply": out.get("reply"), "payload": out.get("payload") or {}, "session_id": sid}
 
 

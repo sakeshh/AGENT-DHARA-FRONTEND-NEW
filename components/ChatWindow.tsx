@@ -96,6 +96,8 @@ export default function ChatWindow() {
   const [editingText, setEditingText] = useState<string>('');
   const [localFolderFiles, setLocalFolderFiles] = useState<File[]>([]);
   const [guidedMode, setGuidedMode] = useState<'none' | 'view' | 'report'>('none');
+  // For SQL table selection in-chat: allow multi-select + OK.
+  const [pendingTableSelections, setPendingTableSelections] = useState<Record<string, number[]>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -372,11 +374,17 @@ export default function ChatWindow() {
             send: String(o?.send ?? ''),
           })).filter((o: any) => o.text && o.send)
         : Array.isArray(payload?.tables)
-        ? payload.tables.slice(0, 12).map((t: any, i: number) => ({
-            id: `table-${i}`,
-            text: String(t?.name ?? t ?? `Table ${i + 1}`),
-            send: `select table ${Number(t?.index ?? i) + 1}`,
-          }))
+        ? payload.tables.slice(0, 50).map((t: any, i: number) => {
+            const oneBased = Number(t?.index ?? i) + 1;
+            const name = String(t?.name ?? t ?? `Table ${oneBased}`);
+            return {
+              id: `table-${oneBased}`,
+              // Keep label aligned with the numbered list shown by backend.
+              text: `${oneBased}. ${name}`,
+              // Special client-side toggle; user confirms with OK.
+              send: `__toggle_table__:${oneBased}`,
+            };
+          })
         : Array.isArray(payload?.files)
           ? [
               ...payload.files.slice(0, 12).map((f: any, i: number) => ({
@@ -414,6 +422,34 @@ export default function ChatWindow() {
     } finally {
       setIsLoadingAgent(false);
     }
+  };
+
+  const isToggleTableOption = (send: string) => String(send || '').startsWith('__toggle_table__:');
+
+  const toggleTableForMessage = (messageId: string, tableNumber: number) => {
+    setPendingTableSelections((prev) => {
+      const existing = Array.isArray(prev[messageId]) ? prev[messageId] : [];
+      const has = existing.includes(tableNumber);
+      const next = has ? existing.filter((x) => x !== tableNumber) : [...existing, tableNumber];
+      next.sort((a, b) => a - b);
+      return { ...prev, [messageId]: next };
+    });
+  };
+
+  const clearTablesForMessage = (messageId: string) => {
+    setPendingTableSelections((prev) => ({ ...prev, [messageId]: [] }));
+  };
+
+  const confirmTablesForMessage = async (messageId: string) => {
+    const selected = pendingTableSelections[messageId] || [];
+    if (!selected.length) return;
+    // Use multi-select command even for a single selection.
+    await sendUserText(`select tables ${selected.join(',')}`);
+    setPendingTableSelections((prev) => {
+      const copy = { ...prev };
+      delete copy[messageId];
+      return copy;
+    });
   };
 
   const handleOptionSelect = async (option: ChatOption) => {
@@ -488,6 +524,10 @@ export default function ChatWindow() {
           {messages.map((message, idx) => {
             const isUser = message.sender === 'user';
             const staggerDelay = Math.min(idx * 0.04, 0.2);
+            const opts = Array.isArray(message.options) ? message.options : [];
+            const hasOptions = message.sender === 'bot' && opts.length > 0;
+            const hasTableToggles = hasOptions && opts.some((o) => isToggleTableOption(o.send));
+            const selectedTables = pendingTableSelections[message.id] || [];
             return (
             <motion.div
               key={message.id}
@@ -536,19 +576,51 @@ export default function ChatWindow() {
                   ) : (
                     <div className="space-y-3">
                       <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.text}</p>
-                      {message.sender === 'bot' && Array.isArray(message.options) && message.options.length > 0 && (
+                      {hasOptions && (
                         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                          {message.options.map((opt) => (
+                          {opts.map((opt) => (
                             <button
                               key={opt.id}
                               type="button"
-                              onClick={() => sendUserText(opt.send)}
-                              className="rounded-lg border border-black/10 bg-white/90 px-3 py-2 text-left text-xs font-semibold text-zinc-900 hover:bg-white hover:border-[#0070AD]/30"
+                              onClick={() => {
+                                if (isToggleTableOption(opt.send)) {
+                                  const n = Number(String(opt.send).split(':')[1]);
+                                  if (Number.isFinite(n) && n > 0) toggleTableForMessage(message.id, n);
+                                  return;
+                                }
+                                sendUserText(opt.send);
+                              }}
+                              className={`rounded-lg border bg-white/90 px-3 py-2 text-left text-xs font-semibold text-zinc-900 hover:bg-white hover:border-[#0070AD]/30 ${
+                                hasTableToggles && isToggleTableOption(opt.send)
+                                  ? selectedTables.includes(Number(String(opt.send).split(':')[1]))
+                                    ? 'border-[#0070AD]/50 bg-[#0070AD]/10'
+                                    : 'border-black/10'
+                                  : 'border-black/10'
+                              }`}
                               title={opt.send}
                             >
                               {opt.text}
                             </button>
                           ))}
+                          {hasTableToggles && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => clearTablesForMessage(message.id)}
+                                className="rounded-lg border border-black/10 bg-white/90 px-3 py-2 text-left text-xs font-semibold text-zinc-900 hover:bg-white hover:border-[#0070AD]/30"
+                              >
+                                Clear selection
+                              </button>
+                              <button
+                                type="button"
+                                disabled={selectedTables.length === 0}
+                                onClick={() => confirmTablesForMessage(message.id)}
+                                className="rounded-lg border border-[#0070AD]/40 bg-[#0070AD]/10 px-3 py-2 text-left text-xs font-semibold text-[#0070AD] hover:bg-[#0070AD]/15 hover:border-[#0070AD]/60 disabled:cursor-not-allowed disabled:opacity-40"
+                              >
+                                OK ({selectedTables.length})
+                              </button>
+                            </>
+                          )}
                           <button
                             type="button"
                             onClick={handleBack}
