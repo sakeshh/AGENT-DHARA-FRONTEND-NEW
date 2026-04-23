@@ -3,6 +3,8 @@ export interface Message {
   text: string;
   sender: 'user' | 'bot';
   timestamp: Date;
+  /** Optional structured payload from backend, used for rich rendering (tables, metadata, etc.). */
+  payload?: any;
   options?: Array<{
     id: string;
     text: string;

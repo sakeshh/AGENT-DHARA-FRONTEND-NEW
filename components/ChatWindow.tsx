@@ -20,6 +20,8 @@ import {
 } from 'react-icons/fa';
 import { Message } from '@/types';
 import Image from 'next/image';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 interface ChatOption {
   id: string;
@@ -82,7 +84,6 @@ function formatTime(d: Date): string {
 }
 
 export default function ChatWindow() {
-  // Important: do not inject canned "bot" content. Bot messages should come only from the agent/backend.
   const [messages, setMessages] = useState<Message[]>([]);
   const [hasSelectedDataSource, setHasSelectedDataSource] = useState(false);
   const [selectedDataSource, setSelectedDataSource] = useState<string | null>(null);
@@ -98,6 +99,10 @@ export default function ChatWindow() {
   const [guidedMode, setGuidedMode] = useState<'none' | 'view' | 'report'>('none');
   // For SQL table selection in-chat: allow multi-select + OK.
   const [pendingTableSelections, setPendingTableSelections] = useState<Record<string, number[]>>({});
+  // For Blob/Local file selection: allow multi-select + OK.
+  const [pendingFileSelections, setPendingFileSelections] = useState<
+    Record<string, { mode: 'blob' | 'local'; selected: number[] }>
+  >({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -127,6 +132,60 @@ export default function ChatWindow() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // First message should be from the agent (UI greeting).
+  // If the session has no prior messages, seed a single assistant greeting.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!sessionId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
+        const data = await res.json().catch(() => null);
+        const session = data?.session;
+        const msgs = Array.isArray(session?.messages) ? session.messages : [];
+        if (cancelled) return;
+        if (msgs.length) return;
+        if (messages.length) return;
+        setMessages([
+          {
+            id: `greeting-${Date.now()}`,
+            text: "Hi i'm Agent Dhara, Select a Data Source to get started..",
+            sender: 'bot',
+            timestamp: new Date(),
+            options: [
+              { id: 'sql', text: '1. SQL', send: 'sql' },
+              { id: 'blob', text: '2. Blob', send: 'blob' },
+              { id: 'fs', text: '3. File Stream', send: 'file stream' },
+            ],
+          },
+        ]);
+      } catch {
+        // If session fetch fails, still show greeting for a usable first render.
+        if (cancelled) return;
+        if (messages.length) return;
+        setMessages([
+          {
+            id: `greeting-${Date.now()}`,
+            text: "Hi i'm Agent Dhara, Select a Data Source to get started..",
+            sender: 'bot',
+            timestamp: new Date(),
+            options: [
+              { id: 'sql', text: '1. SQL', send: 'sql' },
+              { id: 'blob', text: '2. Blob', send: 'blob' },
+              { id: 'fs', text: '3. File Stream', send: 'file stream' },
+            ],
+          },
+        ]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Intentionally run once per session id.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -263,6 +322,264 @@ export default function ChatWindow() {
     await copyText(text);
   };
 
+  const tryParseJson = (text: string): any | null => {
+    const t = String(text || '').trim();
+    if (!t) return null;
+    // Quick guard: only try parse if it looks like JSON.
+    if (!(t.startsWith('{') || t.startsWith('['))) return null;
+    try {
+      return JSON.parse(t);
+    } catch {
+      return null;
+    }
+  };
+
+  const JsonTable = ({ value }: { value: any }) => {
+    const arr = Array.isArray(value) ? value : null;
+    if (!arr || arr.length === 0) {
+      return (
+        <pre className="max-w-full overflow-x-auto rounded-lg border border-black/10 bg-white/70 p-3 text-xs text-zinc-900">
+          {JSON.stringify(value, null, 2)}
+        </pre>
+      );
+    }
+    const isRowObj = arr.every((x) => x && typeof x === 'object' && !Array.isArray(x));
+    if (!isRowObj) {
+      return (
+        <pre className="max-w-full overflow-x-auto rounded-lg border border-black/10 bg-white/70 p-3 text-xs text-zinc-900">
+          {JSON.stringify(value, null, 2)}
+        </pre>
+      );
+    }
+    const cols = Array.from(new Set(arr.flatMap((r: any) => Object.keys(r || {}))));
+    const [showAll, setShowAll] = useState(false);
+    const rows = showAll ? arr : arr.slice(0, 25);
+    const more = arr.length > rows.length ? arr.length - rows.length : 0;
+    return (
+      <div className="max-w-full overflow-x-auto rounded-xl border border-black/60 bg-white/70 shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
+        <table className="w-full border-collapse text-[12.5px]">
+          {/* Header row highlight ("metadata" header like id/name/email/...) */}
+          <thead className="sticky top-0 z-10 bg-black/15 backdrop-blur">
+            <tr>
+              {cols.map((c) => (
+                <th
+                  key={c}
+                  className="border-b border-black/60 border-r border-black/40 px-3 py-2 text-left font-semibold tracking-[0.01em] text-zinc-900 last:border-r-0"
+                >
+                  {c}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r: any, i: number) => (
+              <tr key={i} className="odd:bg-white/40 hover:bg-[#12ABDB]/5">
+                {cols.map((c) => (
+                  <td
+                    key={c}
+                    className="border-b border-black/30 border-r border-black/25 px-3 py-2 align-top text-zinc-900 last:border-r-0"
+                  >
+                    <div className="max-w-[560px] whitespace-pre-wrap break-words leading-relaxed">
+                      {r?.[c] === null || r?.[c] === undefined
+                        ? ''
+                        : typeof r?.[c] === 'object'
+                          ? JSON.stringify(r?.[c])
+                          : String(r?.[c])}
+                    </div>
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {more > 0 ? (
+          <div className="flex items-center justify-between gap-3 border-t border-black/30 px-3 py-2 text-[11px] font-medium text-black/70">
+            <div>Showing {rows.length} rows. …(+{more} more)</div>
+            <button
+              type="button"
+              onClick={() => setShowAll(true)}
+              className="rounded-md border border-black/40 bg-white/80 px-2 py-1 text-[11px] font-semibold text-zinc-900 hover:bg-white"
+            >
+              Show all ({arr.length})
+            </button>
+          </div>
+        ) : showAll && arr.length > 25 ? (
+          <div className="flex items-center justify-end gap-3 border-t border-black/30 px-3 py-2 text-[11px] font-medium text-black/70">
+            <button
+              type="button"
+              onClick={() => setShowAll(false)}
+              className="rounded-md border border-black/40 bg-white/80 px-2 py-1 text-[11px] font-semibold text-zinc-900 hover:bg-white"
+            >
+              Show less
+            </button>
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderBotContent = (text: string, payload?: any) => {
+    // Prefer structured payload rendering when available (more reliable than parsing strings).
+    if (Array.isArray(payload?.rows) && payload.rows.length > 0) {
+      return <JsonTable value={payload.rows} />;
+    }
+
+    const isMetadataView =
+      !!payload?.metadata ||
+      (typeof text === 'string' && text.toLowerCase().includes('metadata —')) ||
+      (typeof text === 'string' && text.toLowerCase().includes('metadata (selected'));
+
+    const reportMd = typeof payload?.report_markdown === 'string' ? payload.report_markdown : null;
+    if (reportMd && reportMd.trim()) {
+      return (
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          components={{
+            h1: ({ children }) => (
+              <h2 className="text-[15px] font-bold tracking-[0.01em] text-zinc-900">{children}</h2>
+            ),
+            h2: ({ children }) => (
+              <h3 className="text-[14px] font-bold tracking-[0.01em] text-zinc-900">{children}</h3>
+            ),
+            h3: ({ children }) => <h4 className="text-[13px] font-semibold text-zinc-900">{children}</h4>,
+            p: ({ children }) => (
+              <p className="text-[13.5px] leading-[1.55] whitespace-pre-wrap text-zinc-900">{children}</p>
+            ),
+            ul: ({ children }) => <ul className="list-disc pl-5 text-[13.5px] leading-[1.55]">{children}</ul>,
+            ol: ({ children }) => <ol className="list-decimal pl-5 text-[13.5px] leading-[1.55]">{children}</ol>,
+            li: ({ children }) => <li className="my-1">{children}</li>,
+            a: ({ children, href }) => (
+              <a
+                href={href}
+                target="_blank"
+                rel="noreferrer"
+                className="font-medium text-[#0070AD] underline decoration-[#0070AD]/40 underline-offset-2 hover:text-[#12ABDB]"
+              >
+                {children}
+              </a>
+            ),
+            blockquote: ({ children }) => (
+              <blockquote className="border-l-2 border-[#0070AD]/40 pl-3 text-[13.5px] italic text-black/70">
+                {children}
+              </blockquote>
+            ),
+            code: ({ children }) => (
+              <code className="rounded-md border border-black/10 bg-white/75 px-1.5 py-0.5 font-mono text-[12px] text-zinc-900">
+                {children}
+              </code>
+            ),
+            pre: ({ children }) => (
+              <pre className="max-w-full overflow-x-auto rounded-xl border border-black/10 bg-white/70 p-3 font-mono text-[12px] leading-relaxed text-zinc-900 shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
+                {children}
+              </pre>
+            ),
+            table: ({ children }) => (
+              <div className="max-w-full overflow-x-auto rounded-xl border border-black/60 bg-white/70 shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
+                <table
+                  className={`w-full border-collapse text-[12.5px] ${
+                    isMetadataView ? '[&>tbody>tr:first-child]:bg-black/10' : ''
+                  }`}
+                >
+                  {children}
+                </table>
+              </div>
+            ),
+            thead: ({ children }) => (
+              <thead className="sticky top-0 z-10 bg-black/15 backdrop-blur">{children}</thead>
+            ),
+            th: ({ children }) => (
+              <th className="border-b border-black/60 border-r border-black/40 px-3 py-2 text-left font-semibold tracking-[0.01em] text-zinc-900 last:border-r-0">
+                {children}
+              </th>
+            ),
+            td: ({ children }) => (
+              <td className="border-b border-black/30 border-r border-black/25 px-3 py-2 align-top text-zinc-900 last:border-r-0">
+                <div className="max-w-[560px] whitespace-pre-wrap break-words leading-relaxed">{children}</div>
+              </td>
+            ),
+          }}
+        >
+          {reportMd}
+        </ReactMarkdown>
+      );
+    }
+
+    const parsed = tryParseJson(text);
+    if (parsed !== null) return <JsonTable value={parsed} />;
+
+    return (
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ children }) => (
+            <h2 className="text-[15px] font-bold tracking-[0.01em] text-zinc-900">{children}</h2>
+          ),
+          h2: ({ children }) => (
+            <h3 className="text-[14px] font-bold tracking-[0.01em] text-zinc-900">{children}</h3>
+          ),
+          h3: ({ children }) => <h4 className="text-[13px] font-semibold text-zinc-900">{children}</h4>,
+          p: ({ children }) => (
+            <p className="text-[13.5px] leading-[1.55] whitespace-pre-wrap text-zinc-900">{children}</p>
+          ),
+          ul: ({ children }) => <ul className="list-disc pl-5 text-[13.5px] leading-[1.55]">{children}</ul>,
+          ol: ({ children }) => <ol className="list-decimal pl-5 text-[13.5px] leading-[1.55]">{children}</ol>,
+          li: ({ children }) => <li className="my-1">{children}</li>,
+          a: ({ children, href }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer"
+              className="font-medium text-[#0070AD] underline decoration-[#0070AD]/40 underline-offset-2 hover:text-[#12ABDB]"
+            >
+              {children}
+            </a>
+          ),
+          blockquote: ({ children }) => (
+            <blockquote className="border-l-2 border-[#0070AD]/40 pl-3 text-[13.5px] italic text-black/70">
+              {children}
+            </blockquote>
+          ),
+          code: ({ children }) => (
+            <code className="rounded-md border border-black/10 bg-white/75 px-1.5 py-0.5 font-mono text-[12px] text-zinc-900">
+              {children}
+            </code>
+          ),
+          pre: ({ children }) => (
+            <pre className="max-w-full overflow-x-auto rounded-xl border border-black/10 bg-white/70 p-3 font-mono text-[12px] leading-relaxed text-zinc-900 shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
+              {children}
+            </pre>
+          ),
+          table: ({ children }) => (
+            <div className="max-w-full overflow-x-auto rounded-xl border border-black/60 bg-white/70 shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
+              <table
+                className={`w-full border-collapse text-[12.5px] ${
+                  isMetadataView ? '[&>tbody>tr:first-child]:bg-black/10' : ''
+                }`}
+              >
+                {children}
+              </table>
+            </div>
+          ),
+          thead: ({ children }) => (
+            <thead className="sticky top-0 z-10 bg-black/15 backdrop-blur">{children}</thead>
+          ),
+          th: ({ children }) => (
+            <th className="border-b border-black/60 border-r border-black/40 px-3 py-2 text-left font-semibold tracking-[0.01em] text-zinc-900 last:border-r-0">
+              {children}
+            </th>
+          ),
+          td: ({ children }) => (
+            <td className="border-b border-black/30 border-r border-black/25 px-3 py-2 align-top text-zinc-900 last:border-r-0">
+              <div className="max-w-[560px] whitespace-pre-wrap break-words leading-relaxed">{children}</div>
+            </td>
+          ),
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    );
+  };
+
   const beginEdit = (m: Message) => {
     setEditingId(m.id);
     setEditingText(m.text);
@@ -374,39 +691,48 @@ export default function ChatWindow() {
             send: String(o?.send ?? ''),
           })).filter((o: any) => o.text && o.send)
         : Array.isArray(payload?.tables)
-        ? payload.tables.slice(0, 50).map((t: any, i: number) => {
-            const oneBased = Number(t?.index ?? i) + 1;
-            const name = String(t?.name ?? t ?? `Table ${oneBased}`);
-            return {
-              id: `table-${oneBased}`,
-              // Keep label aligned with the numbered list shown by backend.
-              text: `${oneBased}. ${name}`,
-              // Special client-side toggle; user confirms with OK.
-              send: `__toggle_table__:${oneBased}`,
-            };
-          })
+        ? (() => {
+            const items = payload.tables.slice(0, 50).map((t: any, i: number) => {
+              const oneBased = Number(t?.index ?? i) + 1;
+              const name = String(t?.name ?? t ?? `Table ${oneBased}`);
+              return {
+                id: `table-${oneBased}`,
+                text: `${oneBased}. ${name}`,
+                send: `__toggle_table__:${oneBased}`,
+              };
+            });
+            const nums = items
+              .map((x) => Number(String(x.send).split(':')[1]))
+              .filter((n) => Number.isFinite(n) && n > 0);
+            if (nums.length > 1) {
+              items.push({
+                id: 'select-all-tables',
+                text: 'Select all',
+                send: `__select_all_tables__:${nums.join(',')}`,
+              });
+            }
+            return items;
+          })()
         : Array.isArray(payload?.files)
-          ? [
-              ...payload.files.slice(0, 12).map((f: any, i: number) => ({
-                id: `file-${i}`,
-                text: String(f),
-                send:
-                  effectiveSource === 'blob'
-                    ? `select files ${i + 1}`
-                    : effectiveSource === 'streams'
-                      ? `select local files ${i + 1}`
-                      : `select local files ${i + 1}`,
-              })),
-              ...(payload.files.length > 0
-                ? [
-                    {
-                      id: 'select-all',
-                      text: 'Select all',
-                      send: effectiveSource === 'blob' ? 'select files all' : 'select local files all',
-                    },
-                  ]
-                : []),
-            ]
+          ? (() => {
+              const mode: 'blob' | 'local' = effectiveSource === 'blob' ? 'blob' : 'local';
+              const items = payload.files.slice(0, 30).map((f: any, i: number) => ({
+                id: `file-${i + 1}`,
+                text: `${i + 1}. ${String(f)}`,
+                send: `__toggle_file__:${mode}:${i + 1}`,
+              }));
+              const nums = items
+                .map((x) => Number(String(x.send).split(':')[2]))
+                .filter((n) => Number.isFinite(n) && n > 0);
+              if (nums.length > 1) {
+                items.push({
+                  id: 'select-all-files',
+                  text: 'Select all',
+                  send: `__select_all_files__:${mode}:${nums.join(',')}`,
+                });
+              }
+              return items;
+            })()
           : undefined;
 
       const botResponse: Message = {
@@ -415,6 +741,7 @@ export default function ChatWindow() {
         sender: 'bot',
         timestamp: new Date(),
         options: interactiveOptions,
+        payload,
       };
       setMessages((prev) => [...prev, botResponse]);
     } catch (err) {
@@ -426,6 +753,11 @@ export default function ChatWindow() {
 
   const isToggleTableOption = (send: string) => String(send || '').startsWith('__toggle_table__:');
 
+  const isSelectAllTablesOption = (send: string) => String(send || '').startsWith('__select_all_tables__:');
+
+  const isToggleFileOption = (send: string) => String(send || '').startsWith('__toggle_file__:');
+  const isSelectAllFilesOption = (send: string) => String(send || '').startsWith('__select_all_files__:');
+
   const toggleTableForMessage = (messageId: string, tableNumber: number) => {
     setPendingTableSelections((prev) => {
       const existing = Array.isArray(prev[messageId]) ? prev[messageId] : [];
@@ -436,8 +768,32 @@ export default function ChatWindow() {
     });
   };
 
-  const clearTablesForMessage = (messageId: string) => {
-    setPendingTableSelections((prev) => ({ ...prev, [messageId]: [] }));
+  const toggleFileForMessage = (messageId: string, mode: 'blob' | 'local', fileNumber: number) => {
+    setPendingFileSelections((prev) => {
+      const cur = prev[messageId];
+      const existing = cur?.mode === mode && Array.isArray(cur.selected) ? cur.selected : [];
+      const has = existing.includes(fileNumber);
+      const next = has ? existing.filter((x) => x !== fileNumber) : [...existing, fileNumber];
+      next.sort((a, b) => a - b);
+      return { ...prev, [messageId]: { mode, selected: next } };
+    });
+  };
+
+  const setAllFilesForMessage = (messageId: string, mode: 'blob' | 'local', all: number[]) => {
+    setPendingFileSelections((prev) => {
+      const cur = prev[messageId];
+      const existing = cur?.mode === mode && Array.isArray(cur.selected) ? cur.selected : [];
+      const isAllSelected = all.length > 0 && existing.length === all.length && all.every((n) => existing.includes(n));
+      return { ...prev, [messageId]: { mode, selected: isAllSelected ? [] : [...all] } };
+    });
+  };
+
+  const setAllTablesForMessage = (messageId: string, all: number[]) => {
+    setPendingTableSelections((prev) => {
+      const existing = Array.isArray(prev[messageId]) ? prev[messageId] : [];
+      const isAllSelected = all.length > 0 && existing.length === all.length && all.every((n) => existing.includes(n));
+      return { ...prev, [messageId]: isAllSelected ? [] : [...all] };
+    });
   };
 
   const confirmTablesForMessage = async (messageId: string) => {
@@ -446,6 +802,21 @@ export default function ChatWindow() {
     // Use multi-select command even for a single selection.
     await sendUserText(`select tables ${selected.join(',')}`);
     setPendingTableSelections((prev) => {
+      const copy = { ...prev };
+      delete copy[messageId];
+      return copy;
+    });
+  };
+
+  const confirmFilesForMessage = async (messageId: string) => {
+    const cur = pendingFileSelections[messageId];
+    const selected = cur?.selected || [];
+    const mode = cur?.mode || 'blob';
+    if (!selected.length) return;
+    const cmd =
+      mode === 'blob' ? `select files ${selected.join(',')}` : `select local files ${selected.join(',')}`;
+    await sendUserText(cmd);
+    setPendingFileSelections((prev) => {
       const copy = { ...prev };
       delete copy[messageId];
       return copy;
@@ -527,7 +898,33 @@ export default function ChatWindow() {
             const opts = Array.isArray(message.options) ? message.options : [];
             const hasOptions = message.sender === 'bot' && opts.length > 0;
             const hasTableToggles = hasOptions && opts.some((o) => isToggleTableOption(o.send));
+            const hasFileToggles = hasOptions && opts.some((o) => isToggleFileOption(o.send));
+            const selectAllOpt = hasOptions ? opts.find((o) => isSelectAllTablesOption(o.send)) : undefined;
+            const allTableNumbers =
+              selectAllOpt && String(selectAllOpt.send).includes(':')
+                ? String(selectAllOpt.send)
+                    .split(':')[1]
+                    .split(',')
+                    .map((x) => Number(x))
+                    .filter((x) => Number.isFinite(x) && x > 0)
+                : [];
+            const selectAllFilesOpt = hasOptions ? opts.find((o) => isSelectAllFilesOption(o.send)) : undefined;
+            const parsedFiles =
+              selectAllFilesOpt && String(selectAllFilesOpt.send).split(':').length >= 3
+                ? (() => {
+                    const parts = String(selectAllFilesOpt.send).split(':');
+                    const mode = (parts[1] as any) === 'blob' ? ('blob' as const) : ('local' as const);
+                    const nums = (parts[2] || '')
+                      .split(',')
+                      .map((x) => Number(x))
+                      .filter((x) => Number.isFinite(x) && x > 0);
+                    return { mode, nums };
+                  })()
+                : null;
             const selectedTables = pendingTableSelections[message.id] || [];
+            const selectedFiles = pendingFileSelections[message.id]?.selected || [];
+            const fileMode = pendingFileSelections[message.id]?.mode || parsedFiles?.mode || 'blob';
+            const hasBackOpt = hasOptions && opts.some((o) => String(o?.send || '').trim().toLowerCase() === 'back');
             return (
             <motion.div
               key={message.id}
@@ -575,7 +972,11 @@ export default function ChatWindow() {
                     </div>
                   ) : (
                     <div className="space-y-3">
-                      <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.text}</p>
+                      {message.sender === 'bot' ? (
+                        <div className="space-y-2">{renderBotContent(message.text, (message as any).payload)}</div>
+                      ) : (
+                        <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.text}</p>
+                      )}
                       {hasOptions && (
                         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                           {opts.map((opt) => (
@@ -588,46 +989,75 @@ export default function ChatWindow() {
                                   if (Number.isFinite(n) && n > 0) toggleTableForMessage(message.id, n);
                                   return;
                                 }
+                                if (isSelectAllTablesOption(opt.send)) {
+                                  setAllTablesForMessage(message.id, allTableNumbers);
+                                  return;
+                                }
+                                if (isToggleFileOption(opt.send)) {
+                                  const parts = String(opt.send).split(':');
+                                  const mode = (parts[1] as any) === 'blob' ? ('blob' as const) : ('local' as const);
+                                  const n = Number(parts[2]);
+                                  if (Number.isFinite(n) && n > 0) toggleFileForMessage(message.id, mode, n);
+                                  return;
+                                }
+                                if (isSelectAllFilesOption(opt.send) && parsedFiles) {
+                                  setAllFilesForMessage(message.id, parsedFiles.mode, parsedFiles.nums);
+                                  return;
+                                }
+                                // Remove options from the previous message once a choice is made.
+                                setMessages((prev) =>
+                                  prev.map((m) => (m.id === message.id ? { ...m, options: undefined } : m))
+                                );
                                 sendUserText(opt.send);
                               }}
                               className={`rounded-lg border bg-white/90 px-3 py-2 text-left text-xs font-semibold text-zinc-900 hover:bg-white hover:border-[#0070AD]/30 ${
                                 hasTableToggles && isToggleTableOption(opt.send)
                                   ? selectedTables.includes(Number(String(opt.send).split(':')[1]))
-                                    ? 'border-[#0070AD]/50 bg-[#0070AD]/10'
+                                    ? 'border-[#0070AD] bg-[#0070AD] text-white hover:bg-[#0070AD]'
                                     : 'border-black/10'
-                                  : 'border-black/10'
+                                  : hasFileToggles && isToggleFileOption(opt.send)
+                                    ? selectedFiles.includes(Number(String(opt.send).split(':')[2]))
+                                      ? 'border-[#0070AD] bg-[#0070AD] text-white hover:bg-[#0070AD]'
+                                      : 'border-black/10'
+                                    : 'border-black/10'
                               }`}
                               title={opt.send}
                             >
                               {opt.text}
                             </button>
                           ))}
-                          {hasTableToggles && (
+                          {(hasTableToggles || hasFileToggles) && (
                             <>
                               <button
                                 type="button"
-                                onClick={() => clearTablesForMessage(message.id)}
-                                className="rounded-lg border border-black/10 bg-white/90 px-3 py-2 text-left text-xs font-semibold text-zinc-900 hover:bg-white hover:border-[#0070AD]/30"
-                              >
-                                Clear selection
-                              </button>
-                              <button
-                                type="button"
-                                disabled={selectedTables.length === 0}
-                                onClick={() => confirmTablesForMessage(message.id)}
+                                disabled={(hasTableToggles ? selectedTables.length === 0 : selectedFiles.length === 0)}
+                                onClick={() =>
+                                  hasTableToggles
+                                    ? confirmTablesForMessage(message.id)
+                                    : confirmFilesForMessage(message.id)
+                                }
                                 className="rounded-lg border border-[#0070AD]/40 bg-[#0070AD]/10 px-3 py-2 text-left text-xs font-semibold text-[#0070AD] hover:bg-[#0070AD]/15 hover:border-[#0070AD]/60 disabled:cursor-not-allowed disabled:opacity-40"
                               >
-                                OK ({selectedTables.length})
+                                OK ({hasTableToggles ? selectedTables.length : selectedFiles.length})
                               </button>
                             </>
                           )}
-                          <button
-                            type="button"
-                            onClick={handleBack}
-                            className="rounded-lg border border-black/10 bg-white/90 px-3 py-2 text-left text-xs font-semibold text-zinc-900 hover:bg-white hover:border-[#0070AD]/30"
-                          >
-                            ← Back
-                          </button>
+                          {/* Avoid duplicate Back button if backend already provided one */}
+                          {!hasBackOpt && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                // Go one step behind in backend flow
+                                setMessages((prev) =>
+                                  prev.map((m) => (m.id === message.id ? { ...m, options: undefined } : m))
+                                );
+                                sendUserText('back');
+                              }}
+                              className="rounded-lg border border-black/10 bg-white/90 px-3 py-2 text-left text-xs font-semibold text-zinc-900 hover:bg-white hover:border-[#0070AD]/30"
+                            >
+                              ← Back
+                            </button>
+                          )}
                         </div>
                       )}
                     </div>

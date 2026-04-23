@@ -160,6 +160,166 @@ def _render_report_markdown(result: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _md_escape(text: Any) -> str:
+    s = "" if text is None else str(text)
+    return s.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _build_report_tables_markdown(result: Dict[str, Any]) -> str:
+    """
+    Build a presentable markdown report using tables wherever possible.
+    This is used as an enhancement layer (or fallback) for chat reports.
+    """
+    if not isinstance(result, dict):
+        return ""
+    datasets = result.get("datasets") or {}
+    dq = (result.get("data_quality_issues") or {}).get("datasets") or {}
+    rels = result.get("relationships") or []
+
+    parts: List[str] = []
+    parts.append("## Tabular Report")
+
+    # Dataset summary table
+    rows = []
+    if isinstance(datasets, dict):
+        for name, meta in datasets.items():
+            meta = meta or {}
+            shape = meta.get("shape") or {}
+            nrows = shape.get("rows")
+            ncols = shape.get("columns")
+            src = meta.get("source_root") or ""
+            summ = (dq.get(name) or {}).get("summary") or {}
+            issues = summ.get("issue_count")
+            high = summ.get("high_severity")
+            med = summ.get("medium_severity")
+            low = summ.get("low_severity")
+            rows.append(
+                f"| `{_md_escape(name)}` | {_md_escape(src)} | {nrows if nrows is not None else ''} | {ncols if ncols is not None else ''} | {issues if issues is not None else 0} | {high if high is not None else 0} | {med if med is not None else 0} | {low if low is not None else 0} |"
+            )
+    parts.append(
+        "### Datasets (summary)\n\n"
+        "| Dataset | Source | Rows | Cols | Issues | High | Med | Low |\n"
+        "|---|---|---:|---:|---:|---:|---:|---:|\n"
+        + ("\n".join(rows) if rows else "|  |  |  |  |  |  |  |  |")
+    )
+
+    # Columns table (per dataset) - mirrors the "columns:" bullets in your screenshot.
+    if isinstance(datasets, dict) and datasets:
+        parts.append("### Columns (per dataset)\n")
+        for name, meta in datasets.items():
+            meta = meta or {}
+            cols = meta.get("columns") or {}
+            if not isinstance(cols, dict) or not cols:
+                continue
+            lines = [
+                "| Column | dtype | null% | unique | semantic type | candidate_pk |",
+                "|---|---|---:|---:|---|:---:|",
+            ]
+            # keep stable order for readability
+            for col_name in sorted(cols.keys(), key=lambda x: str(x).lower()):
+                c = cols.get(col_name) or {}
+                dtype = _md_escape(c.get("dtype"))
+                nullp = c.get("null_percentage")
+                nullp_txt = f"{round(100*float(nullp), 1)}%" if isinstance(nullp, (int, float)) else ""
+                uq = c.get("unique_count")
+                sem = _md_escape(c.get("semantic_type"))
+                cand = c.get("candidate_primary_key")
+                cand_txt = "✓" if cand is True else ("✗" if cand is False else "")
+                lines.append(
+                    f"| `{_md_escape(col_name)}` | `{dtype}` | {nullp_txt} | {uq if isinstance(uq, int) else ''} | `{sem}` | {cand_txt} |"
+                )
+            parts.append(f"#### `{_md_escape(name)}`\n\n" + "\n".join(lines))
+
+    # Per-dataset issues (top N) as table
+    if isinstance(dq, dict) and dq:
+        parts.append("### Top issues (per dataset)")
+        for name, block in dq.items():
+            issues = (block or {}).get("issues") or []
+            if not isinstance(issues, list) or not issues:
+                continue
+            # Show everything (no truncation) – user requested full tabular view.
+            top = issues
+            lines = [
+                "| Severity | Type | Column | Count | Message | Recommendation |",
+                "|:--:|---|---|---:|---|---|",
+            ]
+            for it in top:
+                sev = _md_escape(it.get("severity"))
+                typ = _md_escape(it.get("type"))
+                col = _md_escape(it.get("column"))
+                cnt = it.get("count")
+                msg = _md_escape(it.get("message"))
+                rec = _md_escape(it.get("recommendation"))
+                lines.append(
+                    f"| {sev} | `{typ}` | `{col}` | {cnt if isinstance(cnt, int) else ''} | {_md_escape(msg)} | {_md_escape(rec)} |"
+                )
+            # No "…(+N more)" – show all rows.
+            parts.append(f"#### `{_md_escape(name)}`\n\n" + "\n".join(lines))
+
+    # Relationships table
+    rel_rows = []
+    if isinstance(rels, list) and rels:
+        for r in rels:
+            rel_rows.append(
+                f"| `{_md_escape(r.get('left_dataset'))}` | `{_md_escape(r.get('right_dataset'))}` | `{_md_escape(r.get('on'))}` | `{_md_escape(r.get('type'))}` | {_md_escape(r.get('confidence'))} |"
+            )
+    parts.append(
+        "### Relationships\n\n"
+        "| Left | Right | On | Type | Confidence |\n"
+        "|---|---|---|---|---:|\n"
+        + ("\n".join(rel_rows) if rel_rows else "| _none_ | _none_ |  |  |  |")
+    )
+
+    # Global issues + relationship warnings in tables
+    global_issues = ((result.get("data_quality_issues") or {}).get("global_issues") or {}) if isinstance(result.get("data_quality_issues"), dict) else {}
+    if isinstance(global_issues, dict) and global_issues:
+        parts.append("### Global issues\n")
+        # Relationship row issues (orphans) table if present
+        row_issues = global_issues.get("relationship_row_issues")
+        if isinstance(row_issues, dict) and row_issues:
+            gi_rows = []
+            for k, v in row_issues.items():
+                try:
+                    n = len(v) if isinstance(v, list) else (int(v) if isinstance(v, int) else "")
+                except Exception:
+                    n = ""
+                gi_rows.append(f"| `{_md_escape(k)}` | {n} |")
+            parts.append(
+                "#### Cross-table row issues (orphan keys)\n\n"
+                "| Relationship | Count |\n"
+                "|---|---:|\n"
+                + ("\n".join(gi_rows) if gi_rows else "| _none_ | 0 |")
+            )
+        else:
+            parts.append(
+                "#### Cross-table row issues (orphan keys)\n\n"
+                "| Item | Value |\n"
+                "|---|---|\n"
+                "| Orphans | _none_ |"
+            )
+
+        warnings = global_issues.get("relationship_warnings")
+        if isinstance(warnings, list) and warnings:
+            w_rows = []
+            for w in warnings:
+                w_rows.append(f"| {_md_escape(w)} |")
+            parts.append(
+                "#### Relationship warnings\n\n"
+                "| Warning |\n"
+                "|---|\n"
+                + "\n".join(w_rows)
+            )
+        else:
+            parts.append(
+                "#### Relationship warnings\n\n"
+                "| Warning |\n"
+                "|---|\n"
+                "| _none_ |"
+            )
+
+    return "\n\n".join([p for p in parts if p.strip()])
+
+
 def _write_report_artifacts(
     *,
     result: Dict[str, Any],
@@ -190,7 +350,8 @@ def _write_report_artifacts(
     meta = result.setdefault("run_metadata", {}) if isinstance(result.get("run_metadata"), dict) or result.get("run_metadata") is None else {}
     if isinstance(meta, dict):
         meta["generated_at"] = datetime.now(timezone.utc).isoformat()
-        meta["reports_dir"] = reports_dir
+        # Intentionally do not include local/FS paths in the user-facing report payload.
+        # This directory is internal project storage and should not be shown in the UI.
 
     json_bytes = json.dumps(result, ensure_ascii=False, indent=2, default=str).encode("utf-8")
     paths = {
@@ -613,6 +774,19 @@ def _node_route(state: ChatState) -> ChatState:
         return {"action": "back_flow", "action_args": {}}
     if raw in ("restart", "reset", "start over"):
         return {"action": "reset_flow", "action_args": {}}
+    # Route "schema/metadata/report/preview" to table vs file handlers based on current selection.
+    sess = state.get("session") or {}
+    ctx = sess.get("context", {}) if isinstance(sess, dict) else {}
+    has_selected_files = bool((ctx or {}).get("selected_blob_files") or (ctx or {}).get("selected_local_files"))
+
+    if raw in ("show schema", "schema"):
+        return {"action": ("show_file_schema" if has_selected_files else "show_schema"), "action_args": {}}
+    if raw in ("show metadata", "metadata", "meta data", "show meta data"):
+        return {"action": ("show_file_metadata" if has_selected_files else "show_metadata"), "action_args": {}}
+    if raw in ("view top 10 rows", "next 10 rows", "preview top rows", "preview"):
+        return {"action": ("preview_selected_file" if has_selected_files else "preview_table"), "action_args": {"n": 10}}
+    if raw in ("generate report", "report", "generate a report"):
+        return {"action": ("generate_report_selected_files" if has_selected_files else "generate_report_selected"), "action_args": {}}
 
     # DQ shortcuts: allow follow-up questions after a report without forcing "select table".
     if ("null" in raw or "missing" in raw) and ("column" in raw or "columns" in raw or "fields" in raw):
@@ -739,6 +913,38 @@ def _node_back_flow(state: ChatState) -> ChatState:
     - Else if source was selected → clear source and go back to data source step
     """
     ctx = state["session"].setdefault("context", {})
+    # If we are currently on a generated report, go back to the last table "view" menu
+    # (keep selected table(s) and show the same buttons again).
+    if ctx.get("last_ui_step") == "report" and (ctx.get("selected_tables") or ctx.get("selected_table")):
+        selected = ctx.get("selected_tables") or []
+        if not selected and ctx.get("selected_table"):
+            selected = [str(ctx.get("selected_table"))]
+            ctx["selected_tables"] = selected
+        # Ensure we return to the view menu.
+        ctx["selected_action"] = "view"
+        reply = (
+            "✅ Selected Table(s):\n"
+            + "\n".join([f"- {n}" for n in selected])
+            + "\n\n👉 What would you like to see? (e.g., first row, columns, last 5 rows)\n"
+            + "You can also type: back / restart"
+        )
+        return {
+            "reply": reply,
+            "payload": {
+                "step": "view_query",
+                "selected_tables": selected,
+                "count": len(selected),
+                "options": _flow_options(
+                    {"id": "head", "text": "📊 View top 10 rows", "send": "preview table"},
+                    {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+                    {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+                    {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+                    {"id": "menu", "text": "📋 Menu", "send": "menu"},
+                    {"id": "back", "text": "🔙 Back", "send": "back"},
+                    {"id": "restart", "text": "✅ Restart", "send": "restart"},
+                ),
+            },
+        }
     if ctx.get("selected_tables") or ctx.get("selected_table"):
         ctx.pop("selected_tables", None)
         ctx.pop("selected_table", None)
@@ -834,9 +1040,12 @@ def _node_select_source(state: ChatState) -> ChatState:
         if idx in fs_abs:
             ctx["selected_fs_location_index"] = fs_abs.index(idx)
     reply = f"✅ Selected: {(loc.get('type') or '').lower()} ({loc.get('id') or loc.get('label') or 'no-id'})"
-    out = _prompt_choose_action()
-    out["reply"] = reply + "\n\n" + out["reply"]
-    out["payload"]["selected_source_index"] = idx
+    # Default flow: go straight to "View Data" after selecting a source
+    # (skips the intermediate Choose Action menu).
+    ctx["selected_action"] = "view"
+    out = _node_set_action({"session": state["session"], "message": "view", "action_args": {"action": "view"}})
+    out["reply"] = reply + "\n\n" + (out.get("reply") or "")
+    out.setdefault("payload", {})["selected_source_index"] = idx
     return out
 
 
@@ -979,9 +1188,11 @@ def _node_select_blob_files(state: ChatState) -> ChatState:
             "selected_files": selected,
             "count": len(selected),
             "options": _flow_options(
-                {"id": "first", "text": "📊 Show first row", "send": "show first row"},
-                {"id": "cols", "text": "📊 Show columns", "send": "show columns"},
-                {"id": "head5", "text": "📊 Show top 5", "send": "show top 5 rows"},
+                {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
+                {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+                {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+                {"id": "menu", "text": "📋 Menu", "send": "menu"},
                 {"id": "back", "text": "🔙 Back", "send": "back"},
                 {"id": "restart", "text": "✅ Restart", "send": "restart"},
             ),
@@ -1067,14 +1278,194 @@ def _node_select_local_files(state: ChatState) -> ChatState:
             "selected_local_files": selected,
             "count": len(selected),
             "options": _flow_options(
-                {"id": "first", "text": "📊 Show first row", "send": "show first row"},
-                {"id": "cols", "text": "📊 Show columns", "send": "show columns"},
-                {"id": "head5", "text": "📊 Show top 5", "send": "show top 5 rows"},
+                {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
+                {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+                {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+                {"id": "menu", "text": "📋 Menu", "send": "menu"},
                 {"id": "back", "text": "🔙 Back", "send": "back"},
                 {"id": "restart", "text": "✅ Restart", "send": "restart"},
             ),
         },
     }
+
+
+def _selected_file_mode_and_names(ctx: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Return ('blob'|'local', names[]) based on current session context."""
+    sel_blob = ctx.get("selected_blob_files") or []
+    if isinstance(sel_blob, list) and sel_blob:
+        return "blob", [str(x) for x in sel_blob]
+    sel_local = ctx.get("selected_local_files") or []
+    if isinstance(sel_local, list) and sel_local:
+        return "local", [str(x) for x in sel_local]
+    return "none", []
+
+
+def _node_preview_selected_file(state: ChatState) -> ChatState:
+    """
+    Preview the currently selected file (first selected) with paging (10 rows at a time).
+    For multiple selected files, this previews the first one.
+    """
+    ctx = state["session"].setdefault("context", {})
+    mode, names = _selected_file_mode_and_names(ctx)
+    if mode == "none" or not names:
+        return {"reply": "No file selected. Select one or more files first.", "payload": {}}
+
+    fname = names[0]
+    args = state.get("action_args") or {}
+    try:
+        n = int(args.get("n") or 10)
+    except Exception:
+        n = 10
+    n = max(1, min(n, 50))
+    offset = int(ctx.get("file_preview_offset") or 0)
+    offset = max(0, offset)
+
+    # Load a batch of rows (up to 500) using existing preview nodes.
+    if mode == "local":
+        out = _node_preview_local_file({"session": state["session"], "message": "", "action_args": {"name": fname, "n": 500}})
+    else:
+        out = _node_preview_blob_file({"session": state["session"], "message": "", "action_args": {"name": fname, "n": 500}})
+    rows = ((out.get("payload") or {}).get("rows") or [])
+    if not isinstance(rows, list):
+        rows = []
+    page = rows[offset : offset + n]
+    ctx["file_preview_offset"] = offset + len(page)
+
+    rows_text = json.dumps(page, ensure_ascii=False, indent=2)
+    head_label = "📊 Next 10 rows" if offset > 0 else "📊 View top 10 rows"
+    return {
+        "reply": f"Preview of `{fname}` (rows {offset + 1}–{offset + len(page)}):\n\n{rows_text}",
+        "payload": {
+            "step": "view_query",
+            "file": fname,
+            "rows": page,
+            "count": len(page),
+            "options": _flow_options(
+                {"id": "head", "text": head_label, "send": "view top 10 rows"},
+                {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+                {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+                {"id": "menu", "text": "📋 Menu", "send": "menu"},
+                {"id": "back", "text": "🔙 Back", "send": "back"},
+                {"id": "restart", "text": "✅ Restart", "send": "restart"},
+            ),
+        },
+    }
+
+
+def _node_show_file_schema(state: ChatState) -> ChatState:
+    """Show columns (schema) for selected blob/local files."""
+    ctx = state["session"].setdefault("context", {})
+    mode, names = _selected_file_mode_and_names(ctx)
+    if mode == "none" or not names:
+        return {"reply": "No file selected. Select one or more files first.", "payload": {}}
+
+    blocks: List[str] = []
+    schemas: Dict[str, Any] = {}
+    for fname in names[:10]:
+        if mode == "local":
+            out = _node_preview_local_file({"session": state["session"], "message": "show columns", "action_args": {"name": fname, "mode": "columns"}})
+        else:
+            out = _node_preview_blob_file({"session": state["session"], "message": "show columns", "action_args": {"name": fname, "mode": "columns"}})
+        cols = ((out.get("payload") or {}).get("columns") or [])
+        if not isinstance(cols, list):
+            cols = []
+        schemas[fname] = cols
+        # Markdown table for clean UI rendering.
+        rows = "\n".join([f"| {i+1} | `{str(c)}` |" for i, c in enumerate(cols[:80])])
+        blocks.append(
+            f"### Schema — `{fname}`\n\n"
+            f"| # | Column |\n"
+            f"|---:|--------|\n"
+            f"{rows if rows else '|  |  |'}\n"
+            + (f"\n\n_…(+{len(cols)-80} more columns)_" if len(cols) > 80 else "")
+        )
+    if len(names) > 10:
+        blocks.append(f"_…(+{len(names) - 10} more files)_")
+
+    return {
+        "reply": "\n\n".join(blocks),
+        "payload": {
+            "step": "view_query",
+            "schemas": schemas,
+            "options": _flow_options(
+                {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
+                {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+                {"id": "menu", "text": "📋 Menu", "send": "menu"},
+                {"id": "back", "text": "🔙 Back", "send": "back"},
+                {"id": "restart", "text": "✅ Restart", "send": "restart"},
+            ),
+        },
+    }
+
+
+def _node_show_file_metadata(state: ChatState) -> ChatState:
+    """Show shape/basic metadata for selected blob/local files."""
+    ctx = state["session"].setdefault("context", {})
+    mode, names = _selected_file_mode_and_names(ctx)
+    if mode == "none" or not names:
+        return {"reply": "No file selected. Select one or more files first.", "payload": {}}
+
+    meta: Dict[str, Any] = {}
+    rows_md: List[str] = []
+    for fname in names[:15]:
+        if mode == "local":
+            out = _node_preview_local_file({"session": state["session"], "message": "shape", "action_args": {"name": fname, "mode": "shape"}})
+        else:
+            out = _node_preview_blob_file({"session": state["session"], "message": "shape", "action_args": {"name": fname, "mode": "shape"}})
+        rows = ((out.get("payload") or {}).get("rows"))
+        cols = ((out.get("payload") or {}).get("columns"))
+        meta[fname] = {"rows": rows, "columns": cols}
+        r_txt = str(rows) if rows is not None else "unavailable"
+        c_txt = str(cols) if cols is not None else "unavailable"
+        rows_md.append(f"| `{fname}` | {r_txt} | {c_txt} |")
+
+    return {
+        "reply": (
+            "### Metadata — selected files\n\n"
+            "| File | Rows | Columns |\n"
+            "|------|-----:|--------:|\n"
+            + ("\n".join(rows_md) if rows_md else "|  |  |  |")
+            + (f"\n\n_…(+{len(names) - 15} more files)_" if len(names) > 15 else "")
+        ),
+        "payload": {
+            "step": "view_query",
+            "metadata": meta,
+            "options": _flow_options(
+                {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
+                {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+                {"id": "menu", "text": "📋 Menu", "send": "menu"},
+                {"id": "back", "text": "🔙 Back", "send": "back"},
+                {"id": "restart", "text": "✅ Restart", "send": "restart"},
+            ),
+        },
+    }
+
+
+def _node_generate_report_selected_files(state: ChatState) -> ChatState:
+    """Generate assessment report for selected blob/local files."""
+    ctx = state["session"].setdefault("context", {})
+    mode, names = _selected_file_mode_and_names(ctx)
+    if mode == "none" or not names:
+        return {"reply": "No file selected. Select one or more files first.", "payload": {}}
+
+    ctx["selected_action"] = "report"
+    out = _node_assess_selected_files(state) if mode == "blob" else _node_assess_selected_local_files(state)
+    out["payload"] = out.get("payload") or {}
+    out["payload"]["step"] = "report"
+    ctx["last_ui_step"] = "report"
+    out["payload"]["options"] = _flow_options(
+        {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
+        {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+        {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+        {"id": "menu", "text": "📋 Menu", "send": "menu"},
+        {"id": "back", "text": "🔙 Back", "send": "back"},
+        {"id": "restart", "text": "✅ Restart", "send": "restart"},
+    )
+    return out
 
 
 def _node_assess_selected_local_files(state: ChatState) -> ChatState:
@@ -1130,7 +1521,8 @@ def _node_assess_selected_local_files(state: ChatState) -> ChatState:
         dfs[name] = df
     result = load_and_profile({"name": "local", "locations": []}, additional_data=dfs)
     sampled = f" (sampled up to {max_rows} rows/file where applicable)" if max_rows > 0 else ""
-    report_md = _render_report_markdown(result)
+    # Only return the tabular report in chat (no legacy/freeform report text).
+    report_md = _build_report_tables_markdown(result)
     reply = report_md or f"Assessment complete for {len(dfs)} local file(s){sampled}."
     artifacts = _write_report_artifacts(result=result, report_markdown=report_md)
     # Cache for follow-up DQ questions
@@ -1176,7 +1568,8 @@ def _node_assess_selected_files(state: ChatState) -> ChatState:
     )
     # Run assessment purely over the loaded blobs (via additional_data).
     result = run_assessment(cfg_text, additional_data=dfs)
-    report_md = _render_report_markdown(result)
+    # Only return the tabular report in chat (no legacy/freeform report text).
+    report_md = _build_report_tables_markdown(result)
     if report_md:
         reply = report_md
     else:
@@ -1429,6 +1822,8 @@ def _node_select_tables(state: ChatState) -> ChatState:
     # Convenience: if exactly one table is selected, treat it as the active table for schema/preview/NL queries.
     if len(selected) == 1:
         ctx["selected_table"] = str(selected[0])
+    # Reset preview paging whenever table selection changes.
+    ctx["table_preview_offset"] = 0
     if str(ctx.get("selected_action") or "").lower() == "report":
         out = _node_assess_selected_tables(state)
         out["reply"] = "✅ Selected Table(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n📑 Report:\n" + (out.get("reply") or "")
@@ -1452,8 +1847,11 @@ def _node_select_tables(state: ChatState) -> ChatState:
             "selected_tables": selected,
             "count": len(selected),
             "options": _flow_options(
-                {"id": "head", "text": "📊 Preview top rows", "send": "preview table"},
+                {"id": "head", "text": "📊 View top 10 rows", "send": "preview table"},
                 {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+                {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+                {"id": "menu", "text": "📋 Menu", "send": "menu"},
                 {"id": "back", "text": "🔙 Back", "send": "back"},
                 {"id": "restart", "text": "✅ Restart", "send": "restart"},
             ),
@@ -1489,13 +1887,49 @@ def _node_assess_selected_tables(state: ChatState) -> ChatState:
     dfs = {t: conn.preview_table(t, rows) for t in selected}
     result = load_and_profile({"name": source_root.get("name") or "source", "locations": []}, additional_data=dfs)
     sampled = f" (sampled up to {rows} rows/table)" if max_rows > 0 else " (sampled up to 10,000 rows/table)"
-    report_md = _render_report_markdown(result)
+    # Only return the tabular report in chat (no legacy/freeform report text).
+    report_md = _build_report_tables_markdown(result)
     reply = report_md or f"Assessment complete for {len(dfs)} table(s){sampled}."
     artifacts = _write_report_artifacts(result=result, report_markdown=report_md)
     # Cache for follow-up DQ questions
     ctx["last_assessment_result"] = result
     ctx["last_assessment_datasets"] = list((result.get("datasets") or {}).keys()) if isinstance(result, dict) else []
     return {"reply": reply, "payload": {"selected_tables": selected, "result": result, "report_markdown": report_md, "report_files": artifacts}}
+
+
+def _node_generate_report_selected(state: ChatState) -> ChatState:
+    """
+    Generate a report for the currently selected table(s) without going back
+    to the Choose Action step.
+    """
+    ctx = state["session"].setdefault("context", {})
+    selected = ctx.get("selected_tables") or []
+    if not selected:
+        table = ctx.get("selected_table")
+        if table:
+            selected = [str(table)]
+            ctx["selected_tables"] = selected
+    if not selected:
+        return {"reply": "No table selected. Select a table first, then click Generate report.", "payload": {}}
+
+    ctx["selected_action"] = "report"
+    out = _node_assess_selected_tables(state)
+    out["payload"] = out.get("payload") or {}
+    out["payload"]["step"] = "report"
+    # Mark step so "back" can return to the table menu.
+    ctx["last_ui_step"] = "report"
+    out["payload"]["options"] = _flow_options(
+        {"id": "head", "text": "📊 View top 10 rows", "send": "preview table"},
+        {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+        {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+        # Hide "Generate report" right after generating a report; it will reappear
+        # when the user selects another action (schema/rows/metadata) that returns
+        # the standard view menu.
+        {"id": "menu", "text": "📋 Menu", "send": "menu"},
+        {"id": "back", "text": "🔙 Back", "send": "back"},
+        {"id": "restart", "text": "✅ Restart", "send": "restart"},
+    )
+    return out
 
 
 def _node_select_table(state: ChatState) -> ChatState:
@@ -1522,14 +1956,20 @@ def _node_select_table(state: ChatState) -> ChatState:
 
 def _node_show_schema(state: ChatState) -> ChatState:
     ctx = state["session"].setdefault("context", {})
+    selected_tables = ctx.get("selected_tables") or []
+    if not isinstance(selected_tables, list):
+        selected_tables = []
+
     table = ctx.get("selected_table")
-    if not table:
-        sel = ctx.get("selected_tables") or []
-        if isinstance(sel, list) and len(sel) == 1:
-            table = sel[0]
-            ctx["selected_table"] = str(table)
-    if not table:
-        return {"reply": "No table selected. Use 'select table <schema.table>' (or select exactly one table) first.", "payload": {}}
+    if not table and len(selected_tables) == 1:
+        table = selected_tables[0]
+        ctx["selected_table"] = str(table)
+    if not table and not selected_tables:
+        return {
+            "reply": "No table selected. Select one or more tables first.",
+            "payload": {},
+        }
+    tables = [str(t) for t in (selected_tables if selected_tables else [table])]
     sources_path = state["session"].get("context", {}).get("sources_path") or "config/sources.yaml"
     source_root = load_sources_config(sources_path)
     db_locs = [loc for loc in (source_root.get("locations") or []) if (loc.get("type") or "").lower() == "database"]
@@ -1542,21 +1982,59 @@ def _node_show_schema(state: ChatState) -> ChatState:
     from connectors.azure_sql_pythonnet import AzureSQLPythonNetConnector
 
     conn = AzureSQLPythonNetConnector(conn_cfg)
-    cols = conn.get_table_schema(table)
-    lines = [f"- {c['name']}: {c['type']} nullable={c['nullable']}" for c in cols]
-    return {"reply": f"Schema for {table}:\n" + "\n".join(lines), "payload": {"schema": cols}}
+    blocks: List[str] = []
+    schema_map: Dict[str, Any] = {}
+    for t in tables[:10]:
+        cols = conn.get_table_schema(t)
+        schema_map[str(t)] = cols
+        # Markdown table for clean UI rendering.
+        rows_md = []
+        for i, c in enumerate(cols[:200]):
+            name = str(c.get("name") or "")
+            typ = str(c.get("type") or "")
+            nul = str(c.get("nullable") or "")
+            rows_md.append(f"| {i+1} | `{name}` | `{typ}` | {nul} |")
+        blocks.append(
+            f"### Schema — `{t}`\n\n"
+            "| # | Column | Type | Nullable |\n"
+            "|---:|--------|------|:--------:|\n"
+            + ("\n".join(rows_md) if rows_md else "|  |  |  |  |")
+            + (f"\n\n_…(+{len(cols)-200} more columns)_" if len(cols) > 200 else "")
+        )
+    if len(tables) > 10:
+        blocks.append(f"_…(+{len(tables) - 10} more tables)_")
+    return {
+        "reply": "\n\n".join(blocks),
+        "payload": {
+            "step": "view_query",
+            "schemas": schema_map,
+            "options": _flow_options(
+                {"id": "head", "text": "📊 Next 10 rows", "send": "preview table"},
+                {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+                {"id": "menu", "text": "📋 Menu", "send": "menu"},
+                {"id": "back", "text": "🔙 Back", "send": "back"},
+                {"id": "restart", "text": "✅ Restart", "send": "restart"},
+            ),
+        },
+    }
 
 
 def _node_preview_table(state: ChatState) -> ChatState:
     ctx = state["session"].setdefault("context", {})
+    sel = ctx.get("selected_tables") or []
+    if not isinstance(sel, list):
+        sel = []
     table = ctx.get("selected_table")
+    # If multiple tables are selected, default previews/paging to the first table.
+    if not table and sel:
+        table = sel[0]
+        ctx["selected_table"] = str(table)
+    if not table and len(sel) == 1:
+        table = sel[0]
+        ctx["selected_table"] = str(table)
     if not table:
-        sel = ctx.get("selected_tables") or []
-        if isinstance(sel, list) and len(sel) == 1:
-            table = sel[0]
-            ctx["selected_table"] = str(table)
-    if not table:
-        return {"reply": "No table selected. Use 'select table <schema.table>' (or select exactly one table) first.", "payload": {}}
+        return {"reply": "No table selected. Select one or more tables first.", "payload": {}}
     sources_path = state["session"].get("context", {}).get("sources_path") or "config/sources.yaml"
     source_root = load_sources_config(sources_path)
     db_locs = [loc for loc in (source_root.get("locations") or []) if (loc.get("type") or "").lower() == "database"]
@@ -1576,7 +2054,39 @@ def _node_preview_table(state: ChatState) -> ChatState:
         n = 10
     n = max(1, min(n, 50))
 
-    df = conn.preview_table(table, n)
+    offset = int(ctx.get("table_preview_offset") or 0)
+    offset = max(0, offset)
+
+    # Use a stable-ish paging strategy without requiring a known ordering column.
+    # Note: Without an ORDER BY on a deterministic key, SQL Server does not guarantee consistent ordering across calls.
+    try:
+        from connectors.azure_sql_pythonnet import SqlCommand
+
+        conn_raw = conn._connect()
+        conn_raw.Open()
+        try:
+            table_q = conn._quote_two_part_name(table)
+            sql = f"""
+WITH numbered AS (
+  SELECT *, ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS __rn
+  FROM {table_q}
+)
+SELECT * FROM numbered
+WHERE __rn > @offset AND __rn <= (@offset + @limit)
+ORDER BY __rn
+"""
+            cmd = SqlCommand(sql, conn_raw)
+            cmd.Parameters.AddWithValue("@offset", int(offset))
+            cmd.Parameters.AddWithValue("@limit", int(n))
+            reader = cmd.ExecuteReader()
+            df = conn._read_reader_to_df(reader)
+            if "__rn" in df.columns:
+                df = df.drop(columns=["__rn"])
+        finally:
+            conn_raw.Close()
+    except Exception:
+        # Fallback to TOP N if paging query fails.
+        df = conn.preview_table(table, n)
     # lightweight preview
     cols = list(df.columns)
     rows = df.head(n).to_dict(orient="records")
@@ -1584,9 +2094,125 @@ def _node_preview_table(state: ChatState) -> ChatState:
     rows = mask_rows(rows)
 
     rows_text = json.dumps(rows, ensure_ascii=False, indent=2)
+    # Advance offset by how many rows we returned (even if fewer than requested).
+    next_offset = offset + len(rows)
+    ctx["table_preview_offset"] = next_offset
+    # After the first page, switch the button label to "Next 10 rows".
+    head_label = "📊 Next 10 rows" if next_offset > 0 else "📊 View top 10 rows"
     return {
-        "reply": f"Preview of {table} ({n} rows). Columns: {', '.join(cols[:30])}\n\n{rows_text}",
-        "payload": {"table": str(table), "columns": cols, "rows": rows, "count": len(rows)},
+        "reply": f"Preview of {table} (rows {offset + 1}–{offset + len(rows)}). Columns: {', '.join(cols[:30])}\n\n{rows_text}",
+        "payload": {
+            "step": "view_query",
+            "table": str(table),
+            "columns": cols,
+            "rows": rows,
+            "count": len(rows),
+            "preview_offset": next_offset,
+            "options": _flow_options(
+                {"id": "head", "text": head_label, "send": "preview table"},
+                {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+                {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+                {"id": "menu", "text": "📋 Menu", "send": "menu"},
+                {"id": "back", "text": "🔙 Back", "send": "back"},
+                {"id": "restart", "text": "✅ Restart", "send": "restart"},
+            ),
+        },
+    }
+
+
+def _node_show_metadata(state: ChatState) -> ChatState:
+    ctx = state["session"].setdefault("context", {})
+    selected_tables = ctx.get("selected_tables") or []
+    if not isinstance(selected_tables, list):
+        selected_tables = []
+
+    table = ctx.get("selected_table")
+    if not table and len(selected_tables) == 1:
+        table = selected_tables[0]
+        ctx["selected_table"] = str(table)
+    if not table and not selected_tables:
+        return {"reply": "No table selected. Select one or more tables first.", "payload": {}}
+    tables = [str(t) for t in (selected_tables if selected_tables else [table])]
+
+    sources_path = state["session"].get("context", {}).get("sources_path") or "config/sources.yaml"
+    source_root = load_sources_config(sources_path)
+    db_locs = [loc for loc in (source_root.get("locations") or []) if (loc.get("type") or "").lower() == "database"]
+    if not db_locs:
+        return {"reply": "No database source configured.", "payload": {}}
+    db_idx = int(ctx.get("selected_db_location_index") or 0)
+    db_idx = max(0, min(db_idx, len(db_locs) - 1))
+    conn_cfg = db_locs[db_idx].get("connection") or {}
+
+    from connectors.azure_sql_pythonnet import AzureSQLPythonNetConnector, SqlCommand
+
+    conn = AzureSQLPythonNetConnector(conn_cfg)
+
+    def _split_schema_name(t: str) -> tuple[str, str]:
+        if "." in t:
+            a, b = t.split(".", 1)
+            return a, b
+        return "dbo", t
+
+    def _get_row_count(full_name: str) -> int | None:
+        try:
+            c = conn._connect()
+            c.Open()
+            try:
+                cmd = SqlCommand(
+                    """
+SELECT SUM(row_count) AS row_count
+FROM sys.dm_db_partition_stats
+WHERE object_id = OBJECT_ID(@full_name)
+  AND index_id IN (0, 1)
+""",
+                    c,
+                )
+                cmd.Parameters.AddWithValue("@full_name", full_name)
+                reader = cmd.ExecuteReader()
+                if reader.Read() and not reader.IsDBNull(0):
+                    return int(reader.GetValue(0))
+                return None
+            finally:
+                c.Close()
+        except Exception:
+            return None
+
+    meta: Dict[str, Any] = {}
+    rows_md: List[str] = []
+    for t in tables[:15]:
+        sch, nm = _split_schema_name(t)
+        cols = conn.get_table_schema(t)
+        col_count = len(cols)
+        nullable = sum(1 for c in cols if str(c.get("nullable") or "").lower() in ("yes", "true", "1"))
+        rc = _get_row_count(f"{sch}.{nm}")
+        meta[t] = {"row_count": rc, "column_count": col_count, "nullable_columns": nullable}
+        rc_txt = f"{rc:,}" if isinstance(rc, int) else "unavailable"
+        rows_md.append(f"| `{sch}.{nm}` | {rc_txt} | {col_count} | {nullable} |")
+
+    offset_now = int(ctx.get("table_preview_offset") or 0)
+    reply = (
+        "### Metadata — selected tables\n\n"
+        "| Table | Rows (approx) | Columns | Nullable cols |\n"
+        "|------|--------------:|--------:|--------------:|\n"
+        + ("\n".join(rows_md) if rows_md else "|  |  |  |  |")
+        + (f"\n\n_…(+{len(tables) - 15} more tables)_" if len(tables) > 15 else "")
+        + f"\n\n_Current preview offset_: **{offset_now}**"
+    )
+    return {
+        "reply": reply,
+        "payload": {
+            "tables": tables,
+            "metadata": meta,
+            "options": _flow_options(
+                {"id": "head", "text": "📊 Next 10 rows", "send": "preview table"},
+                {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+                {"id": "menu", "text": "📋 Menu", "send": "menu"},
+                {"id": "back", "text": "🔙 Back", "send": "back"},
+                {"id": "restart", "text": "✅ Restart", "send": "restart"},
+            ),
+        },
     }
 
 
@@ -1653,6 +2279,16 @@ def _node_nl_query(state: ChatState) -> ChatState:
 
 def _node_save_session(state: ChatState) -> ChatState:
     sess = state.get("session") or {}
+    # Track last UI step for deterministic back behavior.
+    try:
+        ctx = sess.setdefault("context", {})
+        if isinstance(ctx, dict):
+            p = state.get("payload") or {}
+            step = p.get("step") if isinstance(p, dict) else None
+            if step:
+                ctx["last_ui_step"] = str(step)
+    except Exception:
+        pass
     msg = state.get("message")
     if msg:
         sess.setdefault("messages", []).append({"role": "user", "content": msg, "ts": time.time()})
@@ -1699,8 +2335,14 @@ def build_chat_graph():
     g.add_node("assess_selected_local_files", _node_assess_selected_local_files)
     g.add_node("preview_local_file", _node_preview_local_file)
     g.add_node("preview_blob_file", _node_preview_blob_file)
+    g.add_node("preview_selected_file", _node_preview_selected_file)
+    g.add_node("show_file_schema", _node_show_file_schema)
+    g.add_node("show_file_metadata", _node_show_file_metadata)
+    g.add_node("generate_report_selected_files", _node_generate_report_selected_files)
     g.add_node("show_schema", _node_show_schema)
     g.add_node("preview_table", _node_preview_table)
+    g.add_node("show_metadata", _node_show_metadata)
+    g.add_node("generate_report_selected", _node_generate_report_selected)
     g.add_node("dq_table", _node_dq_table)
     g.add_node("nl_query", _node_nl_query)
     g.add_node("show_null_columns", _node_show_null_columns)
@@ -1737,8 +2379,14 @@ def build_chat_graph():
             "assess_selected_local_files": "assess_selected_local_files",
             "preview_local_file": "preview_local_file",
             "preview_blob_file": "preview_blob_file",
+            "preview_selected_file": "preview_selected_file",
+            "show_file_schema": "show_file_schema",
+            "show_file_metadata": "show_file_metadata",
+            "generate_report_selected_files": "generate_report_selected_files",
             "show_schema": "show_schema",
             "preview_table": "preview_table",
+            "show_metadata": "show_metadata",
+            "generate_report_selected": "generate_report_selected",
             "dq_table": "dq_table",
             "nl_query": "nl_query",
             "show_null_columns": "show_null_columns",
@@ -1767,8 +2415,14 @@ def build_chat_graph():
         "assess_selected_local_files",
         "preview_local_file",
         "preview_blob_file",
+        "preview_selected_file",
+        "show_file_schema",
+        "show_file_metadata",
+        "generate_report_selected_files",
         "show_schema",
         "preview_table",
+        "show_metadata",
+        "generate_report_selected",
         "dq_table",
         "nl_query",
         "show_null_columns",
