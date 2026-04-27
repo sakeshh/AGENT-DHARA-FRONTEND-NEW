@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useMemo, useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { FaChartBar, FaExclamationTriangle, FaCheckCircle, FaThumbsUp, FaThumbsDown } from 'react-icons/fa';
 
@@ -11,21 +11,97 @@ interface DataAssessmentReportProps {
   onFeedback: (liked: boolean, comment?: string) => void;
 }
 
-interface AssessmentResult {
-  fileName: string;
-  totalRows: number;
-  totalColumns: number;
-  missingValues: number;
-  duplicates: number;
-  dataQualityScore: number;
-  issues: Array<{ type: string; severity: string; description: string }>;
-  columnStats: Array<{ name: string; type: string; nullCount: number; uniqueCount: number }>;
+type Severity = 'high' | 'medium' | 'low';
+
+type BackendAssessment = {
+  datasets?: Record<
+    string,
+    {
+      row_count?: number;
+      column_count?: number;
+      source_root?: string;
+      columns?: Record<
+        string,
+        {
+          dtype?: string;
+          null_percentage?: number;
+          unique_count?: number;
+          semantic_type?: string;
+          candidate_primary_key?: boolean;
+        }
+      >;
+    }
+  >;
+  relationships?: Array<{
+    dataset_a?: string;
+    column_a?: string;
+    dataset_b?: string;
+    column_b?: string;
+    cardinality?: string;
+    overlap_count?: number;
+  }>;
+  data_quality_issues?: {
+    datasets?: Record<
+      string,
+      {
+        summary?: {
+          issue_count?: number;
+          high_severity?: number;
+          medium_severity?: number;
+          low_severity?: number;
+        };
+        issues?: Array<{
+          severity?: Severity | string;
+          type?: string;
+          column?: string;
+          count?: number;
+          message?: string;
+          recommendation?: string;
+        }>;
+      }
+    >;
+    global_issues?: Record<string, any>;
+  };
+};
+
+type UiDatasetSummary = {
+  name: string;
+  sourceLabel: string;
+  rows: number;
+  cols: number;
+  issues: number;
+  high: number;
+  med: number;
+  low: number;
+};
+
+function sourceLabelFromRoot(sourceRoot?: string): string {
+  const sr = String(sourceRoot || '');
+  if (!sr) return '';
+  if (sr.startsWith('__database__')) {
+    const label = sr.includes(':') ? sr.split(':', 2)[1] : '';
+    return `Azure SQL${label ? ` (${label})` : ''}`;
+  }
+  if (sr.startsWith('azure_blob:')) {
+    const prefix = sr.split(':', 2)[1] ?? '';
+    return `Azure Blob${prefix ? ` (${prefix})` : ''}`;
+  }
+  return `Filesystem (${sr})`;
+}
+
+function normalizeSeverity(s: any): Severity {
+  const t = String(s || '').toLowerCase();
+  if (t === 'high') return 'high';
+  if (t === 'medium') return 'medium';
+  return 'low';
 }
 
 export default function DataAssessmentReport({ files, database, onComplete, onFeedback }: DataAssessmentReportProps) {
   const [assessing, setAssessing] = useState(true);
   const [progress, setProgress] = useState(0);
-  const [results, setResults] = useState<AssessmentResult[]>([]);
+  const [assessment, setAssessment] = useState<BackendAssessment | null>(null);
+  const [reportMarkdown, setReportMarkdown] = useState<string | null>(null);
+  const [reportHtml, setReportHtml] = useState<string | null>(null);
   const [showFeedback, setShowFeedback] = useState(false);
 
   useEffect(() => {
@@ -110,36 +186,19 @@ export default function DataAssessmentReport({ files, database, onComplete, onFe
         body: JSON.stringify({ sessionId: sid, messages: [{ role: 'user', content: cmd }] }),
       });
       const chatJson = await chatRes.json().catch(() => null);
-      const result = chatJson?.payload?.result ?? chatJson?.payload ?? chatJson;
+      const payload = chatJson?.payload ?? null;
+      const result: BackendAssessment | null = payload?.result ?? payload ?? null;
+      setAssessment(result);
+      setReportMarkdown(typeof payload?.report_markdown === 'string' ? payload.report_markdown : null);
+      setReportHtml(typeof payload?.report_html === 'string' ? payload.report_html : null);
 
       setProgress(90);
-      // Keep UI stable: synthesize minimal rows for the existing report view.
-      const minimal: AssessmentResult[] = files.map((f) => ({
-        fileName: f,
-        totalRows: 0,
-        totalColumns: 0,
-        missingValues: 0,
-        duplicates: 0,
-        dataQualityScore: 0,
-        issues: [],
-        columnStats: [],
-      }));
-      setResults(minimal);
-      onComplete(result);
+      onComplete({ result, report_markdown: payload?.report_markdown, report_html: payload?.report_html, report_files: payload?.report_files });
     } catch {
-      // fall back to minimal result so pipeline keeps moving
-      const minimal: AssessmentResult[] = files.map((f) => ({
-        fileName: f,
-        totalRows: 0,
-        totalColumns: 0,
-        missingValues: 0,
-        duplicates: 0,
-        dataQualityScore: 0,
-        issues: [],
-        columnStats: [],
-      }));
-      setResults(minimal);
-      onComplete(minimal);
+      setAssessment(null);
+      setReportMarkdown(null);
+      setReportHtml(null);
+      onComplete(null);
     } finally {
       setProgress(100);
       setAssessing(false);
@@ -200,12 +259,35 @@ export default function DataAssessmentReport({ files, database, onComplete, onFe
     );
   }
 
+  const title = files.length === 1 ? `Assessment Report of ${files[0]}` : 'Assessment Report';
+
+  const summaries: UiDatasetSummary[] = useMemo(() => {
+    const datasets = assessment?.datasets || {};
+    const dq = assessment?.data_quality_issues?.datasets || {};
+    return Object.entries(datasets).map(([name, meta]) => {
+      const summ = dq?.[name]?.summary || {};
+      return {
+        name,
+        sourceLabel: sourceLabelFromRoot(meta?.source_root),
+        rows: Number(meta?.row_count ?? 0) || 0,
+        cols: Number(meta?.column_count ?? 0) || 0,
+        issues: Number(summ?.issue_count ?? 0) || 0,
+        high: Number(summ?.high_severity ?? 0) || 0,
+        med: Number(summ?.medium_severity ?? 0) || 0,
+        low: Number(summ?.low_severity ?? 0) || 0,
+      };
+    });
+  }, [assessment]);
+
+  const relationships = Array.isArray(assessment?.relationships) ? assessment!.relationships! : [];
+  const globalIssues = assessment?.data_quality_issues?.global_issues || null;
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-3xl font-bold text-zinc-900 mb-2">Assessment Complete</h2>
-          <p className="text-black/60">Review the data quality analysis below</p>
+          <h2 className="text-3xl font-bold text-zinc-900 mb-2">{title}</h2>
+          <p className="text-black/60">Datasets summary, relationships, and issues</p>
         </div>
         <div className="flex gap-2">
           <button
@@ -225,75 +307,120 @@ export default function DataAssessmentReport({ files, database, onComplete, onFe
         </div>
       </div>
 
-      {/* Results */}
-      <div className="space-y-4">
-        {results.map((result, idx) => (
-          <motion.div
-            key={result.fileName}
-            className="border border-black/10 rounded-lg p-6 bg-white/90"
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: idx * 0.1 }}
-          >
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-xl font-bold text-zinc-900">{result.fileName}</h3>
-              <div className="flex items-center gap-2">
-                <div className={`text-2xl font-bold ${
-                  result.dataQualityScore >= 80 ? 'text-[#0070AD]' :
-                  result.dataQualityScore >= 60 ? 'text-amber-400' : 'text-red-400'
-                }`}>
-                  {result.dataQualityScore}%
-                </div>
-                <div className="text-sm text-black/60">Quality Score</div>
-              </div>
-            </div>
+      {/* Datasets summary */}
+      <div className="border border-black/10 rounded-lg p-6 bg-white/90">
+        <div className="flex items-center gap-3 mb-4">
+          <FaChartBar className="text-[#0070AD]" />
+          <h3 className="text-xl font-bold text-zinc-900">Datasets (summary)</h3>
+        </div>
 
-            <div className="grid grid-cols-4 gap-4 mb-4">
-              <div className="bg-white rounded-lg border border-black/10 p-4">
-                <div className="text-sm text-black/60">Total Rows</div>
-                <div className="text-2xl font-bold text-zinc-900">{result.totalRows.toLocaleString()}</div>
-              </div>
-              <div className="bg-white rounded-lg border border-black/10 p-4">
-                <div className="text-sm text-black/60">Columns</div>
-                <div className="text-2xl font-bold text-zinc-900">{result.totalColumns}</div>
-              </div>
-              <div className="bg-amber-500/20 p-4 rounded-lg">
-                <div className="text-sm text-amber-400">Missing Values</div>
-                <div className="text-2xl font-bold text-amber-400">{result.missingValues.toLocaleString()}</div>
-              </div>
-              <div className="bg-red-500/20 p-4 rounded-lg">
-                <div className="text-sm text-red-400">Duplicates</div>
-                <div className="text-2xl font-bold text-red-400">{result.duplicates.toLocaleString()}</div>
-              </div>
-            </div>
-
-            <div>
-              <h4 className="font-semibold text-zinc-900 mb-2">Issues Found</h4>
-              <div className="space-y-2">
-                {result.issues.map((issue, issueIdx) => (
-                  <div key={issueIdx} className="flex items-start gap-3 p-3 bg-white rounded-lg border border-black/10">
-                    <FaExclamationTriangle className={`text-lg mt-1 ${
-                      issue.severity === 'high' ? 'text-red-500' :
-                      issue.severity === 'medium' ? 'text-yellow-500' : 'text-blue-500'
-                    }`} />
-                    <div className="flex-1">
-                      <div className="font-medium text-zinc-900">{issue.type}</div>
-                      <div className="text-sm text-black/60">{issue.description}</div>
-                    </div>
-                    <span className={`text-xs px-2 py-1 rounded ${
-                      issue.severity === 'high' ? 'bg-red-500/30 text-red-400' :
-                      issue.severity === 'medium' ? 'bg-amber-500/30 text-amber-400' :
-                      'bg-black/5 text-black/70'
-                    }`}>
-                      {issue.severity}
-                    </span>
-                  </div>
+        {summaries.length === 0 ? (
+          <div className="text-sm text-black/60">No datasets found in assessment output.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-black/10">
+                  <th className="text-left py-3 px-2 text-[#0070AD]">Dataset</th>
+                  <th className="text-left py-3 px-2 text-[#0070AD]">Source</th>
+                  <th className="text-right py-3 px-2 text-[#0070AD]">Rows</th>
+                  <th className="text-right py-3 px-2 text-[#0070AD]">Cols</th>
+                  <th className="text-right py-3 px-2 text-[#0070AD]">Issues</th>
+                  <th className="text-right py-3 px-2 text-[#0070AD]">High</th>
+                  <th className="text-right py-3 px-2 text-[#0070AD]">Med</th>
+                  <th className="text-right py-3 px-2 text-[#0070AD]">Low</th>
+                </tr>
+              </thead>
+              <tbody>
+                {summaries.map((r) => (
+                  <tr key={r.name} className="border-b border-black/5">
+                    <td className="py-2 px-2 font-medium text-zinc-900">{r.name}</td>
+                    <td className="py-2 px-2 text-black/70">{r.sourceLabel}</td>
+                    <td className="py-2 px-2 text-right text-black/70">{r.rows.toLocaleString()}</td>
+                    <td className="py-2 px-2 text-right text-black/70">{r.cols.toLocaleString()}</td>
+                    <td className="py-2 px-2 text-right text-black/70">{r.issues.toLocaleString()}</td>
+                    <td className="py-2 px-2 text-right text-red-500">{r.high.toLocaleString()}</td>
+                    <td className="py-2 px-2 text-right text-amber-500">{r.med.toLocaleString()}</td>
+                    <td className="py-2 px-2 text-right text-blue-600">{r.low.toLocaleString()}</td>
+                  </tr>
                 ))}
-              </div>
-            </div>
-          </motion.div>
-        ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
+
+      {/* Relationships */}
+      <div className="border border-black/10 rounded-lg p-6 bg-white/90">
+        <div className="flex items-center gap-3 mb-4">
+          <FaCheckCircle className="text-[#0070AD]" />
+          <h3 className="text-xl font-bold text-zinc-900">Relationships</h3>
+        </div>
+        {relationships.length === 0 ? (
+          <div className="text-sm text-black/60">No relationships found.</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-black/10">
+                  <th className="text-left py-3 px-2 text-[#0070AD]">Dataset A</th>
+                  <th className="text-left py-3 px-2 text-[#0070AD]">Column A</th>
+                  <th className="text-left py-3 px-2 text-[#0070AD]">Dataset B</th>
+                  <th className="text-left py-3 px-2 text-[#0070AD]">Column B</th>
+                  <th className="text-left py-3 px-2 text-[#0070AD]">Cardinality</th>
+                  <th className="text-right py-3 px-2 text-[#0070AD]">Shared keys</th>
+                </tr>
+              </thead>
+              <tbody>
+                {relationships.map((r, i) => (
+                  <tr key={`${r.dataset_a ?? ''}-${r.column_a ?? ''}-${i}`} className="border-b border-black/5">
+                    <td className="py-2 px-2 text-zinc-900">{r.dataset_a}</td>
+                    <td className="py-2 px-2 text-black/70">{r.column_a}</td>
+                    <td className="py-2 px-2 text-zinc-900">{r.dataset_b}</td>
+                    <td className="py-2 px-2 text-black/70">{r.column_b}</td>
+                    <td className="py-2 px-2 text-black/70">{r.cardinality}</td>
+                    <td className="py-2 px-2 text-right text-black/70">{(r.overlap_count ?? 0).toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Global issues */}
+      <div className="border border-black/10 rounded-lg p-6 bg-white/90">
+        <div className="flex items-center gap-3 mb-4">
+          <FaExclamationTriangle className="text-amber-500" />
+          <h3 className="text-xl font-bold text-zinc-900">Global issues</h3>
+        </div>
+        {!globalIssues ? (
+          <div className="text-sm text-black/60">No global issues returned.</div>
+        ) : (
+          <pre className="text-xs text-zinc-900 whitespace-pre-wrap font-mono bg-black/5 border border-black/10 rounded-lg p-4 overflow-auto max-h-80">
+            {JSON.stringify(globalIssues, null, 2)}
+          </pre>
+        )}
+      </div>
+
+      {/* Backend report previews (optional) */}
+      {(reportMarkdown || reportHtml) && (
+        <div className="border border-black/10 rounded-lg p-6 bg-white/90 space-y-3">
+          <h3 className="text-xl font-bold text-zinc-900">Generated report artifacts</h3>
+          {reportMarkdown && (
+            <details className="bg-white/80 border border-black/10 rounded-lg p-4">
+              <summary className="cursor-pointer font-semibold text-zinc-900">Markdown (preview)</summary>
+              <pre className="mt-3 text-xs text-zinc-900 whitespace-pre-wrap font-mono">{reportMarkdown}</pre>
+            </details>
+          )}
+          {reportHtml && (
+            <details className="bg-white/80 border border-black/10 rounded-lg p-4">
+              <summary className="cursor-pointer font-semibold text-zinc-900">HTML (preview)</summary>
+              <pre className="mt-3 text-xs text-zinc-900 whitespace-pre-wrap font-mono">{reportHtml.slice(0, 4000)}{reportHtml.length > 4000 ? '\n…(truncated preview)…' : ''}</pre>
+            </details>
+          )}
+        </div>
+      )}
     </div>
   );
 }

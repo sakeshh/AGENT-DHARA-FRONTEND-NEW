@@ -160,6 +160,87 @@ def _render_report_markdown(result: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _render_report_html(result: Dict[str, Any]) -> Optional[str]:
+    """
+    Render a formal report as HTML when the report builder is available.
+    """
+    try:
+        import main as _main  # type: ignore
+
+        if hasattr(_main, "build_html_report"):
+            return _main.build_html_report(result)  # type: ignore
+    except Exception:
+        return None
+    return None
+
+
+def _override_source_root_for_datasets(result: Dict[str, Any], dataset_names: List[str], source_root: str) -> None:
+    """
+    The core engine tags any `additional_data` datasets as azure_blob:* by default.
+    In some chat flows we pass DataFrames that originate from SQL or local filesystem, so we
+    override `datasets[ds].source_root` here to reflect the real source used.
+    """
+    if not isinstance(result, dict):
+        return
+    ds = result.get("datasets")
+    if not isinstance(ds, dict):
+        return
+    for name in dataset_names or []:
+        meta = ds.get(name)
+        if isinstance(meta, dict):
+            meta["source_root"] = source_root
+
+
+def _theme_wrap_html(*, title: str, body_html: str) -> str:
+    """
+    Wrap arbitrary HTML content in the same Theme 2 CSS as the main report.
+    """
+    import html as html_module
+    from agent.report_html_themes import get_report_html_css
+
+    css = get_report_html_css()
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+        "<meta charset=\"utf-8\"/>\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\n"
+        f"<title>{html_module.escape(str(title) if title else 'Details')}</title>\n"
+        "<style>\n"
+        + css
+        + "\n</style>\n"
+        "</head>\n<body>\n"
+        + '<div class="wrap">'
+        + f'<header class="masthead"><div class="tagline">AGENT DHARA</div><h1>{html_module.escape(str(title))}</h1></header>'
+        + '<section id="details" class="datasets-section">'
+        + body_html
+        + "</section></div></body></html>"
+    )
+
+
+def _html_table(headers: List[str], rows: List[List[Any]]) -> str:
+    import html as html_module
+
+    thead = "".join(f"<th>{html_module.escape(str(h))}</th>" for h in headers)
+    if not rows:
+        return (
+            "<div class='table-wrap'><table class='data-table'><thead><tr>"
+            + thead
+            + "</tr></thead><tbody><tr><td colspan='"
+            + str(len(headers) or 1)
+            + "' class='muted'>(none)</td></tr></tbody></table></div>"
+        )
+    body = []
+    for r in rows:
+        tds = "".join(f"<td>{html_module.escape('' if v is None else str(v))}</td>" for v in r)
+        body.append("<tr>" + tds + "</tr>")
+    return (
+        "<div class='table-wrap'><table class='data-table'><thead><tr>"
+        + thead
+        + "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>"
+    )
+
+
 def _md_escape(text: Any) -> str:
     s = "" if text is None else str(text)
     return s.replace("|", "\\|").replace("\n", " ").strip()
@@ -177,17 +258,31 @@ def _build_report_tables_markdown(result: Dict[str, Any]) -> str:
     rels = result.get("relationships") or []
 
     parts: List[str] = []
-    parts.append("## Tabular Report")
+    ds_names = list(datasets.keys()) if isinstance(datasets, dict) else []
+    if len(ds_names) == 1:
+        parts.append(f"## Assessment Report of `{_md_escape(ds_names[0])}`")
+    else:
+        parts.append("## Assessment Report")
 
     # Dataset summary table
     rows = []
     if isinstance(datasets, dict):
         for name, meta in datasets.items():
             meta = meta or {}
-            shape = meta.get("shape") or {}
-            nrows = shape.get("rows")
-            ncols = shape.get("columns")
-            src = meta.get("source_root") or ""
+            nrows = meta.get("row_count")
+            ncols = meta.get("column_count")
+            src_root = meta.get("source_root") or ""
+            if isinstance(src_root, str) and src_root.startswith("__database__"):
+                # "__database__" or "__database__:label"
+                label = src_root.split(":", 1)[1] if ":" in src_root else ""
+                src = f"Azure SQL{f' ({label})' if label else ''}"
+            elif isinstance(src_root, str) and src_root.startswith("azure_blob:"):
+                prefix = src_root.split(":", 1)[1]
+                src = f"Azure Blob{f' ({prefix})' if prefix else ''}"
+            elif src_root:
+                src = f"Filesystem ({src_root})"
+            else:
+                src = ""
             summ = (dq.get(name) or {}).get("summary") or {}
             issues = summ.get("issue_count")
             high = summ.get("high_severity")
@@ -256,66 +351,64 @@ def _build_report_tables_markdown(result: Dict[str, Any]) -> str:
             # No "…(+N more)" – show all rows.
             parts.append(f"#### `{_md_escape(name)}`\n\n" + "\n".join(lines))
 
-    # Relationships table
+    # Relationships table (engine emits dataset_a/column_a + dataset_b/column_b)
     rel_rows = []
     if isinstance(rels, list) and rels:
         for r in rels:
             rel_rows.append(
-                f"| `{_md_escape(r.get('left_dataset'))}` | `{_md_escape(r.get('right_dataset'))}` | `{_md_escape(r.get('on'))}` | `{_md_escape(r.get('type'))}` | {_md_escape(r.get('confidence'))} |"
+                f"| `{_md_escape(r.get('dataset_a'))}` | `{_md_escape(r.get('column_a'))}` | `{_md_escape(r.get('dataset_b'))}` | `{_md_escape(r.get('column_b'))}` | `{_md_escape(r.get('cardinality'))}` | {_md_escape(r.get('overlap_count'))} |"
             )
     parts.append(
         "### Relationships\n\n"
-        "| Left | Right | On | Type | Confidence |\n"
-        "|---|---|---|---|---:|\n"
-        + ("\n".join(rel_rows) if rel_rows else "| _none_ | _none_ |  |  |  |")
+        "| Dataset A | Column A | Dataset B | Column B | Cardinality | Shared keys |\n"
+        "|---|---|---|---|---|---:|\n"
+        + ("\n".join(rel_rows) if rel_rows else "| _none_ |  | _none_ |  |  |  |")
     )
 
     # Global issues + relationship warnings in tables
-    global_issues = ((result.get("data_quality_issues") or {}).get("global_issues") or {}) if isinstance(result.get("data_quality_issues"), dict) else {}
+    global_issues = (
+        ((result.get("data_quality_issues") or {}).get("global_issues") or {})
+        if isinstance(result.get("data_quality_issues"), dict)
+        else {}
+    )
     if isinstance(global_issues, dict) and global_issues:
         parts.append("### Global issues\n")
-        # Relationship row issues (orphans) table if present
-        row_issues = global_issues.get("relationship_row_issues")
-        if isinstance(row_issues, dict) and row_issues:
+        # Relationship row issues (orphans) - engine uses a list of dicts
+        row_issues = global_issues.get("relationship_row_issues") or []
+        if isinstance(row_issues, list) and row_issues:
             gi_rows = []
-            for k, v in row_issues.items():
-                try:
-                    n = len(v) if isinstance(v, list) else (int(v) if isinstance(v, int) else "")
-                except Exception:
-                    n = ""
-                gi_rows.append(f"| `{_md_escape(k)}` | {n} |")
+            for it in row_issues:
+                gi_rows.append(
+                    "| "
+                    + f"`{_md_escape(it.get('dataset'))}` | `{_md_escape(it.get('column'))}` | "
+                    + f"`{_md_escape(it.get('related_dataset'))}` | `{_md_escape(it.get('related_column'))}` | "
+                    + f"{_md_escape(it.get('count'))} |"
+                )
             parts.append(
                 "#### Cross-table row issues (orphan keys)\n\n"
-                "| Relationship | Count |\n"
-                "|---|---:|\n"
-                + ("\n".join(gi_rows) if gi_rows else "| _none_ | 0 |")
+                "| Child dataset | FK column | Parent dataset | Parent column | Rows affected |\n"
+                "|---|---|---|---|---:|\n"
+                + ("\n".join(gi_rows) if gi_rows else "| _none_ |  |  |  |  |")
             )
         else:
-            parts.append(
-                "#### Cross-table row issues (orphan keys)\n\n"
-                "| Item | Value |\n"
-                "|---|---|\n"
-                "| Orphans | _none_ |"
-            )
+            parts.append("#### Cross-table row issues (orphan keys)\n\n- (none)")
 
         warnings = global_issues.get("relationship_warnings")
         if isinstance(warnings, list) and warnings:
             w_rows = []
             for w in warnings:
-                w_rows.append(f"| {_md_escape(w)} |")
+                if isinstance(w, dict):
+                    w_rows.append(f"| {_md_escape(w.get('severity'))} | {_md_escape(w.get('message'))} |")
+                else:
+                    w_rows.append(f"|  | {_md_escape(w)} |")
             parts.append(
                 "#### Relationship warnings\n\n"
-                "| Warning |\n"
-                "|---|\n"
+                "| Severity | Warning |\n"
+                "|---|---|\n"
                 + "\n".join(w_rows)
             )
         else:
-            parts.append(
-                "#### Relationship warnings\n\n"
-                "| Warning |\n"
-                "|---|\n"
-                "| _none_ |"
-            )
+            parts.append("#### Relationship warnings\n\n- (none)")
 
     return "\n\n".join([p for p in parts if p.strip()])
 
@@ -333,7 +426,7 @@ def _write_report_artifacts(
     The CLI (`main.py --reports-dir`) writes `output/reports/report.*`, but the chat API historically
     returned reports without writing files. Users expect the output folder to update on each run.
 
-    This function overwrites `report.json/.md/.html` and also writes timestamped copies.
+    This function overwrites `report.json/.md/.html`.
     """
     import os
     from datetime import datetime, timezone
@@ -346,7 +439,6 @@ def _write_report_artifacts(
     reports_dir = os.path.abspath(base_dir) if base_dir else default_dir
     os.makedirs(reports_dir, exist_ok=True)
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     meta = result.setdefault("run_metadata", {}) if isinstance(result.get("run_metadata"), dict) or result.get("run_metadata") is None else {}
     if isinstance(meta, dict):
         meta["generated_at"] = datetime.now(timezone.utc).isoformat()
@@ -354,34 +446,21 @@ def _write_report_artifacts(
         # This directory is internal project storage and should not be shown in the UI.
 
     json_bytes = json.dumps(result, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-    paths = {
-        "json": os.path.join(reports_dir, "report.json"),
-        "json_ts": os.path.join(reports_dir, f"report_{ts}.json"),
-    }
+    paths = {"json": os.path.join(reports_dir, "report.json")}
     with open(paths["json"], "wb") as f:
-        f.write(json_bytes)
-    with open(paths["json_ts"], "wb") as f:
         f.write(json_bytes)
 
     if report_markdown:
         md_path = os.path.join(reports_dir, "report.md")
-        md_ts_path = os.path.join(reports_dir, f"report_{ts}.md")
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(report_markdown)
-        with open(md_ts_path, "w", encoding="utf-8") as f:
-            f.write(report_markdown)
         paths["md"] = md_path
-        paths["md_ts"] = md_ts_path
 
     if report_html:
         html_path = os.path.join(reports_dir, "report.html")
-        html_ts_path = os.path.join(reports_dir, f"report_{ts}.html")
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(report_html)
-        with open(html_ts_path, "w", encoding="utf-8") as f:
-            f.write(report_html)
         paths["html"] = html_path
-        paths["html_ts"] = html_ts_path
 
     return {"reports_dir": reports_dir, "paths": paths}
 
@@ -787,6 +866,57 @@ def _node_route(state: ChatState) -> ChatState:
         return {"action": ("preview_selected_file" if has_selected_files else "preview_table"), "action_args": {"n": 10}}
     if raw in ("generate report", "report", "generate a report"):
         return {"action": ("generate_report_selected_files" if has_selected_files else "generate_report_selected"), "action_args": {}}
+
+    # Deterministic selection commands (avoid LLM dropping indices).
+    # Supports:
+    # - "select tables all" / "select all tables"
+    # - "select tables 1,2,3" / "select files 1 2 3" / "select local files 1;2;3"
+    if raw.startswith("select "):
+        import re as _re
+
+        def _parse_int_list(s: str) -> List[int]:
+            out: List[int] = []
+            for tok in _re.split(r"[,\s;]+", (s or "").strip()):
+                if not tok:
+                    continue
+                try:
+                    out.append(int(tok))
+                except Exception:
+                    continue
+            return out
+
+        # access cached lists for "all"
+        sess = state.get("session") or {}
+        ctx = sess.get("context", {}) if isinstance(sess, dict) else {}
+        last_tables = (ctx or {}).get("last_table_list") or []
+        last_blobs = (ctx or {}).get("last_blob_list") or []
+        last_locals = (ctx or {}).get("last_local_file_list") or []
+
+        if raw in ("select all tables", "select tables all", "select all table", "select table all"):
+            if last_tables:
+                return {"action": "select_tables", "action_args": {"all": True}}
+        if raw in ("select all files", "select files all"):
+            if last_blobs:
+                return {"action": "select_blob_files", "action_args": {"all": True}}
+        if raw in ("select all local files", "select local files all"):
+            if last_locals:
+                return {"action": "select_local_files", "action_args": {"all": True}}
+
+        m = _re.match(r"^select\s+tables?\s+(.+)$", raw)
+        if m:
+            idxs = _parse_int_list(m.group(1))
+            if idxs:
+                return {"action": "select_tables", "action_args": {"indices": idxs}}
+        m = _re.match(r"^select\s+files?\s+(.+)$", raw)
+        if m:
+            idxs = _parse_int_list(m.group(1))
+            if idxs:
+                return {"action": "select_blob_files", "action_args": {"indices": idxs}}
+        m = _re.match(r"^select\s+local\s+files?\s+(.+)$", raw)
+        if m:
+            idxs = _parse_int_list(m.group(1))
+            if idxs:
+                return {"action": "select_local_files", "action_args": {"indices": idxs}}
 
     # DQ shortcuts: allow follow-up questions after a report without forcing "select table".
     if ("null" in raw or "missing" in raw) and ("column" in raw or "columns" in raw or "fields" in raw):
@@ -1334,6 +1464,18 @@ def _node_preview_selected_file(state: ChatState) -> ChatState:
 
     rows_text = json.dumps(page, ensure_ascii=False, indent=2)
     head_label = "📊 Next 10 rows" if offset > 0 else "📊 View top 10 rows"
+    # Themed HTML preview
+    cols = []
+    if page and isinstance(page[0], dict):
+        cols = list(page[0].keys())
+    html_rows = []
+    for r in page[:50]:
+        if isinstance(r, dict) and cols:
+            html_rows.append([r.get(c) for c in cols])
+        else:
+            html_rows.append([json.dumps(r, ensure_ascii=False)])
+    body_html = _html_table(cols if cols else ["row"], html_rows)
+    ui_html = _theme_wrap_html(title=f"Preview — {fname}", body_html=body_html)
     return {
         "reply": f"Preview of `{fname}` (rows {offset + 1}–{offset + len(page)}):\n\n{rows_text}",
         "payload": {
@@ -1341,6 +1483,7 @@ def _node_preview_selected_file(state: ChatState) -> ChatState:
             "file": fname,
             "rows": page,
             "count": len(page),
+            "ui_html": ui_html,
             "options": _flow_options(
                 {"id": "head", "text": head_label, "send": "view top 10 rows"},
                 {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
@@ -1384,11 +1527,22 @@ def _node_show_file_schema(state: ChatState) -> ChatState:
     if len(names) > 10:
         blocks.append(f"_…(+{len(names) - 10} more files)_")
 
+    # Themed HTML schema
+    html_parts: List[str] = []
+    for fname in names[:10]:
+        cols = schemas.get(fname) or []
+        trows = [[i + 1, c] for i, c in enumerate(cols[:200])]
+        html_parts.append(f"<h2>{fname}</h2>" + _html_table(["#", "Column"], trows))
+        if isinstance(cols, list) and len(cols) > 200:
+            html_parts.append(f"<p class='muted'>…(+{len(cols)-200} more columns)</p>")
+    ui_html = _theme_wrap_html(title="Schema", body_html="".join(html_parts) if html_parts else "<p class='muted'>(none)</p>")
+
     return {
         "reply": "\n\n".join(blocks),
         "payload": {
             "step": "view_query",
             "schemas": schemas,
+            "ui_html": ui_html,
             "options": _flow_options(
                 {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
                 {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
@@ -1433,6 +1587,13 @@ def _node_show_file_metadata(state: ChatState) -> ChatState:
         "payload": {
             "step": "view_query",
             "metadata": meta,
+            "ui_html": _theme_wrap_html(
+                title="Metadata",
+                body_html=_html_table(
+                    ["File", "Rows", "Columns"],
+                    [[k, v.get("rows"), v.get("columns")] for k, v in (meta or {}).items()],
+                ),
+            ),
             "options": _flow_options(
                 {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
                 {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
@@ -1520,17 +1681,19 @@ def _node_assess_selected_local_files(state: ChatState) -> ChatState:
                 df = pd.read_json(p)
         dfs[name] = df
     result = load_and_profile({"name": "local", "locations": []}, additional_data=dfs)
+    _override_source_root_for_datasets(result, list(dfs.keys()), os.path.abspath(root))
     sampled = f" (sampled up to {max_rows} rows/file where applicable)" if max_rows > 0 else ""
     # Only return the tabular report in chat (no legacy/freeform report text).
     report_md = _build_report_tables_markdown(result)
+    report_html = _render_report_html(result)
     reply = report_md or f"Assessment complete for {len(dfs)} local file(s){sampled}."
-    artifacts = _write_report_artifacts(result=result, report_markdown=report_md)
+    artifacts = _write_report_artifacts(result=result, report_markdown=report_md, report_html=report_html)
     # Cache for follow-up DQ questions
     ctx["last_assessment_result"] = result
     ctx["last_assessment_datasets"] = list((result.get("datasets") or {}).keys()) if isinstance(result, dict) else []
     return {
         "reply": reply,
-        "payload": {"selected_local_files": selected, "result": result, "report_markdown": report_md, "report_files": artifacts},
+        "payload": {"selected_local_files": selected, "result": result, "report_markdown": report_md, "report_html": report_html, "report_files": artifacts},
     }
 
 
@@ -1570,6 +1733,7 @@ def _node_assess_selected_files(state: ChatState) -> ChatState:
     result = run_assessment(cfg_text, additional_data=dfs)
     # Only return the tabular report in chat (no legacy/freeform report text).
     report_md = _build_report_tables_markdown(result)
+    report_html = _render_report_html(result)
     if report_md:
         reply = report_md
     else:
@@ -1584,11 +1748,11 @@ def _node_assess_selected_files(state: ChatState) -> ChatState:
             med += int(s.get("medium_severity") or 0)
             low += int(s.get("low_severity") or 0)
         reply = f"Assessment complete for {len(dfs)} file(s). Issues={issue_count} (high={high}, medium={med}, low={low})."
-    artifacts = _write_report_artifacts(result=result, report_markdown=report_md)
+    artifacts = _write_report_artifacts(result=result, report_markdown=report_md, report_html=report_html)
     # Cache for follow-up DQ questions
     ctx["last_assessment_result"] = result
     ctx["last_assessment_datasets"] = list((result.get("datasets") or {}).keys()) if isinstance(result, dict) else []
-    return {"reply": reply, "payload": {"selected_files": selected, "result": result, "report_markdown": report_md, "report_files": artifacts}}
+    return {"reply": reply, "payload": {"selected_files": selected, "result": result, "report_markdown": report_md, "report_html": report_html, "report_files": artifacts}}
 
 
 def _parse_view_mode(user_text: str) -> str:
@@ -1800,20 +1964,52 @@ def _node_select_tables(state: ChatState) -> ChatState:
     if not available:
         return {"reply": "No table list cached. Run 'list tables' first.", "payload": {}}
     args = state.get("action_args") or {}
+
+    def _parse_indices_arg(v: Any) -> List[int]:
+        if v is None:
+            return []
+        if isinstance(v, (int, float)):
+            try:
+                return [int(v)]
+            except Exception:
+                return []
+        if isinstance(v, str):
+            # Accept "1,2,3" / "1 2 3" / "1;2;3"
+            import re as _re
+
+            out: List[int] = []
+            for tok in _re.split(r"[,\s;]+", v.strip()):
+                if not tok:
+                    continue
+                try:
+                    out.append(int(tok))
+                except Exception:
+                    continue
+            return out
+        if isinstance(v, list):
+            out = []
+            for item in v:
+                out.extend(_parse_indices_arg(item))
+            return out
+        return []
+
     if args.get("all") is True:
         selected = list(available)
     else:
         names = args.get("names")
-        indices = args.get("indices")
+        indices_raw = args.get("indices")
+        indices = _parse_indices_arg(indices_raw)
         selected = []
         if isinstance(names, list):
             selected = [str(n) for n in names if str(n) in available]
-        elif isinstance(indices, list):
+        elif isinstance(names, str) and names.strip():
+            # Accept a single exact table name string
+            s = names.strip()
+            if s in available:
+                selected = [s]
+        elif indices:
             for i in indices:
-                try:
-                    j = int(i) - 1
-                except Exception:
-                    continue
+                j = i - 1
                 if 0 <= j < len(available):
                     selected.append(str(available[j]))
         if not selected:
@@ -1886,15 +2082,23 @@ def _node_assess_selected_tables(state: ChatState) -> ChatState:
     rows = (max_rows if max_rows > 0 else 10_000)
     dfs = {t: conn.preview_table(t, rows) for t in selected}
     result = load_and_profile({"name": source_root.get("name") or "source", "locations": []}, additional_data=dfs)
+    # Ensure source_root reflects Azure SQL (not azure_blob from `additional_data` default).
+    label = (
+        (db_locs[db_idx].get("id") or db_locs[db_idx].get("label") or db_locs[db_idx].get("name") or "").strip()
+        or (conn_cfg.get("database") or "").strip()
+        or "__default__"
+    )
+    _override_source_root_for_datasets(result, list(dfs.keys()), f"__database__:{label}")
     sampled = f" (sampled up to {rows} rows/table)" if max_rows > 0 else " (sampled up to 10,000 rows/table)"
     # Only return the tabular report in chat (no legacy/freeform report text).
     report_md = _build_report_tables_markdown(result)
+    report_html = _render_report_html(result)
     reply = report_md or f"Assessment complete for {len(dfs)} table(s){sampled}."
-    artifacts = _write_report_artifacts(result=result, report_markdown=report_md)
+    artifacts = _write_report_artifacts(result=result, report_markdown=report_md, report_html=report_html)
     # Cache for follow-up DQ questions
     ctx["last_assessment_result"] = result
     ctx["last_assessment_datasets"] = list((result.get("datasets") or {}).keys()) if isinstance(result, dict) else []
-    return {"reply": reply, "payload": {"selected_tables": selected, "result": result, "report_markdown": report_md, "report_files": artifacts}}
+    return {"reply": reply, "payload": {"selected_tables": selected, "result": result, "report_markdown": report_md, "report_html": report_html, "report_files": artifacts}}
 
 
 def _node_generate_report_selected(state: ChatState) -> ChatState:
@@ -2003,11 +2207,24 @@ def _node_show_schema(state: ChatState) -> ChatState:
         )
     if len(tables) > 10:
         blocks.append(f"_…(+{len(tables) - 10} more tables)_")
+
+    # Themed HTML schema
+    html_parts: List[str] = []
+    for t in tables[:10]:
+        cols = schema_map.get(str(t)) or []
+        trows = []
+        for i, c in enumerate((cols or [])[:200]):
+            trows.append([i + 1, c.get("name"), c.get("type"), c.get("nullable")])
+        html_parts.append(f"<h2>{str(t)}</h2>" + _html_table(["#", "Column", "Type", "Nullable"], trows))
+        if isinstance(cols, list) and len(cols) > 200:
+            html_parts.append(f"<p class='muted'>…(+{len(cols)-200} more columns)</p>")
+    ui_html = _theme_wrap_html(title="Schema", body_html="".join(html_parts) if html_parts else "<p class='muted'>(none)</p>")
     return {
         "reply": "\n\n".join(blocks),
         "payload": {
             "step": "view_query",
             "schemas": schema_map,
+            "ui_html": ui_html,
             "options": _flow_options(
                 {"id": "head", "text": "📊 Next 10 rows", "send": "preview table"},
                 {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
@@ -2099,6 +2316,15 @@ ORDER BY __rn
     ctx["table_preview_offset"] = next_offset
     # After the first page, switch the button label to "Next 10 rows".
     head_label = "📊 Next 10 rows" if next_offset > 0 else "📊 View top 10 rows"
+    # Themed HTML preview
+    trows = []
+    for r in rows[:50]:
+        if isinstance(r, dict):
+            trows.append([r.get(c) for c in cols])
+        else:
+            trows.append([json.dumps(r, ensure_ascii=False)])
+    body_html = _html_table(cols if cols else ["row"], trows)
+    ui_html = _theme_wrap_html(title=f"Preview — {table}", body_html=body_html)
     return {
         "reply": f"Preview of {table} (rows {offset + 1}–{offset + len(rows)}). Columns: {', '.join(cols[:30])}\n\n{rows_text}",
         "payload": {
@@ -2108,6 +2334,7 @@ ORDER BY __rn
             "rows": rows,
             "count": len(rows),
             "preview_offset": next_offset,
+            "ui_html": ui_html,
             "options": _flow_options(
                 {"id": "head", "text": head_label, "send": "preview table"},
                 {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
@@ -2204,6 +2431,16 @@ WHERE object_id = OBJECT_ID(@full_name)
         "payload": {
             "tables": tables,
             "metadata": meta,
+            "ui_html": _theme_wrap_html(
+                title="Metadata",
+                body_html=_html_table(
+                    ["Table", "Rows (approx)", "Columns", "Nullable cols"],
+                    [
+                        [k, v.get("row_count"), v.get("column_count"), v.get("nullable_columns")]
+                        for k, v in (meta or {}).items()
+                    ],
+                ),
+            ),
             "options": _flow_options(
                 {"id": "head", "text": "📊 Next 10 rows", "send": "preview table"},
                 {"id": "schema", "text": "📊 Show schema", "send": "show schema"},

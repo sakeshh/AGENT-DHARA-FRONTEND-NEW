@@ -203,13 +203,24 @@ export default function ChatWindow() {
     if (typeof window === 'undefined') return;
     const handler = async () => {
       const sid = getEffectiveSessionId();
+      // Hard reset UI state on session change (e.g. "New chat")
+      setMessages([]);
+      setAgentError(null);
+      setShowOptions(false);
+      setGuidedMode('none');
+      setPendingTableSelections({});
+      setPendingFileSelections({});
+      setLocalFolderFiles([]);
+      setHasSelectedDataSource(false);
+      setSelectedDataSource(getPersistedSelectedSource());
+      setAgentThreadId(window.localStorage.getItem('agentThreadId'));
       setSessionId(sid);
       try {
         const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}`);
         const data = await res.json();
         const session = data?.session;
         const msgs = Array.isArray(session?.messages) ? session.messages : [];
-        if (!msgs.length) return;
+        if (!msgs.length) return; // greeting effect will seed the first bot message
         setMessages(
           msgs
             .filter((m: any) => m?.content && (m?.role === 'user' || m?.role === 'assistant'))
@@ -428,6 +439,34 @@ export default function ChatWindow() {
       !!payload?.metadata ||
       (typeof text === 'string' && text.toLowerCase().includes('metadata —')) ||
       (typeof text === 'string' && text.toLowerCase().includes('metadata (selected'));
+
+    const uiHtml = typeof payload?.ui_html === 'string' ? payload.ui_html : null;
+    if (uiHtml && uiHtml.trim()) {
+      return (
+        <div className="h-[78vh] w-full overflow-hidden rounded-xl border border-black/10 bg-white shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
+          <iframe
+            title="Details"
+            className="h-full w-full"
+            srcDoc={uiHtml}
+            sandbox="allow-scripts allow-same-origin"
+          />
+        </div>
+      );
+    }
+
+    const reportHtml = typeof payload?.report_html === 'string' ? payload.report_html : null;
+    if (reportHtml && reportHtml.trim()) {
+      return (
+        <div className="h-[78vh] w-full overflow-hidden rounded-xl border border-black/10 bg-white shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
+          <iframe
+            title="Assessment report"
+            className="h-full w-full"
+            srcDoc={reportHtml}
+            sandbox="allow-scripts allow-same-origin"
+          />
+        </div>
+      );
+    }
 
     const reportMd = typeof payload?.report_markdown === 'string' ? payload.report_markdown : null;
     if (reportMd && reportMd.trim()) {
@@ -894,6 +933,8 @@ export default function ChatWindow() {
         <AnimatePresence initial={false}>
           {messages.map((message, idx) => {
             const isUser = message.sender === 'user';
+            const isHtmlReportMessage =
+              message.sender === 'bot' && typeof (message as any)?.payload?.report_html === 'string';
             const staggerDelay = Math.min(idx * 0.04, 0.2);
             const opts = Array.isArray(message.options) ? message.options : [];
             const hasOptions = message.sender === 'bot' && opts.length > 0;
@@ -934,7 +975,7 @@ export default function ChatWindow() {
               transition={{ duration: 0.4, ease: [0.25, 0.46, 0.45, 0.94], delay: staggerDelay }}
               className={`group flex ${isUser ? 'justify-end' : 'justify-start'}`}
             >
-              <div className="max-w-[78%]">
+              <div className={isHtmlReportMessage ? 'w-full max-w-full' : 'max-w-[78%]'}>
                 <motion.div
                   initial={{ scale: 0.92, opacity: 0 }}
                   animate={{ scale: 1, opacity: 1 }}
@@ -942,7 +983,9 @@ export default function ChatWindow() {
                   className={`rounded-lg border px-4 py-3 ${
                     message.sender === 'user'
                       ? 'border-[#0070AD]/40 bg-gradient-to-r from-[#0070AD] to-[#12ABDB] text-white shadow-[0_10px_30px_rgba(0,112,173,0.18)]'
-                      : 'border-[#0070AD]/25 bg-gradient-to-r from-[#0070AD]/10 to-[#12ABDB]/10 text-zinc-900'
+                      : isHtmlReportMessage
+                        ? 'border-[#0070AD]/25 bg-transparent text-zinc-900 p-0'
+                        : 'border-[#0070AD]/25 bg-gradient-to-r from-[#0070AD]/10 to-[#12ABDB]/10 text-zinc-900'
                   }`}
                 >
                   {editingId === message.id ? (

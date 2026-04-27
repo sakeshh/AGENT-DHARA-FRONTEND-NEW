@@ -125,7 +125,9 @@ export default function Sidebar() {
                 const id = (crypto?.randomUUID ? crypto.randomUUID() : String(Date.now()));
                 window.localStorage.setItem('dharaSessionId', id);
                 window.localStorage.removeItem('agentThreadId');
+                window.localStorage.removeItem('dharaSelectedDataSource');
                 window.dispatchEvent(new Event('dhara-session-change'));
+                router.push('/chat');
               }}
               className="flex w-full items-center gap-3 rounded-xl border border-black/10 bg-white/85 px-4 py-3 text-left text-sm font-semibold text-zinc-900 transition-colors hover:bg-white"
               title="New chat"
