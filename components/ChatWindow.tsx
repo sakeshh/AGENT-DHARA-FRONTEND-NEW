@@ -109,6 +109,10 @@ export default function ChatWindow() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const localFolderInputRef = useRef<HTMLInputElement | null>(null);
 
+  const showDebugPanels =
+    typeof window !== 'undefined' &&
+    (window.location.search.includes('debug=1') || window.location.hash.includes('debug=1'));
+
   const getPersistedSelectedSource = (): string | null => {
     if (typeof window === 'undefined') return null;
     const v = window.localStorage.getItem('dharaSelectedDataSource');
@@ -346,6 +350,7 @@ export default function ChatWindow() {
   };
 
   const JsonTable = ({ value }: { value: any }) => {
+    const [showAll, setShowAll] = useState(false);
     const arr = Array.isArray(value) ? value : null;
     if (!arr || arr.length === 0) {
       return (
@@ -363,7 +368,6 @@ export default function ChatWindow() {
       );
     }
     const cols = Array.from(new Set(arr.flatMap((r: any) => Object.keys(r || {}))));
-    const [showAll, setShowAll] = useState(false);
     const rows = showAll ? arr : arr.slice(0, 25);
     const more = arr.length > rows.length ? arr.length - rows.length : 0;
     return (
@@ -430,9 +434,85 @@ export default function ChatWindow() {
   };
 
   const renderBotContent = (text: string, payload?: any) => {
+    const renderStructuredReportFromResult = (result: any) => {
+      if (!result || typeof result !== 'object') return null;
+      const datasets = result?.datasets && typeof result.datasets === 'object' ? result.datasets : {};
+      const dqDatasets =
+        result?.data_quality_issues?.datasets && typeof result.data_quality_issues.datasets === 'object'
+          ? result.data_quality_issues.datasets
+          : {};
+      const rels = Array.isArray(result?.relationships) ? result.relationships : [];
+
+      const datasetRows = Object.entries(datasets || {}).map(([name, meta]: any) => {
+        const summ = dqDatasets?.[name]?.summary || {};
+        return {
+          dataset: name,
+          rows: meta?.row_count ?? '',
+          cols: meta?.column_count ?? '',
+          issues: summ?.issue_count ?? 0,
+          high: summ?.high_severity ?? 0,
+          medium: summ?.medium_severity ?? 0,
+          low: summ?.low_severity ?? 0,
+          source: meta?.source_root ?? '',
+        };
+      });
+
+      const issuesRows: any[] = [];
+      for (const [dsName, block] of Object.entries(dqDatasets || {})) {
+        const issues = Array.isArray((block as any)?.issues) ? (block as any).issues : [];
+        for (const it of issues) {
+          issuesRows.push({
+            dataset: dsName,
+            severity: it?.severity ?? '',
+            type: it?.type ?? '',
+            column: it?.column ?? '',
+            count: it?.count ?? '-',
+            message: it?.message ?? '',
+            recommendation: it?.recommendation ?? '',
+          });
+        }
+      }
+
+      const relRows = rels.map((r: any) => ({
+        dataset_a: r?.dataset_a ?? r?.from ?? '',
+        column_a: r?.column_a ?? '',
+        dataset_b: r?.dataset_b ?? r?.to ?? '',
+        column_b: r?.column_b ?? '',
+        cardinality: r?.cardinality ?? '',
+        overlap_count: r?.overlap_count ?? '',
+      }));
+
+      return (
+        <div className="space-y-4">
+          <div>
+            <div className="mb-1 text-[12px] font-semibold text-black/70">Datasets (from backend `result`)</div>
+            <JsonTable value={datasetRows} />
+          </div>
+          {issuesRows.length > 0 ? (
+            <div>
+              <div className="mb-1 text-[12px] font-semibold text-black/70">Data quality issues (from backend `result`)</div>
+              <JsonTable value={issuesRows} />
+            </div>
+          ) : null}
+          {relRows.length > 0 ? (
+            <div>
+              <div className="mb-1 text-[12px] font-semibold text-black/70">Relationships (from backend `result`)</div>
+              <JsonTable value={relRows} />
+            </div>
+          ) : null}
+        </div>
+      );
+    };
+
     // Prefer structured payload rendering when available (more reliable than parsing strings).
     if (Array.isArray(payload?.rows) && payload.rows.length > 0) {
       return <JsonTable value={payload.rows} />;
+    }
+
+    // For reports, render directly from backend `payload.result` so values match exactly.
+    // (Markdown is still available as a fallback.)
+    if (payload?.result && typeof payload.result === 'object' && (payload?.step === 'report' || payload?.report_markdown)) {
+      return renderStructuredReportFromResult(payload.result);
     }
 
     const isMetadataView =
@@ -607,6 +687,76 @@ export default function ChatWindow() {
     );
   };
 
+  const renderValidation = (payload?: any) => {
+    const v = payload?.validation;
+    if (!v || typeof v !== 'object') return null;
+    const title = typeof v.title === 'string' ? v.title : 'Validation';
+    const ok = Boolean(v.ok);
+    const checks = Array.isArray(v.checks) ? v.checks : [];
+    if (checks.length === 0) return null;
+    return (
+      <details className="rounded-xl border border-black/10 bg-white/70 px-3 py-2 text-[12px] text-zinc-900 shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
+        <summary className="cursor-pointer select-none font-semibold">
+          {title}: <span className={ok ? 'text-emerald-700' : 'text-rose-700'}>{ok ? 'OK' : 'Needs review'}</span>
+        </summary>
+        <div className="mt-2 space-y-1">
+          {checks.map((c: any, idx: number) => {
+            const cid = typeof c?.id === 'string' ? c.id : `check_${idx}`;
+            const cok = Boolean(c?.ok);
+            const detail = typeof c?.detail === 'string' ? c.detail : '';
+            return (
+              <div key={cid} className="flex gap-2">
+                <div className={`mt-[2px] h-2.5 w-2.5 rounded-full ${cok ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+                <div className="min-w-0">
+                  <div className="font-mono text-[11px] text-black/60">{cid}</div>
+                  {detail ? <div className="whitespace-pre-wrap break-words leading-relaxed">{detail}</div> : null}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </details>
+    );
+  };
+
+  const renderRawBackendPayload = (payload?: any) => {
+    if (!payload || typeof payload !== 'object') return null;
+    const hasAny =
+      payload?.result !== undefined || payload?.schemas !== undefined || payload?.metadata !== undefined || payload?.rows !== undefined;
+    if (!hasAny) return null;
+    return (
+      <details className="rounded-xl border border-black/10 bg-white/70 px-3 py-2 text-[12px] text-zinc-900 shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
+        <summary className="cursor-pointer select-none font-semibold">Advanced: raw backend payload</summary>
+        <div className="mt-2 space-y-2">
+          {payload?.schemas !== undefined ? (
+            <div>
+              <div className="mb-1 text-[11px] font-semibold text-black/70">payload.schemas</div>
+              <JsonTable value={payload.schemas} />
+            </div>
+          ) : null}
+          {payload?.metadata !== undefined ? (
+            <div>
+              <div className="mb-1 text-[11px] font-semibold text-black/70">payload.metadata</div>
+              <JsonTable value={payload.metadata} />
+            </div>
+          ) : null}
+          {payload?.rows !== undefined ? (
+            <div>
+              <div className="mb-1 text-[11px] font-semibold text-black/70">payload.rows</div>
+              <JsonTable value={payload.rows} />
+            </div>
+          ) : null}
+          {payload?.result !== undefined ? (
+            <div>
+              <div className="mb-1 text-[11px] font-semibold text-black/70">payload.result</div>
+              <JsonTable value={payload.result} />
+            </div>
+          ) : null}
+        </div>
+      </details>
+    );
+  };
+
   const beginEdit = (m: Message) => {
     setEditingId(m.id);
     setEditingText(m.text);
@@ -729,8 +879,8 @@ export default function ChatWindow() {
               };
             });
             const nums = items
-              .map((x) => Number(String(x.send).split(':')[1]))
-              .filter((n) => Number.isFinite(n) && n > 0);
+              .map((x: { send: string }) => Number(String(x.send).split(':')[1]))
+              .filter((n: number) => Number.isFinite(n) && n > 0);
             if (nums.length > 1) {
               items.push({
                 id: 'select-all-tables',
@@ -749,8 +899,8 @@ export default function ChatWindow() {
                 send: `__toggle_file__:${mode}:${i + 1}`,
               }));
               const nums = items
-                .map((x) => Number(String(x.send).split(':')[2]))
-                .filter((n) => Number.isFinite(n) && n > 0);
+                .map((x: { send: string }) => Number(String(x.send).split(':')[2]))
+                .filter((n: number) => Number.isFinite(n) && n > 0);
               if (nums.length > 1) {
                 items.push({
                   id: 'select-all-files',
@@ -1003,7 +1153,11 @@ export default function ChatWindow() {
                   ) : (
                     <div className="space-y-3">
                       {message.sender === 'bot' ? (
-                        <div className="space-y-2">{renderBotContent(message.text, (message as any).payload)}</div>
+                        <div className="space-y-2">
+                          {renderBotContent(message.text, (message as any).payload)}
+                          {showDebugPanels ? renderValidation((message as any).payload) : null}
+                          {showDebugPanels ? renderRawBackendPayload((message as any).payload) : null}
+                        </div>
                       ) : (
                         <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.text}</p>
                       )}

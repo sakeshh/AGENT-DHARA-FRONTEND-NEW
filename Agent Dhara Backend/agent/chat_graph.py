@@ -246,6 +246,117 @@ def _md_escape(text: Any) -> str:
     return s.replace("|", "\\|").replace("\n", " ").strip()
 
 
+def _make_validation(*, title: str, checks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    ok = True
+    for c in checks or []:
+        if not bool(c.get("ok", False)):
+            ok = False
+            break
+    return {"title": title, "ok": ok, "checks": checks}
+
+
+def _validate_schema_markdown(*, reply_md: str, schemas: Dict[str, Any], names: List[str]) -> Dict[str, Any]:
+    checks: List[Dict[str, Any]] = []
+    shown = list(names[:10])
+    checks.append(
+        {
+            "id": "files_in_payload",
+            "ok": set(shown) == set((schemas or {}).keys()),
+            "detail": f"payload.schemas has {len((schemas or {}).keys())} file(s); expected {len(shown)}.",
+        }
+    )
+    for fname in shown:
+        cols = (schemas or {}).get(fname) or []
+        checks.append(
+            {
+                "id": f"schema_block_present::{fname}",
+                "ok": f"### Schema — `{fname}`" in (reply_md or ""),
+                "detail": f"Markdown contains schema section for `{fname}`.",
+            }
+        )
+        if isinstance(cols, list) and len(cols) > 80:
+            checks.append(
+                {
+                    "id": f"schema_truncation_notice::{fname}",
+                    "ok": "_…(+".lower() in (reply_md or "").lower() and f"more columns" in (reply_md or "").lower(),
+                    "detail": f"`{fname}` has {len(cols)} columns; markdown should show a truncation notice after first 80.",
+                }
+            )
+    return _make_validation(title="Schema validation", checks=checks)
+
+
+def _validate_metadata_markdown(*, reply_md: str, meta: Dict[str, Any], names: List[str]) -> Dict[str, Any]:
+    checks: List[Dict[str, Any]] = []
+    shown = list(names[:15])
+    checks.append(
+        {
+            "id": "files_in_payload",
+            "ok": set(shown) == set((meta or {}).keys()),
+            "detail": f"payload.metadata has {len((meta or {}).keys())} file(s); expected {len(shown)}.",
+        }
+    )
+    for fname in shown:
+        checks.append(
+            {
+                "id": f"metadata_row_present::{fname}",
+                "ok": f"| `{fname}` |" in (reply_md or ""),
+                "detail": f"Markdown table contains a row for `{fname}`.",
+            }
+        )
+        m = (meta or {}).get(fname) or {}
+        rows = m.get("rows")
+        cols = m.get("columns")
+        checks.append(
+            {
+                "id": f"metadata_values_present::{fname}",
+                "ok": rows is not None or cols is not None,
+                "detail": f"`{fname}` metadata rows={rows}, columns={cols}.",
+            }
+        )
+    return _make_validation(title="Metadata validation", checks=checks)
+
+
+def _validate_report_payload(*, report_md: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    checks: List[Dict[str, Any]] = []
+    datasets = (result or {}).get("datasets") or {}
+    ds_names = list(datasets.keys()) if isinstance(datasets, dict) else []
+    checks.append(
+        {
+            "id": "dataset_count",
+            "ok": isinstance(datasets, dict),
+            "detail": f"result.datasets count = {len(ds_names) if isinstance(datasets, dict) else 'n/a'}",
+        }
+    )
+    missing = []
+    for n in ds_names[:25]:
+        if f"`{n}`" not in (report_md or ""):
+            missing.append(n)
+    checks.append(
+        {
+            "id": "dataset_names_in_markdown",
+            "ok": len(missing) == 0,
+            "detail": "All dataset names appear in report markdown." if not missing else f"Missing dataset names in markdown: {missing[:8]}",
+        }
+    )
+    dq = (result or {}).get("data_quality_issues") or {}
+    dq_ds = (dq.get("datasets") or {}) if isinstance(dq, dict) else {}
+    # Basic sanity: if there are any DQ issues objects, markdown should include the "Top issues" section header.
+    has_any_issues = False
+    if isinstance(dq_ds, dict):
+        for b in dq_ds.values():
+            if isinstance(b, dict) and (b.get("issues") or []):
+                has_any_issues = True
+                break
+    checks.append(
+        {
+            "id": "dq_section_present",
+            "ok": (not has_any_issues) or ("Top issues" in (report_md or "")),
+            "detail": "DQ issues exist -> report markdown includes issues section header.",
+        }
+    )
+    return _make_validation(title="Report validation", checks=checks)
+
+
 def _build_report_tables_markdown(result: Dict[str, Any]) -> str:
     """
     Build a presentable markdown report using tables wherever possible.
@@ -345,8 +456,17 @@ def _build_report_tables_markdown(result: Dict[str, Any]) -> str:
                 cnt = it.get("count")
                 msg = _md_escape(it.get("message"))
                 rec = _md_escape(it.get("recommendation"))
+                if isinstance(cnt, int):
+                    cnt_txt = str(cnt)
+                elif isinstance(cnt, float):
+                    # Keep readable (some rules may emit ratios)
+                    cnt_txt = str(round(cnt, 4))
+                elif cnt is None:
+                    cnt_txt = "-"
+                else:
+                    cnt_txt = _md_escape(cnt)
                 lines.append(
-                    f"| {sev} | `{typ}` | `{col}` | {cnt if isinstance(cnt, int) else ''} | {_md_escape(msg)} | {_md_escape(rec)} |"
+                    f"| {sev} | `{typ}` | `{col}` | {cnt_txt} | {_md_escape(msg)} | {_md_escape(rec)} |"
                 )
             # No "…(+N more)" – show all rows.
             parts.append(f"#### `{_md_escape(name)}`\n\n" + "\n".join(lines))
@@ -1537,12 +1657,15 @@ def _node_show_file_schema(state: ChatState) -> ChatState:
             html_parts.append(f"<p class='muted'>…(+{len(cols)-200} more columns)</p>")
     ui_html = _theme_wrap_html(title="Schema", body_html="".join(html_parts) if html_parts else "<p class='muted'>(none)</p>")
 
+    reply_md = "\n\n".join(blocks)
+    validation = _validate_schema_markdown(reply_md=reply_md, schemas=schemas, names=names)
     return {
-        "reply": "\n\n".join(blocks),
+        "reply": reply_md,
         "payload": {
             "step": "view_query",
             "schemas": schemas,
             "ui_html": ui_html,
+            "validation": validation,
             "options": _flow_options(
                 {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
                 {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
@@ -1576,14 +1699,16 @@ def _node_show_file_metadata(state: ChatState) -> ChatState:
         c_txt = str(cols) if cols is not None else "unavailable"
         rows_md.append(f"| `{fname}` | {r_txt} | {c_txt} |")
 
-    return {
-        "reply": (
+    reply_md = (
             "### Metadata — selected files\n\n"
             "| File | Rows | Columns |\n"
             "|------|-----:|--------:|\n"
             + ("\n".join(rows_md) if rows_md else "|  |  |  |")
             + (f"\n\n_…(+{len(names) - 15} more files)_" if len(names) > 15 else "")
-        ),
+        )
+    validation = _validate_metadata_markdown(reply_md=reply_md, meta=meta, names=names)
+    return {
+        "reply": reply_md,
         "payload": {
             "step": "view_query",
             "metadata": meta,
@@ -1594,6 +1719,7 @@ def _node_show_file_metadata(state: ChatState) -> ChatState:
                     [[k, v.get("rows"), v.get("columns")] for k, v in (meta or {}).items()],
                 ),
             ),
+            "validation": validation,
             "options": _flow_options(
                 {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
                 {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
@@ -1678,12 +1804,20 @@ def _node_assess_selected_local_files(state: ChatState) -> ChatState:
     report_html = _render_report_html(result)
     reply = report_md or f"Assessment complete for {len(dfs)} local file(s)."
     artifacts = _write_report_artifacts(result=result, report_markdown=report_md, report_html=report_html)
+    validation = _validate_report_payload(report_md=report_md or "", result=result if isinstance(result, dict) else {})
     # Cache for follow-up DQ questions
     ctx["last_assessment_result"] = result
     ctx["last_assessment_datasets"] = list((result.get("datasets") or {}).keys()) if isinstance(result, dict) else []
     return {
         "reply": reply,
-        "payload": {"selected_local_files": selected, "result": result, "report_markdown": report_md, "report_html": report_html, "report_files": artifacts},
+        "payload": {
+            "selected_local_files": selected,
+            "result": result,
+            "report_markdown": report_md,
+            "report_html": report_html,
+            "report_files": artifacts,
+            "validation": validation,
+        },
     }
 
 
@@ -1732,10 +1866,21 @@ def _node_assess_selected_files(state: ChatState) -> ChatState:
             low += int(s.get("low_severity") or 0)
         reply = f"Assessment complete for {len(dfs)} file(s). Issues={issue_count} (high={high}, medium={med}, low={low})."
     artifacts = _write_report_artifacts(result=result, report_markdown=report_md, report_html=report_html)
+    validation = _validate_report_payload(report_md=report_md or "", result=result if isinstance(result, dict) else {})
     # Cache for follow-up DQ questions
     ctx["last_assessment_result"] = result
     ctx["last_assessment_datasets"] = list((result.get("datasets") or {}).keys()) if isinstance(result, dict) else []
-    return {"reply": reply, "payload": {"selected_files": selected, "result": result, "report_markdown": report_md, "report_html": report_html, "report_files": artifacts}}
+    return {
+        "reply": reply,
+        "payload": {
+            "selected_files": selected,
+            "result": result,
+            "report_markdown": report_md,
+            "report_html": report_html,
+            "report_files": artifacts,
+            "validation": validation,
+        },
+    }
 
 
 def _parse_view_mode(user_text: str) -> str:
@@ -2067,10 +2212,21 @@ def _node_assess_selected_tables(state: ChatState) -> ChatState:
     report_html = _render_report_html(result)
     reply = report_md or f"Assessment complete for {len(dfs)} table(s)."
     artifacts = _write_report_artifacts(result=result, report_markdown=report_md, report_html=report_html)
+    validation = _validate_report_payload(report_md=report_md or "", result=result if isinstance(result, dict) else {})
     # Cache for follow-up DQ questions
     ctx["last_assessment_result"] = result
     ctx["last_assessment_datasets"] = list((result.get("datasets") or {}).keys()) if isinstance(result, dict) else []
-    return {"reply": reply, "payload": {"selected_tables": selected, "result": result, "report_markdown": report_md, "report_html": report_html, "report_files": artifacts}}
+    return {
+        "reply": reply,
+        "payload": {
+            "selected_tables": selected,
+            "result": result,
+            "report_markdown": report_md,
+            "report_html": report_html,
+            "report_files": artifacts,
+            "validation": validation,
+        },
+    }
 
 
 def _node_generate_report_selected(state: ChatState) -> ChatState:

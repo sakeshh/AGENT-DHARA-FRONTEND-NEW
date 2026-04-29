@@ -45,6 +45,46 @@ extended_checks:
   # |skew| above this → skewed_distribution (low)
   skew_threshold: 2.0
 
+# Summarize repeated invalid tokens as systematic placeholders.
+systematic_placeholders:
+  min_count: 5
+  min_pct: 0.02
+  top_k: 5
+
+# Domain/range rules (applied to numeric-parsed values).
+domain_rules:
+  rules:
+    - column: "age"
+      min: 18
+      max: 80
+      severity: "medium"
+    - column: "salary"
+      min: 1
+      severity: "medium"
+
+# Relationship inference: by default only key-like columns are used.
+relationships:
+  include_non_key_columns: false
+  orphan_only_if_same_dataset: true
+  same_dataset_min_id_overlap_ratio: 0.90
+  same_dataset_max_rowcount_diff_ratio: 0.10
+
+# Duplicate detection (same schema + high ID overlap).
+duplicate_detection:
+  min_id_overlap_ratio: 0.95
+  max_rowcount_diff_ratio: 0.05
+
+# Business-first summary section
+executive_summary:
+  max_items: 8
+
+# Per-dataset DQ score (0-100) weighting
+dq_score:
+  weights:
+    high: 3.0
+    medium: 1.0
+    low: 0.3
+
 # Optional: custom rules (applied after standard DQ)
 # custom_rules:
 #   - dataset: "*"              # or specific dataset name

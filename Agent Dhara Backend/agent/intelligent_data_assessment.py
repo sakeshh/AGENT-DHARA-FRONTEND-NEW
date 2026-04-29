@@ -92,6 +92,54 @@ def _strip(x: Any) -> Any:
     return x.strip() if isinstance(x, str) else x
 
 
+def scalar_type_distribution(series: pd.Series, max_sample: int = 2000) -> Dict[str, Any]:
+    """
+    Summarize Python scalar types present in a column.
+    Useful for JSON-loaded datasets where pandas dtype is 'object' but values mix int/str/etc.
+    """
+    try:
+        s = series.dropna()
+    except Exception:
+        s = series
+    if len(s) > max_sample:
+        try:
+            s = s.sample(max_sample, random_state=42)
+        except Exception:
+            s = s.head(max_sample)
+
+    counts: Dict[str, int] = {
+        "str": 0,
+        "int": 0,
+        "float": 0,
+        "bool": 0,
+        "dict": 0,
+        "list": 0,
+        "other": 0,
+    }
+    total = 0
+    for v in s.tolist():
+        if v is None:
+            continue
+        total += 1
+        if isinstance(v, bool):
+            counts["bool"] += 1
+        elif isinstance(v, int):
+            counts["int"] += 1
+        elif isinstance(v, float):
+            counts["float"] += 1
+        elif isinstance(v, str):
+            counts["str"] += 1
+        elif isinstance(v, dict):
+            counts["dict"] += 1
+        elif isinstance(v, list):
+            counts["list"] += 1
+        else:
+            counts["other"] += 1
+
+    pct = {k: (counts[k] / total if total else 0.0) for k in counts}
+    return {"counts": counts, "pct": pct, "sample_size": int(total)}
+
+
 def detect_semantic_type(values: pd.Series) -> str:
     """
     Lightweight semantic type detector using a small sample.
@@ -133,25 +181,29 @@ def _dtype_inference_for_object(series: pd.Series) -> Optional[str]:
     except Exception:
         pass
 
-    # datetime-like
-    try:
-        import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="Could not infer format, so each element will be parsed individually",
-            )
-            dt_coerced = pd.to_datetime(s, errors="coerce")
-        if (1.0 - float(dt_coerced.isna().mean())) > 0.8:
-            return "datetime_like"
-    except Exception:
-        pass
-
     # numeric-like
     try:
         num = pd.to_numeric(s, errors="coerce")
         if (1.0 - float(num.isna().mean())) > 0.8:
             return "numeric_like"
+    except Exception:
+        pass
+
+    # datetime-like (guarded: require date-ish separators; avoid numeric IDs being miscast)
+    try:
+        as_str = s.astype(str)
+        # Require at least some obvious date delimiters in the sample.
+        # This prevents numeric IDs like 1/2/3... from being interpreted as datetimes by pandas.
+        if (as_str.str.contains(r"[-/:T]", regex=True).mean() >= 0.20):
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="Could not infer format, so each element will be parsed individually",
+                )
+                dt_coerced = pd.to_datetime(s, errors="coerce")
+            if (1.0 - float(dt_coerced.isna().mean())) > 0.8:
+                return "datetime_like"
     except Exception:
         pass
 
@@ -192,10 +244,14 @@ def profile_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
         dtype_str = str(s.dtype)
         semantic = detect_semantic_type(s)
         hint = _dtype_inference_for_object(s) if dtype_str == "object" else None
+        if semantic == "numeric_id" and hint == "datetime_like":
+            hint = "numeric_like"
+        type_dist = scalar_type_distribution(s) if dtype_str == "object" else None
 
         profile["columns"][col] = {
             "dtype": dtype_str,
             "dtype_inference": hint,
+            "type_distribution": type_dist,
             "null_percentage": float(s.isna().mean()),
             "unique_count": safe_nunique(s),
             "semantic_type": semantic,
@@ -497,6 +553,7 @@ MAX_REL_ROW_INDEXES = 200
 def analyze_cross_dataset_relationships(
     datasets: Dict[str, pd.DataFrame],
     metadata: Dict[str, Any],
+    thresholds: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     For each pair of datasets sharing a column name (case-insensitive):
@@ -507,6 +564,74 @@ def analyze_cross_dataset_relationships(
     relationships: List[Dict[str, Any]] = []
     row_issues: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
+    thresholds = thresholds or {}
+    rel_cfg = thresholds.get("relationships") or {}
+    include_non_key = bool(rel_cfg.get("include_non_key_columns", False))
+    orphan_only_if_same_data = bool(rel_cfg.get("orphan_only_if_same_dataset", True))
+    same_data_min_id_overlap = float(rel_cfg.get("same_dataset_min_id_overlap_ratio", 0.90))
+    same_data_max_row_diff = float(rel_cfg.get("same_dataset_max_rowcount_diff_ratio", 0.10))
+
+    def _is_key_like(col_lower: str) -> bool:
+        return any(x in col_lower for x in ("_id", "id", "key", "code", "sku"))
+
+    def _same_dataset_representation(df1: pd.DataFrame, df2: pd.DataFrame) -> bool:
+        """
+        Heuristic guard: only treat datasets as join-compatible for orphan/FK checks when
+        they look like different serializations of the SAME records.
+        """
+        try:
+            cols1 = {str(c).strip().lower() for c in df1.columns}
+            cols2 = {str(c).strip().lower() for c in df2.columns}
+            if cols1 != cols2 or "id" not in cols1:
+                return False
+            c1 = next(c for c in df1.columns if str(c).lower() == "id")
+            c2 = next(c for c in df2.columns if str(c).lower() == "id")
+            k1 = set(df1[c1].map(_to_key).dropna().tolist())
+            k2 = set(df2[c2].map(_to_key).dropna().tolist())
+            if not k1 or not k2:
+                return False
+            inter = k1 & k2
+            overlap_ratio = len(inter) / max(1, min(len(k1), len(k2)))
+            r1, r2 = len(df1), len(df2)
+            row_diff_ratio = abs(r1 - r2) / max(1, max(r1, r2))
+            if not (overlap_ratio >= same_data_min_id_overlap and row_diff_ratio <= same_data_max_row_diff):
+                return False
+
+            # Stronger check: do rows actually match on shared IDs?
+            # This avoids falsely treating independent sources with same id range as identical datasets.
+            inter_list = list(inter)
+            if len(inter_list) > 50:
+                inter_list = inter_list[:50]
+            # prefer email if present, else compare full row signature excluding id
+            cols = [c for c in df1.columns if str(c).lower() != "id"]
+            if not cols:
+                return True
+            # Map id -> normalized tuple of values
+            def _row_sig(df: pd.DataFrame, id_col: str) -> Dict[Any, Tuple[Any, ...]]:
+                out = {}
+                for _, row in df.iterrows():
+                    ik = _to_key(row[id_col])
+                    if ik is None or ik in out:
+                        continue
+                    out[ik] = tuple(_to_key(row[c]) for c in cols)
+                return out
+            m1 = _row_sig(df1, c1)
+            m2 = _row_sig(df2, c2)
+            if not m1 or not m2:
+                return False
+            matches = 0
+            total = 0
+            for ik in inter_list:
+                if ik in m1 and ik in m2:
+                    total += 1
+                    if m1[ik] == m2[ik]:
+                        matches += 1
+            if total == 0:
+                return False
+            return (matches / total) >= 0.80
+        except Exception:
+            return False
+
     names = list(datasets.keys())
 
     for i in range(len(names)):
@@ -519,6 +644,8 @@ def analyze_cross_dataset_relationships(
                 continue
             common = set(map(str.lower, df1.columns)) & set(map(str.lower, df2.columns))
             for col_lower in common:
+                if (not include_non_key) and (not _is_key_like(col_lower)):
+                    continue
                 c1 = next(x for x in df1.columns if str(x).lower() == col_lower)
                 c2 = next(x for x in df2.columns if str(x).lower() == col_lower)
                 try:
@@ -582,6 +709,8 @@ def analyze_cross_dataset_relationships(
                 guess = _guess_parent_child_tables(n1, df1, c1, n2, df2, c2, meta1, meta2)
                 if guess:
                     _pn, pdf, pc, cn, cdf, cc = guess
+                    if orphan_only_if_same_data and not _same_dataset_representation(pdf, cdf):
+                        continue
                     try:
                         parent_keys = set(_to_key(x) for x in pdf[pc].dropna())
                     except Exception:
@@ -628,6 +757,166 @@ def detect_relationships(
 ) -> List[Dict[str, Any]]:
     """Returns enriched relationship list (cardinality, summaries)."""
     return analyze_cross_dataset_relationships(datasets, metadata or {})["relationships"]
+
+
+def analyze_cross_dataset_consistency(
+    datasets: Dict[str, pd.DataFrame],
+    metadata: Dict[str, Any],
+    thresholds: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Cross-dataset insights for data engineers:
+    - ID type drift across datasets (e.g., JSON mixed str/int vs CSV int)
+    - Likely duplicate representations (same schema + high ID overlap)
+    """
+    thresholds = thresholds or {}
+    out: List[Dict[str, Any]] = []
+
+    # ID type drift
+    try:
+        id_summaries: Dict[str, Any] = {}
+        for name, df in datasets.items():
+            id_col = None
+            for c in df.columns:
+                cl = str(c).lower()
+                if cl == "id" or cl.endswith("_id"):
+                    id_col = c
+                    break
+            if id_col is None:
+                continue
+            td = scalar_type_distribution(df[id_col])
+            id_summaries[name] = {"column": str(id_col), "type_distribution": td}
+
+        if len(id_summaries) >= 2:
+            def _bucket(td: Dict[str, Any]) -> str:
+                pct = (td.get("pct") or {})
+                strp = float(pct.get("str", 0.0))
+                nump = float(pct.get("int", 0.0)) + float(pct.get("float", 0.0))
+                if strp >= 0.10 and nump >= 0.10:
+                    return "mixed_str_num"
+                if nump >= 0.80:
+                    return "mostly_numeric"
+                if strp >= 0.80:
+                    return "mostly_string"
+                return "other"
+
+            buckets = {ds: _bucket(v["type_distribution"]) for ds, v in id_summaries.items()}
+            if len(set(buckets.values())) >= 2:
+                out.append({
+                    "severity": "high",
+                    "type": "id_type_drift_across_datasets",
+                    "message": "ID column uses inconsistent scalar types across datasets (serialization/type drift).",
+                    "details": {"buckets": buckets, "samples": id_summaries},
+                })
+    except Exception:
+        pass
+
+    # Duplicate representation candidates: schema match + high ID overlap
+    try:
+        dupe_cfg = thresholds.get("duplicate_detection") or {}
+        min_overlap = float(dupe_cfg.get("min_id_overlap_ratio", 0.95))
+        max_row_diff = float(dupe_cfg.get("max_rowcount_diff_ratio", 0.05))
+
+        def _schema_sig(df: pd.DataFrame) -> Tuple[str, ...]:
+            return tuple(sorted({str(c).strip().lower() for c in df.columns}))
+
+        groups: Dict[Tuple[str, ...], List[str]] = {}
+        for name, df in datasets.items():
+            groups.setdefault(_schema_sig(df), []).append(name)
+
+        for sig, names in groups.items():
+            if len(names) < 2 or len(sig) == 0:
+                continue
+            for i in range(len(names)):
+                for j in range(i + 1, len(names)):
+                    a, b = names[i], names[j]
+                    dfa, dfb = datasets[a], datasets[b]
+                    if "id" not in [str(c).lower() for c in dfa.columns] or "id" not in [str(c).lower() for c in dfb.columns]:
+                        continue
+                    ca = next(c for c in dfa.columns if str(c).lower() == "id")
+                    cb = next(c for c in dfb.columns if str(c).lower() == "id")
+                    ka = set(dfa[ca].map(_to_key).dropna().tolist())
+                    kb = set(dfb[cb].map(_to_key).dropna().tolist())
+                    if not ka or not kb:
+                        continue
+                    inter = ka & kb
+                    overlap_ratio = len(inter) / max(1, min(len(ka), len(kb)))
+                    ra, rb = len(dfa), len(dfb)
+                    row_diff_ratio = abs(ra - rb) / max(1, max(ra, rb))
+                    if overlap_ratio >= min_overlap and row_diff_ratio <= max_row_diff:
+                        out.append({
+                            "severity": "medium",
+                            "type": "duplicate_representation_candidate",
+                            "message": f"Datasets '{a}' and '{b}' likely represent the same records in different formats.",
+                            "details": {
+                                "schema_columns": list(sig)[:30],
+                                "id_overlap_ratio": round(overlap_ratio, 4),
+                                "id_overlap_count": len(inter),
+                                "row_counts": {a: ra, b: rb},
+                            },
+                        })
+    except Exception:
+        pass
+
+    # Enrich recommendations
+    for it in out:
+        enrich_issue_with_recommendation(it)
+    return out
+
+
+def build_executive_summary_items(
+    per_dataset_dq: Dict[str, Any],
+    global_issues: Dict[str, Any],
+    thresholds: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Business-first summary: rank the most impactful signals into a small list.
+    Uses a lightweight scoring model (severity × datasets affected).
+    """
+    thresholds = thresholds or {}
+    cfg = thresholds.get("executive_summary") or {}
+    max_items = int(cfg.get("max_items", 8))
+    sev_w = {"high": 3.0, "medium": 2.0, "low": 1.0}
+
+    rollup: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for ds, block in (per_dataset_dq or {}).items():
+        issues = (block or {}).get("issues") or []
+        for it in issues:
+            typ = str(it.get("type") or "")
+            col = str(it.get("column") or "")
+            key = (typ, col)
+            r = rollup.setdefault(key, {"type": typ, "column": col, "datasets": set(), "sev_max": "low", "rows": 0})
+            r["datasets"].add(ds)
+            r["rows"] += int(it.get("count") or 0)
+            if sev_w.get(str(it.get("severity") or "low"), 1) > sev_w.get(r["sev_max"], 1):
+                r["sev_max"] = str(it.get("severity") or "low")
+
+    # add cross-dataset consistency signals
+    for it in (global_issues.get("cross_dataset_consistency") or []):
+        if not isinstance(it, dict):
+            continue
+        key = (str(it.get("type") or ""), "")
+        r = rollup.setdefault(key, {"type": key[0], "column": "", "datasets": set(), "sev_max": "low", "rows": 0})
+        if sev_w.get(str(it.get("severity") or "low"), 1) > sev_w.get(r["sev_max"], 1):
+            r["sev_max"] = str(it.get("severity") or "low")
+
+    ranked = []
+    for r in rollup.values():
+        ds_count = len(r["datasets"]) if r["datasets"] else 1
+        score = sev_w.get(r["sev_max"], 1.0) * (1.0 + min(3.0, ds_count / 2.0))
+        ranked.append({**r, "datasets_affected": ds_count, "score": float(score)})
+    ranked.sort(key=lambda x: (-x.get("score", 0.0), -x.get("datasets_affected", 0), -x.get("rows", 0)))
+
+    items = []
+    for x in ranked[:max_items]:
+        items.append({
+            "title": x["type"] + (f" ({x['column']})" if x.get("column") else ""),
+            "severity": x.get("sev_max"),
+            "datasets_affected": x.get("datasets_affected"),
+            "estimated_rows_affected": x.get("rows"),
+            "recommendation": DQ_ISSUE_RECOMMENDATIONS.get(x["type"], _DEFAULT_REC),
+        })
+    return items
 
 
 # ============================================================
@@ -677,6 +966,14 @@ DQ_ISSUE_RECOMMENDATIONS: Dict[str, str] = {
     "extremely_long_strings": "Truncate with audit trail, or move large text to blob/document store.",
     "empty_string_values": "Normalize empty string to NULL for consistent SQL semantics.",
     "control_characters_in_text": "Strip non-printable chars in ETL; fix export encoding (UTF-8).",
+    "mixed_scalar_types": "Standardize to a single scalar type in ETL (e.g. cast all IDs to string or integer) and enforce it at ingest.",
+    "case_inconsistency": "Normalize case in ETL (e.g. UPPER/LOWER) and consider adding a canonical mapping table for display.",
+    "name_format_inconsistency": "Normalize name presentation (trim, collapse spaces, title-case) in staging; preserve raw in an audit column if needed.",
+    "mixed_phone_formats": "Normalize phones to a single canonical format (prefer E.164) and validate length/country rules at capture time.",
+    "systematic_placeholder": "Investigate upstream defaults; replace placeholders with NULL and enforce domain constraints at source.",
+    "out_of_range": "Clip/correct out-of-range values or quarantine rows; confirm expected business bounds with domain owners.",
+    "id_type_drift_across_datasets": "Align serialization across formats: IDs should use a consistent type (string or integer) across JSON/CSV/XML exports.",
+    "duplicate_representation_candidate": "These datasets likely represent the same entities in different formats; avoid double-counting and choose a system-of-record.",
     "custom_one_of": "Map invalid values to allowed enum or reject rows per data contract.",
     "custom_range": "Clip to bounds or reject; align with business limits.",
     "custom_regex": "Fix format at source or apply regex replace in staging.",
@@ -690,6 +987,45 @@ def enrich_issue_with_recommendation(issue: Dict[str, Any]) -> None:
     issue["recommendation"] = DQ_ISSUE_RECOMMENDATIONS.get(
         issue.get("type") or "", _DEFAULT_REC
     )
+
+
+FIXABILITY_BY_ISSUE_TYPE: Dict[str, str] = {
+    # deterministic transforms
+    "whitespace": "FIXABLE",
+    "empty_string_values": "FIXABLE",
+    "case_inconsistency": "FIXABLE",
+    "mixed_scalar_types": "FIXABLE",
+    "integer_stored_as_float": "FIXABLE",
+    "control_characters_in_text": "FIXABLE",
+    "nested_structure": "FIXABLE",
+    # complex / requires domain decision
+    # invalid emails can't be deterministically corrected (only quarantine/drop)
+    "invalid_email": "NOT_FIXABLE",
+    "invalid_phone": "COMPLEX",
+    "mixed_phone_formats": "COMPLEX",
+    "invalid_numeric": "COMPLEX",
+    "mixed_types": "COMPLEX",
+    "negative_values": "COMPLEX",
+    "out_of_range": "COMPLEX",
+    "numeric_outliers_iqr": "COMPLEX",
+    "dominant_value_skew": "COMPLEX",
+    "name_format_inconsistency": "COMPLEX",
+    "systematic_placeholder": "COMPLEX",
+    # cannot be auto-repaired without authoritative source
+    "duplicate_primary_key": "NOT_FIXABLE",
+    "duplicate_rows": "COMPLEX",
+    # orphan keys generally require upstream reference data; cannot be deterministically "fixed" in-place
+    "orphan_foreign_key_rows": "NOT_FIXABLE",
+    "orphan_foreign_key": "NOT_FIXABLE",
+    "id_type_drift_across_datasets": "FIXABLE",
+    "duplicate_representation_candidate": "COMPLEX",
+}
+
+
+def enrich_issue_with_fixability(issue: Dict[str, Any]) -> None:
+    if issue.get("fixability"):
+        return
+    issue["fixability"] = FIXABILITY_BY_ISSUE_TYPE.get(issue.get("type") or "", "COMPLEX")
 
 
 def dq_issue(
@@ -715,7 +1051,8 @@ def dq_issue(
         "count": count,
         "row_indexes": rows[:50] if rows else [],
         "sample_values": sample[:10] if sample else [],
-        "message": msg
+        "message": msg,
+        "fixability": FIXABILITY_BY_ISSUE_TYPE.get(typ, "COMPLEX"),
     }
 
 
@@ -741,6 +1078,7 @@ def analyze_column(
     n = len(series)
     s = series.copy()
     s_stripped = s.map(_strip)
+    is_phone_col = isinstance(col, str) and any(p in col.lower() for p in ["phone", "mobile", "contact"])
 
     # null/placeholder
     null_like_mask = s_stripped.isna() | s_stripped.astype(object).map(
@@ -762,6 +1100,25 @@ def analyze_column(
         issues.append(dq_issue("low", "whitespace", f"{ws_cnt} leading/trailing spaces",
                                column=col, count=ws_cnt, rows=rows, sample=list(s[ws_mask].head(5))))
 
+    # mixed scalar types (common in JSON IDs: alternating "0", 1, "2"...)
+    try:
+        if str(s.dtype) == "object" and n > 0:
+            td = scalar_type_distribution(s)
+            pct = (td.get("pct") or {})
+            has_str = float(pct.get("str", 0.0)) >= 0.05
+            has_num = (float(pct.get("int", 0.0)) + float(pct.get("float", 0.0))) >= 0.05
+            if has_str and has_num:
+                sev_str = "medium" if (semantic == "numeric_id" or (isinstance(col, str) and col.lower().endswith("id"))) else "low"
+                issues.append(dq_issue(
+                    sev_str,
+                    "mixed_scalar_types",
+                    f"Mixed scalar types (str≈{round(100*pct.get('str',0.0),1)}%, num≈{round(100*(pct.get('int',0.0)+pct.get('float',0.0)),1)}%)",
+                    column=col,
+                    sample=[td.get("counts", {})],
+                ))
+    except Exception:
+        pass
+
     # email
     if semantic == "email":
         bad_email_mask = s_stripped.astype(object).map(
@@ -774,7 +1131,7 @@ def analyze_column(
                                    column=col, count=bad_cnt, rows=rows, sample=list(s[bad_email_mask].head(5))))
 
     # phone
-    if isinstance(col, str) and any(p in col.lower() for p in ["phone", "mobile", "contact"]):
+    if is_phone_col:
         bad_phone_mask = s_stripped.astype(object).map(
             lambda v: isinstance(v, str) and not PHONE_RE.match(v)
         ) & (~null_like_mask)
@@ -783,6 +1140,38 @@ def analyze_column(
             rows = s.index[bad_phone_mask].tolist()
             issues.append(dq_issue("medium", "invalid_phone", f"{bad_cnt} invalid phone(s)",
                                    column=col, count=bad_cnt, rows=rows, sample=list(s[bad_phone_mask].head(5))))
+
+        # Mixed phone formats (e.g., "+91-..." vs digits-only); exclude junk/short from this
+        # to avoid double-counting with invalid_phone.
+        try:
+            def _digits(v: Any) -> str:
+                return re.sub(r"\D+", "", v) if isinstance(v, str) else ""
+
+            non_null = s_stripped[~null_like_mask]
+            e164ish = non_null.astype(object).map(lambda v: isinstance(v, str) and v.strip().startswith("+") and 10 <= len(_digits(v)) <= 15)
+            digits_only = non_null.astype(object).map(lambda v: isinstance(v, str) and v.strip().isdigit() and 10 <= len(v.strip()) <= 15)
+            short_or_junk = non_null.astype(object).map(lambda v: isinstance(v, str) and 0 < len(_digits(v)) < 10)
+            buckets = {
+                "e164ish": int(e164ish.sum()),
+                "digits_only_valid_len": int(digits_only.sum()),
+                "short_or_junk": int(short_or_junk.sum()),
+            }
+            nonzero_valid = [k for k in ("e164ish", "digits_only_valid_len") if buckets.get(k, 0) > 0]
+            if len(nonzero_valid) >= 2:
+                samples = []
+                for k in nonzero_valid:
+                    mask = {"e164ish": e164ish, "digits_only_valid_len": digits_only, "short_or_junk": short_or_junk}[k]
+                    samples.append({k: list(non_null[mask].head(3))})
+                issues.append(dq_issue(
+                    "medium",
+                    "mixed_phone_formats",
+                    f"Multiple phone formats detected among valid-length values: {', '.join([f'{k}={buckets[k]}' for k in nonzero_valid])}. Junk/short={buckets.get('short_or_junk',0)}.",
+                    column=col,
+                    count=sum(buckets[k] for k in nonzero_valid),
+                    sample=samples,
+                ))
+        except Exception:
+            pass
 
     # date
     if semantic == "date":
@@ -796,11 +1185,11 @@ def analyze_column(
                                    column=col, count=bad_cnt, rows=rows, sample=list(s[bad_mask].head(5))))
 
     # numeric-like validations
-    if (semantic in ("numeric_id",)) or (str(s.dtype) != "object") or (
+    if (not is_phone_col) and ((semantic in ("numeric_id",)) or (str(s.dtype) != "object") or (
         (str(s.dtype) == "object") and (
             (1.0 - pd.to_numeric(s_stripped, errors="coerce").isna().mean()) > 0.2
         )
-    ):
+    )):
         num = pd.to_numeric(s_stripped, errors="coerce")
         invalid_mask = num.isna() & (~null_like_mask)
         invalid_cnt = int(invalid_mask.sum())
@@ -810,6 +1199,30 @@ def analyze_column(
             issues.append(dq_issue(sev_str, "invalid_numeric",
                                    f"{invalid_cnt} non-numeric value(s)",
                                    column=col, count=invalid_cnt, rows=rows, sample=list(s[invalid_mask].head(5))))
+
+            # Systematic placeholder detection among invalid tokens (e.g., "50k", "twenty")
+            try:
+                ph = (thresholds or {}).get("systematic_placeholders") or {}
+                min_count = int(ph.get("min_count", 5))
+                min_pct = float(ph.get("min_pct", 0.02))
+                top_k = int(ph.get("top_k", 5))
+                inval = s_stripped[invalid_mask].astype(str)
+                vc = inval.value_counts()
+                if len(vc) > 0:
+                    top = vc.head(top_k)
+                    top_items = [{"value": k, "count": int(v), "pct": float(v) / max(1, n)} for k, v in top.items()]
+                    biggest = int(top.iloc[0])
+                    if biggest >= min_count and (biggest / max(1, n)) >= min_pct:
+                        issues.append(dq_issue(
+                            "medium",
+                            "systematic_placeholder",
+                            f"Repeated invalid token(s) detected (top='{str(top.index[0])}' appears {biggest} times)",
+                            column=col,
+                            count=int(vc.sum()),
+                            sample=top_items,
+                        ))
+            except Exception:
+                pass
 
         neg_mask = num < 0
         neg_cnt = int(neg_mask.sum())
@@ -830,9 +1243,50 @@ def analyze_column(
 
         parse_rate = 1.0 - float(num.isna().mean())
         if mixed_low < parse_rate < mixed_high:
+            # "mixed_types" means a material number of values do not conform to the dominant numeric parse.
+            # Use the same invalid_mask used for invalid_numeric (excludes null-like placeholders).
+            mixed_cnt = int((num.isna() & (~null_like_mask)).sum())
             issues.append(dq_issue("medium", "mixed_types",
                                    f"Mixed numeric/text (parse={round(parse_rate*100,1)}%)",
-                                   column=col))
+                                   column=col, count=mixed_cnt,
+                                   rows=s.index[num.isna() & (~null_like_mask)].tolist()[:50],
+                                   sample=list(s[num.isna() & (~null_like_mask)].head(5))))
+
+        # Domain/range rules (config-driven; applied to parsed numeric values)
+        try:
+            dr = (thresholds or {}).get("domain_rules") or {}
+            rules = dr.get("rules") or []
+            if isinstance(rules, list) and isinstance(col, str):
+                for r in rules:
+                    if not isinstance(r, dict):
+                        continue
+                    rcol = str(r.get("column") or "").strip().lower()
+                    if not rcol or rcol != col.lower():
+                        continue
+                    rmin = r.get("min", None)
+                    rmax = r.get("max", None)
+                    if rmin is None and rmax is None:
+                        continue
+                    ok = num.notna() & (~null_like_mask)
+                    out_mask = ok.copy()
+                    if rmin is not None:
+                        out_mask = out_mask & (num < float(rmin))
+                    if rmax is not None:
+                        out_mask = out_mask & (num > float(rmax))
+                    oc = int(out_mask.sum())
+                    if oc > 0:
+                        rows = s.index[out_mask].tolist()
+                        issues.append(dq_issue(
+                            str(r.get("severity") or "medium").lower(),
+                            "out_of_range",
+                            f"{oc} value(s) outside expected range",
+                            column=col,
+                            count=oc,
+                            rows=rows[:50],
+                            sample=list(s[out_mask].head(5)),
+                        ))
+        except Exception:
+            pass
 
     # structural leftovers
     struct_mask = s.astype(object).map(lambda v: isinstance(v, (list, dict)))
@@ -1008,6 +1462,7 @@ def run_extended_dq_checks(
                     "low", "very_high_cardinality",
                     f"{uq} distinct values (~{round(100*uq/max(non_null,1),1)}% of non-null rows)",
                     column=col,
+                    count=int(uq),
                 ))
 
         if uq == 2 and non_null > 10:
@@ -1119,6 +1574,66 @@ def run_extended_dq_checks(
                     ))
             except Exception:
                 pass
+
+            # Value-level case inconsistency for categorical-like string columns (IT vs it, etc.)
+            try:
+                if non_null > 0 and uq <= max(250, int(0.6 * non_null)):
+                    sub = s.dropna()
+                    if len(sub) > max_heavy:
+                        sub = sub.sample(max_heavy, random_state=44)
+                    norm = sub.map(lambda v: v.strip().lower() if isinstance(v, str) else None)
+                    groups: Dict[str, set] = {}
+                    for raw, key in zip(sub.tolist(), norm.tolist()):
+                        if not isinstance(raw, str) or not key:
+                            continue
+                        groups.setdefault(key, set()).add(raw.strip())
+                    collisions = {k: sorted(list(v)) for k, v in groups.items() if len(v) >= 2}
+                    if collisions:
+                        top = sorted(collisions.items(), key=lambda kv: len(kv[1]), reverse=True)[:5]
+                        examples = [{k: v} for k, v in top]
+                        issues.append(dq_issue(
+                            "medium",
+                            "case_inconsistency",
+                            f"Values differ only by casing (e.g., {top[0][1][0]} vs {top[0][1][1]})",
+                            column=col,
+                            count=len(collisions),
+                            sample=examples,
+                        ))
+            except Exception:
+                pass
+
+            # Name format check (casing/digits/spaces), separate from whitespace
+            try:
+                if isinstance(col, str) and col.lower() in ("name", "full_name", "fullname"):
+                    sub = s.dropna()
+                    if len(sub) > max_heavy:
+                        sub = sub.sample(max_heavy, random_state=45)
+                    vals = sub[sub.apply(lambda x: isinstance(x, str))].map(lambda v: v.strip())
+                    if len(vals) > 0:
+                        all_upper = vals.map(lambda v: v.isalpha() and v.isupper()).mean()
+                        all_lower = vals.map(lambda v: v.isalpha() and v.islower()).mean()
+                        has_digits = vals.map(lambda v: bool(re.search(r"\d", v))).mean()
+                        multi_space = vals.map(lambda v: "  " in v).mean()
+                        if (all_upper > 0.05 and all_lower > 0.05) or has_digits > 0.05 or multi_space > 0.05:
+                            # Convert numpy scalars to plain Python floats for clean JSON/HTML rendering
+                            au = float(all_upper)
+                            al = float(all_lower)
+                            hd = float(has_digits)
+                            ms = float(multi_space)
+                            issues.append(dq_issue(
+                                "medium",
+                                "name_format_inconsistency",
+                                "Inconsistent name casing/formatting (upper/lower/digits/spaces)",
+                                column=col,
+                                sample=[{
+                                    "all_upper_pct": round(100.0 * au, 1),
+                                    "all_lower_pct": round(100.0 * al, 1),
+                                    "has_digits_pct": round(100.0 * hd, 1),
+                                    "multi_space_pct": round(100.0 * ms, 1),
+                                }, list(vals.head(5))],
+                            ))
+            except Exception:
+                pass
             try:
                 _ctrl_pat = r"[\x00-\x08\x0b\x0c\x0e-\x1f]"
                 if n <= max_heavy:
@@ -1206,13 +1721,58 @@ def analyze_dataset_quality(
 
     issues.extend(run_extended_dq_checks(df, profile, thresholds))
 
+    # DQ score (0-100) and clean row estimates
+    try:
+        score_cfg = (thresholds or {}).get("dq_score") or {}
+        w = (score_cfg.get("weights") or {})
+        wh = float(w.get("high", 3.0))
+        wm = float(w.get("medium", 1.0))
+        wl = float(w.get("low", 0.3))
+        sev_w = {"high": wh, "medium": wm, "low": wl}
+
+        # penalize by DISTINCT affected rows per severity.
+        # This avoids double-penalizing the same bad rows across multiple issue types.
+        high_rows, med_rows, low_rows = set(), set(), set()
+        for it in issues:
+            sev = str(it.get("severity") or "low").lower()
+            rows = it.get("row_indexes") or []
+            if rows:
+                if sev == "high":
+                    high_rows.update(rows)
+                elif sev == "medium":
+                    med_rows.update(rows)
+                else:
+                    low_rows.update(rows)
+
+        # Remove overlap so a row counted as HIGH doesn't also count against MED/LOW
+        med_rows = set(med_rows) - set(high_rows)
+        low_rows = set(low_rows) - set(high_rows) - set(med_rows)
+
+        frac_h = len(high_rows) / max(1, n)
+        frac_m = len(med_rows) / max(1, n)
+        frac_l = len(low_rows) / max(1, n)
+
+        raw_penalty = (sev_w["high"] * frac_h) + (sev_w["medium"] * frac_m) + (sev_w["low"] * frac_l)
+        max_penalty = sev_w["high"] + sev_w["medium"] + sev_w["low"]
+        dq_score = 100.0 * max(0.0, 1.0 - (raw_penalty / max(1e-9, max_penalty)))
+
+        clean_est_high = max(0, n - len(high_rows))
+        clean_est_high_med = max(0, n - len(high_rows.union(med_rows)))
+    except Exception:
+        dq_score = None
+        clean_est_high = None
+        clean_est_high_med = None
+
     return {
         "issues": issues,
         "summary": {
             "issue_count": len(issues),
             "high_severity": sum(1 for i in issues if i["severity"] == "high"),
             "medium_severity": sum(1 for i in issues if i["severity"] == "medium"),
-            "low_severity": sum(1 for i in issues if i["severity"] == "low")
+            "low_severity": sum(1 for i in issues if i["severity"] == "low"),
+            "dq_score_0_100": dq_score,
+            "estimated_clean_rows_after_high": clean_est_high,
+            "estimated_clean_rows_after_high_and_medium": clean_est_high_med,
         }
     }
 
@@ -1221,11 +1781,70 @@ def analyze_dataset_quality(
 # GLOBAL ISSUES (orphans, cross-dataset inconsistencies)
 # ============================================================
 
-def detect_global_issues(datasets: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+def detect_global_issues(datasets: Dict[str, pd.DataFrame], thresholds: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     - Orphan foreign keys: values present in one dataset.column but not in the counterpart
     - Cross-dataset inconsistencies: coarse mixed numeric/text indicator per column by parse-rate
     """
+    thresholds = thresholds or {}
+    rel_cfg = thresholds.get("relationships") or {}
+    orphan_only_if_same_data = bool(rel_cfg.get("orphan_only_if_same_dataset", True))
+    same_data_min_id_overlap = float(rel_cfg.get("same_dataset_min_id_overlap_ratio", 0.90))
+    same_data_max_row_diff = float(rel_cfg.get("same_dataset_max_rowcount_diff_ratio", 0.10))
+
+    def _same_dataset_representation(df1: pd.DataFrame, df2: pd.DataFrame) -> bool:
+        try:
+            cols1 = {str(c).strip().lower() for c in df1.columns}
+            cols2 = {str(c).strip().lower() for c in df2.columns}
+            if cols1 != cols2 or "id" not in cols1:
+                return False
+            c1 = next(c for c in df1.columns if str(c).lower() == "id")
+            c2 = next(c for c in df2.columns if str(c).lower() == "id")
+            k1 = set(df1[c1].map(_to_key).dropna().tolist())
+            k2 = set(df2[c2].map(_to_key).dropna().tolist())
+            if not k1 or not k2:
+                return False
+            inter = k1 & k2
+            overlap_ratio = len(inter) / max(1, min(len(k1), len(k2)))
+            r1, r2 = len(df1), len(df2)
+            row_diff_ratio = abs(r1 - r2) / max(1, max(r1, r2))
+            if not (overlap_ratio >= same_data_min_id_overlap and row_diff_ratio <= same_data_max_row_diff):
+                return False
+
+            # Stronger check: do rows actually match on shared IDs?
+            inter_list = list(inter)
+            if len(inter_list) > 50:
+                inter_list = inter_list[:50]
+            cols = [c for c in df1.columns if str(c).lower() != "id"]
+            if not cols:
+                return True
+
+            def _row_sig(df: pd.DataFrame, id_col: str) -> Dict[Any, Tuple[Any, ...]]:
+                out = {}
+                for _, row in df.iterrows():
+                    ik = _to_key(row[id_col])
+                    if ik is None or ik in out:
+                        continue
+                    out[ik] = tuple(_to_key(row[c]) for c in cols)
+                return out
+
+            m1 = _row_sig(df1, c1)
+            m2 = _row_sig(df2, c2)
+            if not m1 or not m2:
+                return False
+            matches = 0
+            total = 0
+            for ik in inter_list:
+                if ik in m1 and ik in m2:
+                    total += 1
+                    if m1[ik] == m2[ik]:
+                        matches += 1
+            if total == 0:
+                return False
+            return (matches / total) >= 0.80
+        except Exception:
+            return False
+
     global_issues = {
         "orphan_foreign_keys": [],
         "cross_dataset_inconsistencies": []
@@ -1236,6 +1855,7 @@ def detect_global_issues(datasets: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
         df1 = datasets[names[i]]
         for j in range(i + 1, len(names)):
             df2 = datasets[names[j]]
+            same_data = _same_dataset_representation(df1, df2)
 
             common = set(map(str.lower, df1.columns)) & set(map(str.lower, df2.columns))
             for col in common:
@@ -1258,22 +1878,23 @@ def detect_global_issues(datasets: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
                     "Align keys between datasets (trim, type cast). Add missing reference rows or remove "
                     "orphan facts in the child extract. Prefer FK constraints in the source system."
                 )
-                if only_left:
-                    global_issues["orphan_foreign_keys"].append({
-                        "from": f"{names[i]}.{c1}",
-                        "to": f"{names[j]}.{c2}",
-                        "orphan_count": len(only_left),
-                        "sample_values": only_left[:10],
-                        "recommendation": _orph_rec,
-                    })
-                if only_right:
-                    global_issues["orphan_foreign_keys"].append({
-                        "from": f"{names[j]}.{c2}",
-                        "to": f"{names[i]}.{c1}",
-                        "orphan_count": len(only_right),
-                        "sample_values": only_right[:10],
-                        "recommendation": _orph_rec,
-                    })
+                if (not orphan_only_if_same_data) or same_data:
+                    if only_left:
+                        global_issues["orphan_foreign_keys"].append({
+                            "from": f"{names[i]}.{c1}",
+                            "to": f"{names[j]}.{c2}",
+                            "orphan_count": len(only_left),
+                            "sample_values": only_left[:10],
+                            "recommendation": _orph_rec,
+                        })
+                    if only_right:
+                        global_issues["orphan_foreign_keys"].append({
+                            "from": f"{names[j]}.{c2}",
+                            "to": f"{names[i]}.{c1}",
+                            "orphan_count": len(only_right),
+                            "sample_values": only_right[:10],
+                            "recommendation": _orph_rec,
+                        })
 
             for nm, df in ((names[i], df1), (names[j], df2)):
                 for col in df.columns:
@@ -1284,12 +1905,27 @@ def detect_global_issues(datasets: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
                         global_issues["cross_dataset_inconsistencies"].append({
                             "dataset": nm,
                             "column": col,
+                            "issue_type": "mixed_types",
                             "message": f"Mixed numeric/text values (parse={round(parse_rate*100,1)}%)",
                             "recommendation": (
                                 "Standardize to one type in staging: coerce numerics after validation, "
                                 "or split into _raw and _numeric columns."
                             ),
                         })
+
+    # Deduplicate cross-dataset inconsistencies: one row per (dataset, column, issue_type)
+    try:
+        seen = set()
+        deduped = []
+        for x in global_issues.get("cross_dataset_inconsistencies", []) or []:
+            key = (x.get("dataset"), x.get("column"), x.get("issue_type"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(x)
+        global_issues["cross_dataset_inconsistencies"] = deduped
+    except Exception:
+        pass
 
     return global_issues
 
@@ -1483,16 +2119,36 @@ def load_and_profile(
                     1 for i in per_dataset_dq[ds_name]["issues"] if i.get("severity") == "high"
                 )
 
-    rel_bundle = analyze_cross_dataset_relationships(datasets, metadata)
+    rel_bundle = analyze_cross_dataset_relationships(datasets, metadata, thresholds)
     relationships = rel_bundle["relationships"]
-    global_issues = detect_global_issues(datasets)
+    global_issues = detect_global_issues(datasets, thresholds)
     global_issues["relationship_row_issues"] = rel_bundle["relationship_row_issues"]
     global_issues["relationship_warnings"] = rel_bundle["relationship_warnings"]
+    global_issues["cross_dataset_consistency"] = analyze_cross_dataset_consistency(datasets, metadata, thresholds)
 
     for ds_name, block in per_dataset_dq.items():
         for iss in block.get("issues", []):
             iss.setdefault("dataset", ds_name)
             enrich_issue_with_recommendation(iss)
+            enrich_issue_with_fixability(iss)
+
+    # Enrich global/cross-dataset issues
+    try:
+        for iss in (global_issues.get("relationship_row_issues") or []):
+            enrich_issue_with_recommendation(iss)
+            enrich_issue_with_fixability(iss)
+        for iss in (global_issues.get("relationship_warnings") or []):
+            enrich_issue_with_recommendation(iss)
+            enrich_issue_with_fixability(iss)
+        for iss in (global_issues.get("cross_dataset_consistency") or []):
+            enrich_issue_with_recommendation(iss)
+            enrich_issue_with_fixability(iss)
+        for iss in (global_issues.get("cross_dataset_inconsistencies") or []):
+            # these use issue_type, not type
+            if isinstance(iss, dict) and iss.get("issue_type") and not iss.get("fixability"):
+                iss["fixability"] = FIXABILITY_BY_ISSUE_TYPE.get(str(iss.get("issue_type")), "COMPLEX")
+    except Exception:
+        pass
 
     out = {
         "datasets": metadata,
@@ -1500,7 +2156,8 @@ def load_and_profile(
         "data_quality_issues": {
             "datasets": per_dataset_dq,
             "global_issues": global_issues
-        }
+        },
+        "executive_summary_items": build_executive_summary_items(per_dataset_dq, global_issues, thresholds),
     }
     if return_datasets:
         out["_datasets"] = datasets

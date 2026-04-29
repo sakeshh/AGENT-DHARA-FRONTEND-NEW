@@ -104,6 +104,24 @@ export default function DataAssessmentReport({ files, database, onComplete, onFe
   const [reportHtml, setReportHtml] = useState<string | null>(null);
   const [showFeedback, setShowFeedback] = useState(false);
 
+  const summaries: UiDatasetSummary[] = useMemo(() => {
+    const datasets = assessment?.datasets || {};
+    const dq = assessment?.data_quality_issues?.datasets || {};
+    return Object.entries(datasets).map(([name, meta]) => {
+      const summ = dq?.[name]?.summary || {};
+      return {
+        name,
+        sourceLabel: sourceLabelFromRoot(meta?.source_root),
+        rows: Number(meta?.row_count ?? 0) || 0,
+        cols: Number(meta?.column_count ?? 0) || 0,
+        issues: Number(summ?.issue_count ?? 0) || 0,
+        high: Number(summ?.high_severity ?? 0) || 0,
+        med: Number(summ?.medium_severity ?? 0) || 0,
+        low: Number(summ?.low_severity ?? 0) || 0,
+      };
+    });
+  }, [assessment]);
+
   useEffect(() => {
     runAssessment();
   }, []);
@@ -260,24 +278,6 @@ export default function DataAssessmentReport({ files, database, onComplete, onFe
   }
 
   const title = files.length === 1 ? `Assessment Report of ${files[0]}` : 'Assessment Report';
-
-  const summaries: UiDatasetSummary[] = useMemo(() => {
-    const datasets = assessment?.datasets || {};
-    const dq = assessment?.data_quality_issues?.datasets || {};
-    return Object.entries(datasets).map(([name, meta]) => {
-      const summ = dq?.[name]?.summary || {};
-      return {
-        name,
-        sourceLabel: sourceLabelFromRoot(meta?.source_root),
-        rows: Number(meta?.row_count ?? 0) || 0,
-        cols: Number(meta?.column_count ?? 0) || 0,
-        issues: Number(summ?.issue_count ?? 0) || 0,
-        high: Number(summ?.high_severity ?? 0) || 0,
-        med: Number(summ?.medium_severity ?? 0) || 0,
-        low: Number(summ?.low_severity ?? 0) || 0,
-      };
-    });
-  }, [assessment]);
 
   const relationships = Array.isArray(assessment?.relationships) ? assessment!.relationships! : [];
   const globalIssues = assessment?.data_quality_issues?.global_issues || null;

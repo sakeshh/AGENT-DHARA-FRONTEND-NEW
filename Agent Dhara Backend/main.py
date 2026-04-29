@@ -469,6 +469,7 @@ def build_markdown_report(result: Dict[str, Any]) -> str:
     dq = result.get("data_quality_issues", {})
     dq_ds = dq.get("datasets", {})
     dq_global = dq.get("global_issues", {})
+    exec_items = result.get("executive_summary_items") or []
 
     md.append("**Overview**")
     md.append(f"- Total datasets: {len(datasets)}")
@@ -478,6 +479,18 @@ def build_markdown_report(result: Dict[str, Any]) -> str:
     md.append(f"- Total rows (approx.): {total_rows}")
     md.append(f"- Total columns (sum): {total_cols}")
     md.append(f"- Total memory (bytes): {total_bytes}\n")
+
+    if exec_items:
+        md.append("**Executive summary (prioritized)**")
+        for it in exec_items[:10]:
+            if not isinstance(it, dict):
+                continue
+            md.append(
+                f"- ({it.get('severity')}) **{it.get('title')}** — "
+                f"datasets={it.get('datasets_affected')}, rows≈{it.get('estimated_rows_affected')}. "
+                f"→ {str(it.get('recommendation') or '')[:220]}"
+            )
+        md.append("")
 
     rm = result.get("run_metadata") or {}
     if rm:
@@ -535,6 +548,15 @@ def build_markdown_report(result: Dict[str, Any]) -> str:
     for name, meta in datasets.items():
         md.append(f"- **{name}**")
         md.append(f"  - rows: {meta.get('row_count')}, cols: {meta.get('column_count')}, bytes: {meta.get('data_volume_bytes')}")
+        dq_block = (dq_ds.get(name) or {})
+        summ = (dq_block.get("summary") or {})
+        if summ:
+            if summ.get("dq_score_0_100") is not None:
+                md.append(f"  - dq_score: **{round(float(summ.get('dq_score_0_100')), 1)} / 100**")
+            if summ.get("estimated_clean_rows_after_high") is not None:
+                md.append(f"  - est_clean_rows_after_high: **{summ.get('estimated_clean_rows_after_high')}**")
+            if summ.get("estimated_clean_rows_after_high_and_medium") is not None:
+                md.append(f"  - est_clean_rows_after_high+medium: **{summ.get('estimated_clean_rows_after_high_and_medium')}**")
         cols = meta.get("columns", {})
         if cols:
             md.append("  - columns:")
@@ -598,7 +620,9 @@ def build_markdown_report(result: Dict[str, Any]) -> str:
             md.append("  - (no issues)")
         else:
             for i in issues[:25]:
-                md.append("  " + _brief_issue_line(i))
+                fx = i.get("fixability") or ""
+                fx_part = f" [{fx}]" if fx else ""
+                md.append("  " + _brief_issue_line({**i, "type": f"{i.get('type')}{fx_part}"}))
             if len(issues) > 25:
                 md.append(f"  - ... (+{len(issues)-25} more)")
         md.append("")
@@ -620,6 +644,14 @@ def build_markdown_report(result: Dict[str, Any]) -> str:
                 md.append(f"    → {x['recommendation'][:160]}")
     else:
         md.append("  - Cross-dataset inconsistencies: (none)")
+
+    xcons = dq_global.get("cross_dataset_consistency", [])
+    if xcons:
+        md.append("  - Cross-dataset consistency insights:")
+        for x in xcons[:20]:
+            md.append(f"    - ({x.get('severity')}) {x.get('type')}: {x.get('message')}")
+            if x.get("recommendation"):
+                md.append(f"      → {str(x.get('recommendation'))[:180]}")
     md.append("")
     return "\n".join(md)
 
@@ -637,6 +669,7 @@ def build_html_report(result: Dict[str, Any]) -> str:
     dq = result.get("data_quality_issues", {})
     dq_ds = dq.get("datasets", {})
     dq_global = dq.get("global_issues", {})
+    exec_items = result.get("executive_summary_items") or []
     total_rows = sum(d.get("row_count", 0) for d in datasets.values())
     total_cols = sum(d.get("column_count", 0) for d in datasets.values())
     total_bytes = sum(d.get("data_volume_bytes", 0) for d in datasets.values())
@@ -695,6 +728,32 @@ def build_html_report(result: Dict[str, Any]) -> str:
             "<p>Could not generate insights: <code>"
             + html_module.escape(str(llm.get("error") or ""))
             + "</code></p><p class=\"muted\">Check Azure OpenAI env vars and deployment.</p></div></section>"
+        )
+
+    exec_summary_html = ""
+    if exec_items:
+        _lis = []
+        for it in exec_items[:10]:
+            if not isinstance(it, dict):
+                continue
+            _lis.append(
+                "<li><span class=\"pill sev-"
+                + html_module.escape(str(it.get("severity") or "low"))
+                + "\">"
+                + html_module.escape(str(it.get("severity") or "low").upper())
+                + "</span> <strong>"
+                + html_module.escape(str(it.get("title") or ""))
+                + "</strong> <span class=\"muted\">(datasets="
+                + html_module.escape(str(it.get("datasets_affected") or "—"))
+                + ", rows≈"
+                + html_module.escape(str(it.get("estimated_rows_affected") or "—"))
+                + ")</span><br/><span class=\"muted\">"
+                + html_module.escape(str(it.get("recommendation") or ""))
+                + "</span></li>"
+            )
+        exec_summary_html = (
+            "<div class=\"exec-summary\"><h3>Executive summary (prioritized)</h3>"
+            "<ul class=\"exec-ul\">" + ("".join(_lis) if _lis else "<li class=\"muted\">(none)</li>") + "</ul></div>"
         )
 
     def esc(x: Any) -> str:
@@ -784,12 +843,13 @@ def build_html_report(result: Dict[str, Any]) -> str:
     def render_dq_table(title: str, rows: List[Dict]) -> str:
         body = []
         if not rows:
-            body.append("<tr><td colspan='8' class='muted'>(no issues)</td></tr>")
+            body.append("<tr><td colspan='9' class='muted'>(no issues)</td></tr>")
         else:
             for i in rows:
                 sev = (i.get("severity") or "low").lower()
                 msg = (i.get("message") or "").strip()
                 rec = (i.get("recommendation") or "").strip()
+                fx = (i.get("fixability") or "").strip()
                 msg_td = f"<td class='msg-cell'>{esc(msg)}</td>" if msg else "<td class='msg-cell'><span class='muted'>—</span></td>"
                 rec_td = f"<td class='rec-cell'>{esc(rec)}</td>" if rec else "<td class='rec-cell'><span class='muted'>—</span></td>"
                 body.append(
@@ -797,6 +857,7 @@ def build_html_report(result: Dict[str, Any]) -> str:
                     f"<td>{esc(i.get('column') or '-')}</td>"
                     f"<td><code>{esc(i.get('type'))}</code></td>"
                     f"<td><span class='badge sev-{esc(sev)}'>{esc(sev.upper())}</span></td>"
+                    f"<td><span class='badge fx-{esc(fx.lower() or 'complex')}'>{esc(fx or '—')}</span></td>"
                     f"<td>{esc(i.get('count')) if i.get('count') is not None else '-'}</td>"
                     f"<td>{fmt_rows(i.get('row_indexes') or [])}</td>"
                     f"<td>{fmt_samples(i.get('sample_values') or [])}</td>"
@@ -805,7 +866,7 @@ def build_html_report(result: Dict[str, Any]) -> str:
         return (
             f"<h4 class='block-title'>{esc(title)}</h4>"
             "<div class='table-wrap'><table class='data-table'><thead><tr>"
-            "<th>Column</th><th>Issue</th><th>Sev</th><th>Count</th><th>Rows</th><th>Samples</th>"
+            "<th>Column</th><th>Issue</th><th>Sev</th><th>Fixability</th><th>Count</th><th>Rows</th><th>Samples</th>"
             "<th>Problem</th><th>Recommendation</th>"
             "</tr></thead><tbody>" + "".join(body) + "</tbody></table></div>"
         )
@@ -825,6 +886,7 @@ def build_html_report(result: Dict[str, Any]) -> str:
         profile_tbl = render_profile_table(meta.get("columns", {}) or {})
         ds_issues = dq_ds.get(name, {}).get("issues", []) or []
         buckets = split_by_sev(ds_issues)
+        ds_summary = (dq_ds.get(name, {}).get("summary") or {}) if isinstance(dq_ds.get(name, {}), dict) else {}
         src = meta.get("source_root") or ""
         raw = path_raw_for_copy(src)
         if src == "__database__":
@@ -837,6 +899,25 @@ def build_html_report(result: Dict[str, Any]) -> str:
             path_html = "<div class='path-inset'><span class='path-inset-label'>Source</span><span class='path-inset-value muted'>Not specified</span></div>"
         i = ds_idx[0]
         ds_idx[0] += 1
+        score = ds_summary.get("dq_score_0_100")
+        clean_h = ds_summary.get("estimated_clean_rows_after_high")
+        clean_hm = ds_summary.get("estimated_clean_rows_after_high_and_medium")
+        score_html = ""
+        if score is not None:
+            try:
+                sv = float(score)
+                sev_class = "sev-high" if sv < 35 else ("sev-medium" if sv < 70 else "sev-low")
+                score_html = f"<span class='badge {sev_class}'>DQ {round(sv,1)}/100</span>"
+            except Exception:
+                score_html = f"<span class='badge sev-low'>DQ {esc(str(score))}/100</span>"
+        clean_html = ""
+        if clean_h is not None or clean_hm is not None:
+            clean_html = "<div class='dataset-metrics'>"
+            if clean_h is not None:
+                clean_html += f"<span class='metric'><span class='label'>Clean after HIGH</span><span class='val'>{esc(str(clean_h))}</span></span>"
+            if clean_hm is not None:
+                clean_html += f"<span class='metric'><span class='label'>Clean after HIGH+MED</span><span class='val'>{esc(str(clean_hm))}</span></span>"
+            clean_html += "</div>"
         return f"""
         <div class="nest-file-card dataset-card depth-card" id="ds-{i}" data-path-group="{pi}">
           <button type="button" class="nest-toggle nest-level-3" aria-expanded="true" aria-controls="dbc-{i}">
@@ -845,10 +926,11 @@ def build_html_report(result: Dict[str, Any]) -> str:
               <h3>{esc(name)}</h3>
               <div class="toggle-sub">Profile &amp; data quality</div>
             </div>
-            <div class="dataset-stats-inline"><span>{rows:,} rows</span><span>{cols} cols</span></div>
+            <div class="dataset-stats-inline"><span>{rows:,} rows</span><span>{cols} cols</span>{score_html}</div>
           </button>
           <div class="dataset-body" id="dbc-{i}">
             {path_html}
+            {clean_html}
             <h4 class="block-title">Profile</h4>
             {profile_tbl}
             <h4 class="block-title">Data quality</h4>
@@ -1116,6 +1198,7 @@ def build_html_report(result: Dict[str, Any]) -> str:
   <div class="kpi"><div class="label">Total columns</div><div class="val">{total_cols:,}</div></div>
   <div class="kpi"><div class="label">Memory (bytes)</div><div class="val">{total_bytes:,}</div></div>
 </div>
+{exec_summary_html}
 </section>
 {llm_section_html}
 <section id="datasets" class="datasets-section">
