@@ -1,6 +1,6 @@
 # Data sources for Intelligent Data Assessment.
 # Use environment variables or Azure Key Vault for secrets in production.
-#
+
 # Multiple databases or Blob containers: add another - type: database / azure_blob block.
 # Optional per block: id: crm   or   label: warehouse   (used in dataset names when multiples exist).
 

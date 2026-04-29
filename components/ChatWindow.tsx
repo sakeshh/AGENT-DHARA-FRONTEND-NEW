@@ -440,33 +440,7 @@ export default function ChatWindow() {
       (typeof text === 'string' && text.toLowerCase().includes('metadata —')) ||
       (typeof text === 'string' && text.toLowerCase().includes('metadata (selected'));
 
-    const uiHtml = typeof payload?.ui_html === 'string' ? payload.ui_html : null;
-    if (uiHtml && uiHtml.trim()) {
-      return (
-        <div className="h-[78vh] w-full overflow-hidden rounded-xl border border-black/10 bg-white shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
-          <iframe
-            title="Details"
-            className="h-full w-full"
-            srcDoc={uiHtml}
-            sandbox="allow-scripts allow-same-origin"
-          />
-        </div>
-      );
-    }
-
-    const reportHtml = typeof payload?.report_html === 'string' ? payload.report_html : null;
-    if (reportHtml && reportHtml.trim()) {
-      return (
-        <div className="h-[78vh] w-full overflow-hidden rounded-xl border border-black/10 bg-white shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
-          <iframe
-            title="Assessment report"
-            className="h-full w-full"
-            srcDoc={reportHtml}
-            sandbox="allow-scripts allow-same-origin"
-          />
-        </div>
-      );
-    }
+    // Do not render payload.ui_html as an iframe; prefer chat-native markdown/tables.
 
     const reportMd = typeof payload?.report_markdown === 'string' ? payload.report_markdown : null;
     if (reportMd && reportMd.trim()) {
@@ -540,6 +514,20 @@ export default function ChatWindow() {
         >
           {reportMd}
         </ReactMarkdown>
+      );
+    }
+
+    const reportHtml = typeof payload?.report_html === 'string' ? payload.report_html : null;
+    if (reportHtml && reportHtml.trim()) {
+      return (
+        <div className="h-[78vh] w-full overflow-hidden rounded-xl border border-black/10 bg-white shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
+          <iframe
+            title="Assessment report"
+            className="h-full w-full"
+            srcDoc={reportHtml}
+            sandbox="allow-scripts allow-same-origin"
+          />
+        </div>
       );
     }
 
@@ -933,8 +921,7 @@ export default function ChatWindow() {
         <AnimatePresence initial={false}>
           {messages.map((message, idx) => {
             const isUser = message.sender === 'user';
-            const isHtmlReportMessage =
-              message.sender === 'bot' && typeof (message as any)?.payload?.report_html === 'string';
+            const isHtmlReportMessage = false;
             const staggerDelay = Math.min(idx * 0.04, 0.2);
             const opts = Array.isArray(message.options) ? message.options : [];
             const hasOptions = message.sender === 'bot' && opts.length > 0;

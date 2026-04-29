@@ -21,7 +21,6 @@ from agent.mcp_interface import (
     load_path,
     process_uploaded_file,
 )
-from agent.transformation_agent import generate_transformation_rules_with_suggestions
 from agent.requirements_to_config import build_user_request_text, requirements_to_selected_sources
 
 # Load local .env automatically (developer convenience; do not rely on this in production).
@@ -59,12 +58,6 @@ class StreamPayload(BaseModel):
 class PathPayload(BaseModel):
     path: str
 
-
-class GenerateRulesPayload(BaseModel):
-    """Either send assessment result (from /run) or config to run assessment first."""
-    assessment: Optional[Dict[str, Any]] = None
-    config: Optional[str] = None
-    language: Optional[str] = "sql"
 
 class AssessPayload(BaseModel):
     """
@@ -196,37 +189,6 @@ def api_load_path(payload: PathPayload) -> Dict[str, Any]:
     data = load_path(payload.path)
     return {"datasets": list(data.keys()), "count": len(data)}
 
-
-@app.post("/apply_transformations")
-def api_apply_transformations(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Apply rule-based transformations to clean data.
-    Body: {"assessment": {...}, "datasets": {name: list of dicts (rows)} }.
-    Returns only an overall transform log/summary (no per-dataset cleaned previews).
-    """
-    assessment = payload.get("assessment")
-    datasets_raw = payload.get("datasets", {})
-    if not assessment or not datasets_raw:
-        return {"error": "Provide 'assessment' (from /run) and 'datasets' (dict of dataset_name: list of row dicts)"}
-    import pandas as pd
-    dfs = {k: pd.DataFrame(v) if isinstance(v, list) else v for k, v in datasets_raw.items()}
-    from agent.mcp_interface import apply_transformations_and_return_cleaned
-    return apply_transformations_and_return_cleaned(assessment, dfs)
-
-
-@app.post("/generate_transformation_rules")
-def api_generate_transformation_rules(payload: GenerateRulesPayload) -> Dict[str, Any]:
-    """Step 3: Generate transformation rules/code via Azure Foundry. Send assessment from /run or config to run first."""
-    if payload.assessment:
-        assessment_result = payload.assessment
-    elif payload.config and (payload.config or "").strip():
-        assessment_result = run_assessment(payload.config.strip())
-    else:
-        return {"error": "Provide either 'assessment' (full result from /run) or 'config' (YAML/JSON string) to run assessment first."}
-    lang = (payload.language or "sql").lower()
-    if lang not in ("sql", "python", "both"):
-        lang = "sql"
-    return generate_transformation_rules_with_suggestions(assessment_result, language=lang)
 
 @app.get("/sources")
 def api_sources() -> Dict[str, Any]:

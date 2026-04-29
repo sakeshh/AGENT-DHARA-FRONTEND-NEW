@@ -225,17 +225,6 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--azure-output-container", default="output", help="Output container name")
     p.add_argument("--skip-azure", action="store_true", help="Do not access Azure Blob (offline)")
     p.add_argument("--dq-thresholds", default=None, help="Path to dq_thresholds.yaml (default: config/dq_thresholds.yaml)")
-    # Step 3: Azure Foundry agent–generated transformation rules
-    p.add_argument("--generate-transformation-rules", action="store_true", help="Call Azure OpenAI to generate transformation rules/code from DQ issues")
-    p.add_argument("--export-transformation-rules", default=None, help="Write Step 3 output (suggestions + agent rules) to this path (JSON)")
-    p.add_argument("--transformation-language", default="sql", choices=["sql", "python", "both"], help="Language hint for generated code (sql|python|both)")
-    # Apply transformations and output cleaned data
-    p.add_argument("--apply-transformations", action="store_true", help="Apply rule-based transforms and output cleaned data")
-    p.add_argument("--approved-transforms-file", default=None, help="JSON file with user-approved transforms (from pending approval)")
-    p.add_argument("--output-cleaned-dir", default=None, help="Local directory to write cleaned files")
-    p.add_argument("--cleaned-container", default=None, help="Azure Blob container for cleaned files (uses same connection as output)")
-    p.add_argument("--output-pending-approval", default=None, help="Write pending approval JSON (use with --generate-transformation-rules) for user to review")
-    p.add_argument("--use-rule-based", action="store_true", help="Use rule-based suggestions instead of AI rules in pending approval (default: use AI when available)")
     p.add_argument(
         "--llm-insights",
         action="store_true",
@@ -417,7 +406,7 @@ def _attach_run_metadata_and_suggestions(
     started_at_iso: str,
     sources_path: str,
 ) -> None:
-    """Add run timing, DQ rollups, and rule-based transformation suggestions to the report payload."""
+    """Add run timing, DQ rollups, and report suggestion metadata."""
     from datetime import datetime, timezone
 
     dq = result.get("data_quality_issues") or {}
@@ -447,7 +436,7 @@ def _attach_run_metadata_and_suggestions(
 
         result["transformation_suggestions"] = suggest_transformations(result)
     except Exception as e:
-        logger.warning("Transformation suggestions skipped: %s", e)
+        logger.warning("Report suggestions skipped: %s", e)
         result["transformation_suggestions"] = {
             "suggested_transformations": [],
             "summary": {"total_suggestions": 0, "by_action": {}},
@@ -507,7 +496,7 @@ def build_markdown_report(result: Dict[str, Any]) -> str:
     if sug and not ts.get("_error"):
         md.append("**Suggested fixes (rule-based)**")
         md.append(
-            f"*{ts.get('summary', {}).get('total_suggestions', len(sug))} suggestions — use `--export-transformation-rules` or Stage-3 flow for full manifests.*"
+            f"*{ts.get('summary', {}).get('total_suggestions', len(sug))} suggestions based on current DQ signals.*"
         )
         _rank = {"high": 0, "medium": 1, "low": 2}
         for s in sorted(sug, key=lambda x: (_rank.get((x.get("severity") or "low").lower(), 3), str(x.get("dataset"))))[
@@ -1061,7 +1050,7 @@ def build_html_report(result: Dict[str, Any]) -> str:
         _sug_inner = (
             '<p class="section-lead">Rule-based actions from DQ signals. Showing <strong>'
             f"{len(top_sug)}</strong> of <strong>{total_ct}</strong>. Full manifest: "
-            "<code>--export-transformation-rules</code>.</p>"
+            "the assessment JSON output.</p>"
             '<div class="table-wrap"><table class="data-table suggestions-table"><thead><tr>'
             "<th>Action</th><th>Dataset</th><th>Column</th><th>Severity</th><th>Context</th>"
             "</tr></thead><tbody>"
@@ -1697,7 +1686,7 @@ def main():
         source_cfg,
         additional_data=blob_data,
         dq_thresholds_path=dq_thresholds_path,
-        return_datasets=args.apply_transformations,
+        return_datasets=False,
         location_types=location_filter,
     )
     _attach_run_metadata_and_suggestions(result, _run_t0, _run_started, args.sources or "")
@@ -1802,61 +1791,6 @@ def main():
             _export(args.export_pf_eval, pf_eval_bytes, None, os.path.basename(args.export_pf_eval), "PF evaluation")
         except Exception as e:
             logger.exception("Inline evaluation failed: %s", e)
-
-    # Apply transformations and output cleaned data
-    if args.apply_transformations:
-        datasets_raw = result.pop("_datasets", {})
-        if datasets_raw:
-            try:
-                from agent.data_transformer import apply_transformations, infer_output_format, write_dataframe_by_format
-                import io
-                approved = None
-                if args.approved_transforms_file and os.path.isfile(args.approved_transforms_file):
-                    with open(args.approved_transforms_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    approved = data if isinstance(data, list) else (data.get("suggested_transforms") or [])
-                    if not isinstance(approved, list):
-                        approved = []
-                    logger.info("Loaded %d approved transforms from %s", len(approved), args.approved_transforms_file)
-                cleaned_dfs, transform_log = apply_transformations(
-                    datasets_raw, result, approved_transforms=approved
-                )
-                logger.info("Applied %d transformation actions", transform_log.get("total_actions", 0))
-                logger.info(
-                    "Transformations applied. Cleaned dataset export is disabled; "
-                    "set up a separate export step if you need cleaned files."
-                )
-            except Exception as e:
-                logger.exception("Apply transformations failed: %s", e)
-        else:
-            logger.warning("No datasets to transform (add filesystem or azure_blob source)")
-
-    # Step 3: Generate transformation rules via Azure Foundry / OpenAI
-    step3_result = None
-    if args.generate_transformation_rules:
-        try:
-            from agent.transformation_agent import generate_transformation_rules_with_suggestions
-            from agent.data_transformer import build_pending_approval_for_user
-            step3_result = generate_transformation_rules_with_suggestions(result, language=args.transformation_language)
-            if args.export_transformation_rules:
-                step3_bytes = json.dumps(step3_result, ensure_ascii=False, indent=2, default=to_json_safe).encode("utf-8")
-                _export(args.export_transformation_rules, step3_bytes, None, os.path.basename(args.export_transformation_rules), "transformation rules")
-            if args.output_pending_approval:
-                pending = build_pending_approval_for_user(
-                    result,
-                    agent_result=step3_result.get("agent_generated") if step3_result else None,
-                    use_agent_rules=not args.use_rule_based,
-                )
-                _ensure_parent(args.output_pending_approval)
-                with open(args.output_pending_approval, "w", encoding="utf-8") as f:
-                    json.dump(pending, f, ensure_ascii=False, indent=2, default=to_json_safe)
-                logger.info("Wrote pending approval to %s - review and save as approved_transforms.json", args.output_pending_approval)
-            if step3_result and step3_result.get("agent_generated", {}).get("error"):
-                logger.warning("Step 3 agent error: %s", step3_result["agent_generated"]["error"])
-            elif step3_result and step3_result.get("agent_generated", {}).get("success"):
-                logger.info("Step 3: generated %d code blocks", len(step3_result["agent_generated"].get("code_blocks", [])))
-        except Exception as e:
-            logger.exception("Step 3 transformation rules failed: %s", e)
 
     print("\n=== FULL RESULT (JSON) ===")
     print(json.dumps(result, indent=2, default=to_json_safe))

@@ -215,7 +215,7 @@ class AzureSQLPythonNetConnector:
         finally:
             conn.Close()
 
-    def execute_select(self, sql: str, max_rows: int = 200) -> pd.DataFrame:
+    def execute_select(self, sql: str, max_rows: Optional[int] = None) -> pd.DataFrame:
         """
         Execute a SELECT query (read-only). Reject non-SELECT statements.
         """
@@ -235,11 +235,10 @@ class AzureSQLPythonNetConnector:
         banned = ("insert", "update", "delete", "merge", "drop", "alter", "create", "exec", "execute", "truncate")
         if any(re.search(rf"\\b{kw}\\b", q_norm) for kw in banned):
             raise ValueError("Query contains forbidden keywords.")
-        max_rows = int(max_rows) if max_rows and max_rows > 0 else 200
-        max_rows = max(1, min(max_rows, 5000))
-        # If query doesn't include TOP, wrap it.
-        if " top " not in q_norm[:120]:
-            q = f"SELECT TOP {max_rows} * FROM ({q}) AS q"
+        if max_rows is not None:
+            max_rows = int(max_rows) if max_rows and max_rows > 0 else 0
+            if max_rows > 0 and " top " not in q_norm[:120]:
+                q = f"SELECT TOP {max_rows} * FROM ({q}) AS q"
         conn = self._connect()
         try:
             conn.Open()

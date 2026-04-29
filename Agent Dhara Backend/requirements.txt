@@ -9,7 +9,7 @@ azure-storage-blob>=12.0.0
 # Optional: Azure Identity (managed identity)
 azure-identity>=1.12.0
 
-# Step 3: Azure OpenAI / Foundry for transformation rule generation
+# Azure OpenAI client support
 openai>=1.0.0
 
 # Optional HTTP APIs

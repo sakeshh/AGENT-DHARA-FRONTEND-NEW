@@ -32,12 +32,11 @@ Rules:
 - Output ONLY SQL, no commentary.
 - Must be a single SELECT statement.
 - Never modify data (no INSERT/UPDATE/DELETE/MERGE/DDL/EXEC).
-- Prefer TOP and avoid returning too many columns/rows.
 - Use only the provided table and columns.
 """
 
 
-def nl_to_sql_select(*, question: str, table: str, columns: List[Dict[str, Any]], max_rows: int = 200) -> str:
+def nl_to_sql_select(*, question: str, table: str, columns: List[Dict[str, Any]], max_rows: Optional[int] = None) -> str:
     """
     Use OpenAI (or Azure OpenAI) to translate question → SELECT query for one table.
     """
@@ -65,9 +64,10 @@ def nl_to_sql_select(*, question: str, table: str, columns: List[Dict[str, Any]]
         )
 
     cols_compact = ", ".join([f"{c.get('name')}({c.get('type')})" for c in columns[:80]])
+    limit_line = f"Row limit: {max_rows}" if max_rows is not None else "Row limit: no enforced limit"
     user = f"""Table: {table}
 Columns: {cols_compact}
-Row limit: {max_rows}
+{limit_line}
 
 User question: {question}
 """

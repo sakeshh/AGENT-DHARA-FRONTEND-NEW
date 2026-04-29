@@ -2,7 +2,7 @@
 LLM-assisted narrative on top of deterministic assessment (Azure OpenAI).
 
 Uses only aggregated metadata (counts, issue types) — no raw cell values — to reduce PII exposure.
-Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT (same as Step 3).
+Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT.
 """
 
 from __future__ import annotations

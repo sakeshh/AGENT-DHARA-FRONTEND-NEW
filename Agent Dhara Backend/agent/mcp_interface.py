@@ -206,16 +206,3 @@ def read_file(path: str) -> str:
         return f.read()
 
 
-def apply_transformations_and_return_cleaned(
-    assessment_result: Dict[str, Any],
-    datasets_raw: Dict[str, "pd.DataFrame"],
-) -> Dict[str, Any]:
-    """
-    Apply rule-based transformations and return only the overall transformation log.
-
-    Cleaned dataset previews are intentionally not returned to keep API responses compact.
-    """
-    from agent.data_transformer import apply_transformations
-
-    cleaned, log = apply_transformations(datasets_raw, assessment_result)
-    return {"cleaned_summary": {"datasets_cleaned": len(cleaned)}, "transform_log": log}

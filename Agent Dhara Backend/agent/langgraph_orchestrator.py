@@ -4,7 +4,6 @@ LangGraph-based multi-agent orchestration for Agent Dhara Backend.
 This module defines a small LangGraph workflow:
 - Route user request (MasterAgent.plan)
 - Extract per selected source location (ExtractionAgent, parallel)
-- Optionally generate transformation suggestions/rules (existing transformation agent)
 
 The workflow is designed to be callable from:
 - CLI glue code (future)
@@ -48,9 +47,6 @@ class OrchestratorState(TypedDict, total=False):
     # Outputs
     extractions: List[Dict[str, Any]]
     extraction_errors: List[Dict[str, Any]]
-    transformation: Dict[str, Any]
-
-
 def _node_route(state: OrchestratorState) -> OrchestratorState:
     master = MasterAgent()
     p = master.plan(state.get("user_request", ""))
@@ -101,31 +97,6 @@ def _node_extract(state: OrchestratorState) -> OrchestratorState:
     return asyncio.run(_node_extract_async(state))
 
 
-def _node_transform(state: OrchestratorState) -> OrchestratorState:
-    """
-    Use the existing transformation agent helper to generate suggested + LLM rules.
-
-    We aggregate extraction results by running transformation per extraction result.
-    This keeps failures isolated per source.
-    """
-    plan = state.get("plan") or {}
-    if not plan.get("do_transform"):
-        return {"transformation": {"skipped": True}}
-
-    from agent.transformation_agent import generate_transformation_rules_with_suggestions
-
-    outputs: List[Dict[str, Any]] = []
-    for ex in state.get("extractions", []) or []:
-        try:
-            assessment_result = ex.get("result") or {}
-            out = generate_transformation_rules_with_suggestions(assessment_result, language="sql")
-            outputs.append({"source": ex.get("source"), "output": out, "success": True})
-        except Exception as e:
-            outputs.append({"source": ex.get("source"), "error": str(e), "success": False})
-
-    return {"transformation": {"per_source": outputs}}
-
-
 def build_orchestrator_graph():
     """
     Build and compile the LangGraph orchestrator.
@@ -138,12 +109,10 @@ def build_orchestrator_graph():
     g = StateGraph(OrchestratorState)
     g.add_node("route", _node_route)
     g.add_node("extract", _node_extract)
-    g.add_node("transform", _node_transform)
 
     g.set_entry_point("route")
     g.add_edge("route", "extract")
-    g.add_edge("extract", "transform")
-    g.add_edge("transform", END)
+    g.add_edge("extract", END)
     return g.compile()
 
 

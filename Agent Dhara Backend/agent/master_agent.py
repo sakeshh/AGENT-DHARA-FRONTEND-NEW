@@ -2,8 +2,8 @@
 Master agent for LangGraph-based orchestration.
 
 Responsibilities:
-- Maintains a registry of sub-agents (ExtractionAgent now; can be extended to Assessment/Transformation agents).
-- Receives a user request and decides which steps to run (extract / assess / transform).
+- Maintains a registry of sub-agents (ExtractionAgent now; can be extended later).
+- Receives a user request and decides which steps to run.
 - Coordinates data flow between steps (via LangGraph state in `agent.langgraph_orchestrator`).
 
 This module intentionally keeps the routing logic simple and deterministic:
@@ -140,20 +140,7 @@ class MasterAgent:
         """
         Determine which sub-agents to trigger based on the user's request.
         """
-        txt = (user_request or "").lower()
-        wants_transform = any(
-            k in txt
-            for k in (
-                "transform",
-                "transformation",
-                "clean",
-                "cleaning",
-                "suggest fixes",
-                "generate rules",
-                "generate transformation",
-            )
-        )
-        return Plan(do_extract=True, do_transform=wants_transform)
+        return Plan(do_extract=True, do_transform=False)
 
     def infer_selected_sources_from_query(self, user_request: str) -> List[str]:
         """

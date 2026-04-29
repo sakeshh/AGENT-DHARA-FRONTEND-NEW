@@ -1640,23 +1640,16 @@ def _node_assess_selected_local_files(state: ChatState) -> ChatState:
     import pandas as pd
     from agent.intelligent_data_assessment import load_and_profile
 
-    # No hard default limits; set env ASSESS_MAX_ROWS_PER_LOCAL_FILE to cap.
-    raw = (os.environ.get("ASSESS_MAX_ROWS_PER_LOCAL_FILE") or "").strip()
-    max_rows = int(raw) if raw else 0
-    if max_rows < 0:
-        max_rows = 0
-
     dfs = {}
     for name in selected:
         p = os.path.join(root, name)
         if not os.path.isfile(p):
             return {"reply": f"File not found: {p}", "payload": {"file": name}}
         low = p.lower()
-        nrows = (max_rows if max_rows > 0 else None)
         if low.endswith(".csv"):
-            df = pd.read_csv(p, low_memory=False, nrows=nrows)
+            df = pd.read_csv(p, low_memory=False)
         elif low.endswith(".tsv"):
-            df = pd.read_csv(p, sep="\t", low_memory=False, nrows=nrows)
+            df = pd.read_csv(p, sep="\t", low_memory=False)
         elif low.endswith(".jsonl"):
             rows = []
             with open(p, "r", encoding="utf-8") as f:
@@ -1668,8 +1661,6 @@ def _node_assess_selected_local_files(state: ChatState) -> ChatState:
                         rows.append(json.loads(line))
                     except Exception:
                         rows.append({"value": line})
-                    if max_rows > 0 and len(rows) >= max_rows:
-                        break
             df = pd.json_normalize(rows, max_level=1) if rows else pd.DataFrame()
         else:
             # full read for other formats
@@ -1682,11 +1673,10 @@ def _node_assess_selected_local_files(state: ChatState) -> ChatState:
         dfs[name] = df
     result = load_and_profile({"name": "local", "locations": []}, additional_data=dfs)
     _override_source_root_for_datasets(result, list(dfs.keys()), os.path.abspath(root))
-    sampled = f" (sampled up to {max_rows} rows/file where applicable)" if max_rows > 0 else ""
     # Only return the tabular report in chat (no legacy/freeform report text).
     report_md = _build_report_tables_markdown(result)
     report_html = _render_report_html(result)
-    reply = report_md or f"Assessment complete for {len(dfs)} local file(s){sampled}."
+    reply = report_md or f"Assessment complete for {len(dfs)} local file(s)."
     artifacts = _write_report_artifacts(result=result, report_markdown=report_md, report_html=report_html)
     # Cache for follow-up DQ questions
     ctx["last_assessment_result"] = result
@@ -1714,20 +1704,13 @@ def _node_assess_selected_files(state: ChatState) -> ChatState:
     from agent.mcp_clients import _single_location_config  # type: ignore
     from agent.mcp_interface import load_selected_blob_datasets, run_assessment
 
-    # No hard default limits; set env ASSESS_MAX_ROWS_PER_BLOB / ASSESS_MAX_BLOB_BYTES to cap.
-    import os
-    raw_rows = (os.environ.get("ASSESS_MAX_ROWS_PER_BLOB") or "").strip()
-    raw_bytes = (os.environ.get("ASSESS_MAX_BLOB_BYTES") or "").strip()
-    max_rows = int(raw_rows) if raw_rows else None
-    max_bytes = int(raw_bytes) if raw_bytes else None
-
     cfg_text = _single_location_config({"name": source_root.get("name") or "source"}, blob_locs[blob_loc_idx])
     dfs = load_selected_blob_datasets(
         cfg_text,
         location_index=0,
         blob_names=list(selected),
-        max_rows=max_rows,
-        max_bytes=max_bytes,
+        max_rows=None,
+        max_bytes=None,
     )
     # Run assessment purely over the loaded blobs (via additional_data).
     result = run_assessment(cfg_text, additional_data=dfs)
@@ -1825,8 +1808,6 @@ def _node_preview_local_file(state: ChatState) -> ChatState:
                     rows.append(json.loads(line))
                 except Exception:
                     rows.append({"value": line})
-                if len(rows) >= 500:
-                    break
         df = pd.json_normalize(rows, max_level=1) if rows else pd.DataFrame()
     elif low.endswith((".xlsx", ".xls")):
         df = pd.read_excel(p)
@@ -1895,7 +1876,7 @@ def _node_preview_blob_file(state: ChatState) -> ChatState:
     from agent.mcp_interface import load_selected_blob_datasets  # type: ignore
 
     cfg_text = _single_location_config({"name": source_root.get("name") or "source"}, blob_locs[blob_loc_idx])
-    dfs = load_selected_blob_datasets(cfg_text, location_index=0, blob_names=[blob_name], max_rows=500, max_bytes=None)
+    dfs = load_selected_blob_datasets(cfg_text, location_index=0, blob_names=[blob_name], max_rows=None, max_bytes=None)
     df = dfs.get(blob_name)
     if df is None:
         return {"reply": f"Couldn't load blob as a dataset: {blob_name}", "payload": {"file": blob_name}}
@@ -2070,17 +2051,9 @@ def _node_assess_selected_tables(state: ChatState) -> ChatState:
     conn_cfg = db_locs[db_idx].get("connection") or {}
     from connectors.azure_sql_pythonnet import AzureSQLPythonNetConnector
     from agent.intelligent_data_assessment import load_and_profile
-    import os
-
-    # No hard default limits; set env ASSESS_MAX_ROWS_PER_TABLE to cap.
-    raw = (os.environ.get("ASSESS_MAX_ROWS_PER_TABLE") or "").strip()
-    max_rows = int(raw) if raw else 0
-    if max_rows < 0:
-        max_rows = 0
 
     conn = AzureSQLPythonNetConnector(conn_cfg)
-    rows = (max_rows if max_rows > 0 else 10_000)
-    dfs = {t: conn.preview_table(t, rows) for t in selected}
+    dfs = {t: conn.load_table(t) for t in selected}
     result = load_and_profile({"name": source_root.get("name") or "source", "locations": []}, additional_data=dfs)
     # Ensure source_root reflects Azure SQL (not azure_blob from `additional_data` default).
     label = (
@@ -2089,11 +2062,10 @@ def _node_assess_selected_tables(state: ChatState) -> ChatState:
         or "__default__"
     )
     _override_source_root_for_datasets(result, list(dfs.keys()), f"__database__:{label}")
-    sampled = f" (sampled up to {rows} rows/table)" if max_rows > 0 else " (sampled up to 10,000 rows/table)"
     # Only return the tabular report in chat (no legacy/freeform report text).
     report_md = _build_report_tables_markdown(result)
     report_html = _render_report_html(result)
-    reply = report_md or f"Assessment complete for {len(dfs)} table(s){sampled}."
+    reply = report_md or f"Assessment complete for {len(dfs)} table(s)."
     artifacts = _write_report_artifacts(result=result, report_markdown=report_md, report_html=report_html)
     # Cache for follow-up DQ questions
     ctx["last_assessment_result"] = result
@@ -2467,13 +2439,13 @@ def _node_dq_table(state: ChatState) -> ChatState:
     from agent.intelligent_data_assessment import profile_dataframe, analyze_dataset_quality, load_dq_thresholds
 
     conn = AzureSQLPythonNetConnector(conn_cfg)
-    df = conn.preview_table(table, 500)
+    df = conn.load_table(table)
     profile = profile_dataframe(df)
     thresholds = load_dq_thresholds()
     dq = analyze_dataset_quality(table, df, profile, thresholds)
     summ = dq.get("summary") or {}
     reply = (
-        f"Data quality summary for {table} (sampled up to 500 rows): "
+        f"Data quality summary for {table}: "
         f"issues={summ.get('issue_count')}, high={summ.get('high_severity')}, "
         f"medium={summ.get('medium_severity')}, low={summ.get('low_severity')}."
     )
@@ -2498,14 +2470,14 @@ def _node_nl_query(state: ChatState) -> ChatState:
     try:
         from agent.sql_nl_query import nl_to_sql_select
 
-        sql = nl_to_sql_select(question=question, table=table, columns=cols, max_rows=200)
+        sql = nl_to_sql_select(question=question, table=table, columns=cols, max_rows=None)
     except Exception as e:
         return {
             "reply": f"I can't translate your question to SQL yet: {e}",
             "payload": {},
         }
     try:
-        df = conn.execute_select(sql, max_rows=200)
+        df = conn.execute_select(sql, max_rows=None)
         rows = df.head(50).to_dict(orient="records")
         from agent.pii_masking import mask_rows
         rows = mask_rows(rows)
