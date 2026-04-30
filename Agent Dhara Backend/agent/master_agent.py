@@ -13,8 +13,11 @@ we route based on keyword heuristics so the system is usable without an LLM.
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from agent.model_config import load_llm_config
 
 
 def _read_text(path: str) -> str:
@@ -121,6 +124,8 @@ class Plan:
     """
 
     do_extract: bool = True
+    do_dq_check: bool = True
+    do_dq_recommendations: bool = False
     do_transform: bool = False
 
 
@@ -140,7 +145,131 @@ class MasterAgent:
         """
         Determine which sub-agents to trigger based on the user's request.
         """
-        return Plan(do_extract=True, do_transform=False)
+        txt = (user_request or "").lower()
+
+        # Try LLM routing first (production intent understanding).
+        cfg = load_llm_config(purpose="router")
+        if cfg is not None:
+            try:
+                system = (
+                    "You are a routing controller for a data assessment system.\n"
+                    "Return ONLY valid JSON. No markdown.\n\n"
+                    "Choose which steps to run based on the user request.\n"
+                    "Schema discovery is done by listing tables/files; extraction runs profiling+D Q.\n"
+                    "If user asks to clean/fix/transform, enable dq_recommendations and transform.\n\n"
+                    "JSON schema:\n"
+                    "{\n"
+                    '  "do_extract": boolean,\n'
+                    '  "do_dq_check": boolean,\n'
+                    '  "do_dq_recommendations": boolean,\n'
+                    '  "do_transform": boolean,\n'
+                    '  "reason": string\n'
+                    "}\n"
+                )
+                prompt = json.dumps({"user_request": user_request}, ensure_ascii=False)
+
+                if cfg.provider == "azure_openai":
+                    from openai import AzureOpenAI  # type: ignore
+
+                    client = AzureOpenAI(
+                        api_key=cfg.api_key,
+                        api_version=cfg.api_version or "2024-02-01",
+                        azure_endpoint=cfg.endpoint,
+                    )
+                    resp = client.chat.completions.create(
+                        model=cfg.model,
+                        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                        temperature=0.0,
+                        max_tokens=180,
+                    )
+                else:
+                    from openai import OpenAI  # type: ignore
+
+                    client = OpenAI(api_key=cfg.api_key)
+                    resp = client.chat.completions.create(
+                        model=cfg.model,
+                        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                        temperature=0.0,
+                        max_tokens=180,
+                    )
+                raw = (resp.choices[0].message.content or "").strip()
+                obj = json.loads(raw)
+                return Plan(
+                    do_extract=bool(obj.get("do_extract", True)),
+                    do_dq_check=bool(obj.get("do_dq_check", True)),
+                    do_dq_recommendations=bool(obj.get("do_dq_recommendations", False)),
+                    do_transform=bool(obj.get("do_transform", False)),
+                )
+            except Exception:
+                # Fall back to deterministic routing below.
+                pass
+
+        wants_quality = any(
+            k in txt
+            for k in (
+                "data quality",
+                "dq",
+                "quality issue",
+                "quality issues",
+                "issues",
+                "anomaly",
+                "anomalies",
+                "profile",
+                "profiling",
+                "validate",
+                "validation",
+                "assess",
+                "assessment",
+                "cleanliness",
+            )
+        )
+        wants_transform = any(
+            k in txt
+            for k in (
+                "transform",
+                "transformation",
+                "clean",
+                "fix",
+                "repair",
+                "normalize",
+                "standardize",
+                "dedupe",
+                "deduplicate",
+                "impute",
+                "fill null",
+                "fill missing",
+                "remove null",
+                "recommend",
+                "suggest",
+            )
+        )
+        wants_extract_only = any(
+            k in txt
+            for k in (
+                "sample",
+                "preview",
+                "show data",
+                "extract",
+                "pull data",
+                "get data",
+                "fetch",
+            )
+        )
+
+        # If user asks for transform, we implicitly need DQ checks to drive suggestions.
+        if wants_transform:
+            return Plan(do_extract=True, do_dq_check=True, do_dq_recommendations=True, do_transform=True)
+
+        # DQ requests (and assessment/profile) run extraction + DQ.
+        if wants_quality:
+            return Plan(do_extract=True, do_dq_check=True, do_dq_recommendations=False, do_transform=False)
+
+        # If user explicitly asks only for extraction/sample, skip DQ/transform.
+        if wants_extract_only:
+            return Plan(do_extract=True, do_dq_check=False, do_dq_recommendations=False, do_transform=False)
+
+        # Default: extract + DQ (useful baseline).
+        return Plan(do_extract=True, do_dq_check=True, do_dq_recommendations=False, do_transform=False)
 
     def infer_selected_sources_from_query(self, user_request: str) -> List[str]:
         """

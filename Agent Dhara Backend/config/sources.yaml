@@ -24,9 +24,9 @@ source:
         account_key: eUC9IgUGh0InG9HitceV5LhyueXAmdriJGTn2MLAISZ7LjiUvnt0AW8sRLXYGOSuYDf5PrqI01PB+AStjNC1PA==
         container: datasets
 
-    - type: azure_blob_output
-      connector: azure_blob_storage
-      connection:
-        account_name: storagegjuhg
-        account_key: YOUR_ACCOUNT_KEY
-        container: output
+    # - type: azure_blob_output
+    #   connector: azure_blob_storage
+    #   connection:
+    #     account_name: storagegjuhg
+    #     account_key: YOUR_ACCOUNT_KEY
+    #     container: output

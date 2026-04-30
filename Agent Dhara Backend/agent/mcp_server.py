@@ -3,6 +3,7 @@
 import os
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
@@ -21,6 +22,7 @@ from agent.mcp_interface import (
     load_path,
     process_uploaded_file,
 )
+from agent.transformation_suggester import suggest_transformations
 from agent.requirements_to_config import build_user_request_text, requirements_to_selected_sources
 
 # Load local .env automatically (developer convenience; do not rely on this in production).
@@ -178,6 +180,106 @@ def api_list_tables(cfg: ConfigText) -> Dict[str, List[str]]:
     return {"tables": list_tables(config_text)}
 
 
+_SCHEMA_CACHE: Dict[str, Any] = {
+    "sources_path": None,
+    "sources_mtime": None,
+    "cached_at": None,
+    "tables": None,
+}
+
+
+@app.get("/schema/tables")
+def api_schema_tables(ttl_seconds: int = 30) -> Dict[str, Any]:
+    """
+    Discover Azure SQL tables from the configured sources file.
+
+    Intended for UI discovery: when a new table is added, the frontend can refresh
+    and see it without editing sources.yaml.
+
+    Caching:
+    - In-memory cache with TTL
+    - Auto-invalidates when sources.yaml mtime changes
+    """
+    sources_path = os.environ.get("MCP_SOURCES_PATH") or "config/sources.yaml"
+    ttl = max(0, int(ttl_seconds))
+
+    try:
+        mtime = os.path.getmtime(sources_path) if os.path.isfile(sources_path) else None
+    except Exception:
+        mtime = None
+
+    now = time.time()
+    cached_at = _SCHEMA_CACHE.get("cached_at")
+    same_file = _SCHEMA_CACHE.get("sources_path") == sources_path and _SCHEMA_CACHE.get("sources_mtime") == mtime
+    fresh = isinstance(cached_at, (int, float)) and (now - float(cached_at) <= ttl)
+    if same_file and fresh and isinstance(_SCHEMA_CACHE.get("tables"), list):
+        return {
+            "ok": True,
+            "sources_path": sources_path,
+            "cached": True,
+            "tables": _SCHEMA_CACHE.get("tables"),
+        }
+
+    try:
+        with open(sources_path, "r", encoding="utf-8") as f:
+            config_text = f.read()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read sources config: {e}")
+
+    try:
+        tables = list_tables(config_text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to discover tables: {e}")
+
+    _SCHEMA_CACHE.update(
+        {
+            "sources_path": sources_path,
+            "sources_mtime": mtime,
+            "cached_at": now,
+            "tables": tables,
+        }
+    )
+
+    return {"ok": True, "sources_path": sources_path, "cached": False, "tables": tables}
+
+
+@app.post("/transform_suggest")
+def api_transform_suggest(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Generate transformation suggestions from an existing assessment result.
+    Payload:
+      { "assessment_result": <dict returned by load_and_profile/run_assessment> }
+    """
+    ar = payload.get("assessment_result")
+    if not isinstance(ar, dict):
+        raise HTTPException(status_code=400, detail="assessment_result must be an object")
+    try:
+        return {"ok": True, "suggestions": suggest_transformations(ar)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dq_recommend")
+def api_dq_recommend(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Generate LLM-assisted cleaning recommendations from merged DQ issues.
+    Payload:
+      { "data_quality": <dict like load_and_profile()['data_quality_issues']>, "user_intent": "..." }
+    """
+    dq = payload.get("data_quality")
+    if not isinstance(dq, dict):
+        raise HTTPException(status_code=400, detail="data_quality must be an object")
+    user_intent = str(payload.get("user_intent") or "")
+    try:
+        from agent.dq_recommendations_agent import DQRecommendationsAgent, dq_recommendations_to_dict
+
+        agent = DQRecommendationsAgent()
+        rec = agent.recommend(merged_dq=dq, user_intent=user_intent)
+        return {"ok": True, "recommendations": dq_recommendations_to_dict(rec)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/stream")
 def api_stream(payload: StreamPayload) -> Dict[str, Any]:
     return process_stream_chunk(payload.records, name=payload.name or "stream")
@@ -217,7 +319,7 @@ def api_sources() -> Dict[str, Any]:
 
 
 @app.post("/assess")
-def api_assess(payload: AssessPayload) -> Dict[str, Any]:
+def api_assess(payload: AssessPayload, request: Request) -> Dict[str, Any]:
     """
     High-level orchestration endpoint:
     uses LangGraph orchestrator (route → extract → transform).
@@ -240,6 +342,7 @@ def api_assess(payload: AssessPayload) -> Dict[str, Any]:
         user_request=user_request,
         sources_path=sources_path,
         selected_sources=selected_sources,
+        request_id=getattr(getattr(request, "state", None), "request_id", "") or "",
     )
     return {"ok": True, "result": result}
 

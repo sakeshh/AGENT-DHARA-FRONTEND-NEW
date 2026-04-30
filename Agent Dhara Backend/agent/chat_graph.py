@@ -670,6 +670,87 @@ def _ensure_latest_assessment(state: ChatState) -> Tuple[Optional[Dict[str, Any]
     return None, "No datasets selected. Select one or more tables/files first, then ask again."
 
 
+def _node_show_cleaning_recommendations(state: ChatState) -> ChatState:
+    """
+    Show LLM-assisted (or fallback) cleaning recommendations for the current selection.
+    """
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+    try:
+        from agent.dq_recommendations_agent import DQRecommendationsAgent, dq_recommendations_to_dict
+
+        agent = DQRecommendationsAgent()
+        merged_dq = (result.get("data_quality_issues") or {}) if isinstance(result, dict) else {}
+        rec = agent.recommend(merged_dq=merged_dq, user_intent=state.get("message", "") or "")
+        result = dict(result)
+        result["dq_recommendations"] = dq_recommendations_to_dict(rec)
+    except Exception:
+        pass
+
+    # Re-show the same action buttons so user can continue the flow.
+    options = _flow_options(
+        {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+        {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
+        {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+        {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+        # Hide the currently active option (we are already showing cleaning recommendations)
+        {"id": "transform", "text": "🛠️ Suggested transformations", "send": "suggested transformations"},
+        {"id": "menu", "text": "📋 Menu", "send": "menu"},
+        {"id": "back", "text": "🔙 Back", "send": "back"},
+        {"id": "restart", "text": "✅ Restart", "send": "restart"},
+    )
+
+    return {
+        "reply": "🧹 Cleaning recommendations (based on the latest assessment):",
+        "payload": {
+            "step": "report",
+            "result": result,
+            "ui": {"show_cleaning": True, "show_transform": False, "only_panel": "cleaning"},
+            "options": options,
+        },
+    }
+
+
+def _node_show_transform_suggestions(state: ChatState) -> ChatState:
+    """
+    Show suggested transformations for the current selection.
+    """
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+    try:
+        from agent.transformation_suggester import suggest_transformations
+
+        sug = suggest_transformations(result)
+        result = dict(result)
+        result["transform_suggestions"] = {"sources": {"result": sug}}
+    except Exception:
+        pass
+
+    options = _flow_options(
+        {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+        {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
+        {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+        {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+        {"id": "clean", "text": "🧹 Cleaning recommendations", "send": "cleaning recommendations"},
+        # Hide the currently active option (we are already showing transform suggestions)
+        {"id": "menu", "text": "📋 Menu", "send": "menu"},
+        {"id": "back", "text": "🔙 Back", "send": "back"},
+        {"id": "restart", "text": "✅ Restart", "send": "restart"},
+    )
+
+    return {
+        "reply": "🛠️ Suggested transformations (based on the latest assessment):",
+        "payload": {
+            "step": "report",
+            "result": result,
+            "ui": {"show_cleaning": False, "show_transform": True, "only_panel": "transform"},
+            "options": options,
+        },
+    }
+
+
 def _node_show_null_columns(state: ChatState) -> ChatState:
     """
     Show columns that have nulls / placeholder-nulls based on the latest assessment result.
@@ -986,6 +1067,23 @@ def _node_route(state: ChatState) -> ChatState:
         return {"action": ("preview_selected_file" if has_selected_files else "preview_table"), "action_args": {"n": 10}}
     if raw in ("generate report", "report", "generate a report"):
         return {"action": ("generate_report_selected_files" if has_selected_files else "generate_report_selected"), "action_args": {}}
+    if raw in (
+        "cleaning recommendations",
+        "cleaning recommendation",
+        "cleaning plan",
+        "recommend cleaning",
+        "cleaning recs",
+    ):
+        return {"action": "show_cleaning_recommendations", "action_args": {}}
+    if raw in (
+        "suggested transformations",
+        "suggest transformations",
+        "transform suggestions",
+        "transformation suggestions",
+        "suggested fixes",
+        "suggest fixes",
+    ):
+        return {"action": "show_transform_suggestions", "action_args": {}}
 
     # Deterministic selection commands (avoid LLM dropping indices).
     # Supports:
@@ -1419,6 +1517,7 @@ def _node_select_blob_files(state: ChatState) -> ChatState:
         out = _node_assess_selected_files(state)
         out["reply"] = "✅ Selected File(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n📑 Report:\n" + (out.get("reply") or "")
         out["payload"]["step"] = "report"
+        out["payload"]["ui"] = {"show_cleaning": False, "show_transform": False}
         out["payload"]["selected_files"] = selected
         out["payload"]["options"] = _flow_options(
             {"id": "back", "text": "🔙 Back", "send": "back"},
@@ -1438,10 +1537,10 @@ def _node_select_blob_files(state: ChatState) -> ChatState:
             "selected_files": selected,
             "count": len(selected),
             "options": _flow_options(
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
                 {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
                 {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
                 {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
-                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
                 {"id": "menu", "text": "📋 Menu", "send": "menu"},
                 {"id": "back", "text": "🔙 Back", "send": "back"},
                 {"id": "restart", "text": "✅ Restart", "send": "restart"},
@@ -1509,6 +1608,7 @@ def _node_select_local_files(state: ChatState) -> ChatState:
         out = _node_assess_selected_local_files(state)
         out["reply"] = "✅ Selected File(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n📑 Report:\n" + (out.get("reply") or "")
         out["payload"]["step"] = "report"
+        out["payload"]["ui"] = {"show_cleaning": False, "show_transform": False}
         out["payload"]["selected_local_files"] = selected
         out["payload"]["options"] = _flow_options(
             {"id": "back", "text": "🔙 Back", "send": "back"},
@@ -1528,10 +1628,10 @@ def _node_select_local_files(state: ChatState) -> ChatState:
             "selected_local_files": selected,
             "count": len(selected),
             "options": _flow_options(
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
                 {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
                 {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
                 {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
-                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
                 {"id": "menu", "text": "📋 Menu", "send": "menu"},
                 {"id": "back", "text": "🔙 Back", "send": "back"},
                 {"id": "restart", "text": "✅ Restart", "send": "restart"},
@@ -1743,11 +1843,14 @@ def _node_generate_report_selected_files(state: ChatState) -> ChatState:
     out = _node_assess_selected_files(state) if mode == "blob" else _node_assess_selected_local_files(state)
     out["payload"] = out.get("payload") or {}
     out["payload"]["step"] = "report"
+    out["payload"]["ui"] = {"show_cleaning": False, "show_transform": False}
     ctx["last_ui_step"] = "report"
     out["payload"]["options"] = _flow_options(
         {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
         {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
         {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+        {"id": "clean", "text": "🧹 Cleaning recommendations", "send": "cleaning recommendations"},
+        {"id": "transform", "text": "🛠️ Suggested transformations", "send": "suggested transformations"},
         {"id": "menu", "text": "📋 Menu", "send": "menu"},
         {"id": "back", "text": "🔙 Back", "send": "back"},
         {"id": "restart", "text": "✅ Restart", "send": "restart"},
@@ -2150,6 +2253,7 @@ def _node_select_tables(state: ChatState) -> ChatState:
         out = _node_assess_selected_tables(state)
         out["reply"] = "✅ Selected Table(s):\n" + "\n".join([f"- {n}" for n in selected]) + "\n\n📑 Report:\n" + (out.get("reply") or "")
         out["payload"]["step"] = "report"
+        out["payload"]["ui"] = {"show_cleaning": False, "show_transform": False}
         out["payload"]["selected_tables"] = selected
         out["payload"]["options"] = _flow_options(
             {"id": "back", "text": "🔙 Back", "send": "back"},
@@ -2169,10 +2273,10 @@ def _node_select_tables(state: ChatState) -> ChatState:
             "selected_tables": selected,
             "count": len(selected),
             "options": _flow_options(
+                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
                 {"id": "head", "text": "📊 View top 10 rows", "send": "preview table"},
                 {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
                 {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
-                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
                 {"id": "menu", "text": "📋 Menu", "send": "menu"},
                 {"id": "back", "text": "🔙 Back", "send": "back"},
                 {"id": "restart", "text": "✅ Restart", "send": "restart"},
@@ -2248,12 +2352,15 @@ def _node_generate_report_selected(state: ChatState) -> ChatState:
     out = _node_assess_selected_tables(state)
     out["payload"] = out.get("payload") or {}
     out["payload"]["step"] = "report"
+    out["payload"]["ui"] = {"show_cleaning": False, "show_transform": False}
     # Mark step so "back" can return to the table menu.
     ctx["last_ui_step"] = "report"
     out["payload"]["options"] = _flow_options(
         {"id": "head", "text": "📊 View top 10 rows", "send": "preview table"},
         {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
         {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+        {"id": "clean", "text": "🧹 Cleaning recommendations", "send": "cleaning recommendations"},
+        {"id": "transform", "text": "🛠️ Suggested transformations", "send": "suggested transformations"},
         # Hide "Generate report" right after generating a report; it will reappear
         # when the user selects another action (schema/rows/metadata) that returns
         # the standard view menu.
@@ -2708,6 +2815,8 @@ def build_chat_graph():
     g.add_node("preview_table", _node_preview_table)
     g.add_node("show_metadata", _node_show_metadata)
     g.add_node("generate_report_selected", _node_generate_report_selected)
+    g.add_node("show_cleaning_recommendations", _node_show_cleaning_recommendations)
+    g.add_node("show_transform_suggestions", _node_show_transform_suggestions)
     g.add_node("dq_table", _node_dq_table)
     g.add_node("nl_query", _node_nl_query)
     g.add_node("show_null_columns", _node_show_null_columns)
@@ -2752,6 +2861,8 @@ def build_chat_graph():
             "preview_table": "preview_table",
             "show_metadata": "show_metadata",
             "generate_report_selected": "generate_report_selected",
+            "show_cleaning_recommendations": "show_cleaning_recommendations",
+            "show_transform_suggestions": "show_transform_suggestions",
             "dq_table": "dq_table",
             "nl_query": "nl_query",
             "show_null_columns": "show_null_columns",
@@ -2788,6 +2899,8 @@ def build_chat_graph():
         "preview_table",
         "show_metadata",
         "generate_report_selected",
+        "show_cleaning_recommendations",
+        "show_transform_suggestions",
         "dq_table",
         "nl_query",
         "show_null_columns",

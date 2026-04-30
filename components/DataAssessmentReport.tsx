@@ -2,11 +2,16 @@
 
 import { useMemo, useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { FaChartBar, FaExclamationTriangle, FaCheckCircle, FaThumbsUp, FaThumbsDown } from 'react-icons/fa';
+import { FaChartBar, FaExclamationTriangle, FaCheckCircle, FaThumbsUp, FaThumbsDown, FaWrench } from 'react-icons/fa';
+import ReportEnhancements from '@/components/ReportEnhancements';
 
 interface DataAssessmentReportProps {
   files: string[];
   database: string;
+  includeTransformSuggestions?: boolean;
+  onIncludeTransformSuggestionsChange?: (v: boolean) => void;
+  includeDqRecommendations?: boolean;
+  onIncludeDqRecommendationsChange?: (v: boolean) => void;
   onComplete: (data: any) => void;
   onFeedback: (liked: boolean, comment?: string) => void;
 }
@@ -96,13 +101,26 @@ function normalizeSeverity(s: any): Severity {
   return 'low';
 }
 
-export default function DataAssessmentReport({ files, database, onComplete, onFeedback }: DataAssessmentReportProps) {
+export default function DataAssessmentReport({
+  files,
+  database,
+  includeTransformSuggestions = true,
+  onIncludeTransformSuggestionsChange,
+  includeDqRecommendations = true,
+  onIncludeDqRecommendationsChange,
+  onComplete,
+  onFeedback,
+}: DataAssessmentReportProps) {
   const [assessing, setAssessing] = useState(true);
   const [progress, setProgress] = useState(0);
   const [assessment, setAssessment] = useState<BackendAssessment | null>(null);
   const [reportMarkdown, setReportMarkdown] = useState<string | null>(null);
   const [reportHtml, setReportHtml] = useState<string | null>(null);
   const [showFeedback, setShowFeedback] = useState(false);
+  const [transformEnabled, setTransformEnabled] = useState<boolean>(Boolean(includeTransformSuggestions));
+  const [transformSuggestions, setTransformSuggestions] = useState<any>(null);
+  const [transformLoading, setTransformLoading] = useState(false);
+  const [dqRecEnabled, setDqRecEnabled] = useState<boolean>(Boolean(includeDqRecommendations));
 
   const summaries: UiDatasetSummary[] = useMemo(() => {
     const datasets = assessment?.datasets || {};
@@ -124,7 +142,17 @@ export default function DataAssessmentReport({ files, database, onComplete, onFe
 
   useEffect(() => {
     runAssessment();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Keep local state in sync with parent toggle if provided
+  useEffect(() => {
+    setTransformEnabled(Boolean(includeTransformSuggestions));
+  }, [includeTransformSuggestions]);
+
+  useEffect(() => {
+    setDqRecEnabled(Boolean(includeDqRecommendations));
+  }, [includeDqRecommendations]);
 
   const getSessionId = () => {
     if (typeof window === 'undefined') return 'default';
@@ -149,6 +177,7 @@ export default function DataAssessmentReport({ files, database, onComplete, onFe
   const runAssessment = async () => {
     setAssessing(true);
     setProgress(5);
+    setTransformSuggestions(null);
     try {
       const sid = getSessionId();
       const src = parseSourceToken(database);
@@ -210,8 +239,34 @@ export default function DataAssessmentReport({ files, database, onComplete, onFe
       setReportMarkdown(typeof payload?.report_markdown === 'string' ? payload.report_markdown : null);
       setReportHtml(typeof payload?.report_html === 'string' ? payload.report_html : null);
 
+      let suggestionsOut: any = null;
+      if (transformEnabled && result) {
+        setTransformLoading(true);
+        try {
+          const tr = await fetch('/api/transform-suggest', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ assessment_result: result }),
+          });
+          const trJson = await tr.json().catch(() => null);
+          suggestionsOut = trJson?.suggestions ?? null;
+          setTransformSuggestions(suggestionsOut);
+        } catch {
+          suggestionsOut = null;
+          setTransformSuggestions(null);
+        } finally {
+          setTransformLoading(false);
+        }
+      }
+
       setProgress(90);
-      onComplete({ result, report_markdown: payload?.report_markdown, report_html: payload?.report_html, report_files: payload?.report_files });
+      onComplete({
+        result,
+        report_markdown: payload?.report_markdown,
+        report_html: payload?.report_html,
+        report_files: payload?.report_files,
+        transform_suggestions: suggestionsOut,
+      });
     } catch {
       setAssessment(null);
       setReportMarkdown(null);
@@ -307,6 +362,66 @@ export default function DataAssessmentReport({ files, database, onComplete, onFe
         </div>
       </div>
 
+      {/* Transform suggestions toggle */}
+      <div className="border border-black/10 rounded-lg p-4 bg-white/90 flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <div className="p-2 rounded-lg bg-[#0070AD]/10 text-[#0070AD]">
+            <FaWrench />
+          </div>
+          <div>
+            <div className="font-semibold text-zinc-900">Include transformation suggestions</div>
+            <div className="text-sm text-black/60">Generates suggested cleaning/transform actions from detected issues</div>
+          </div>
+        </div>
+        <motion.button
+          type="button"
+          onClick={() => {
+            const next = !transformEnabled;
+            setTransformEnabled(next);
+            if (onIncludeTransformSuggestionsChange) onIncludeTransformSuggestionsChange(next);
+          }}
+          className={`px-4 py-2 rounded-xl border text-sm font-semibold transition-colors ${
+            transformEnabled
+              ? 'border-[#0070AD]/50 bg-[#0070AD]/10 text-[#0070AD] hover:bg-[#0070AD]/15'
+              : 'border-black/10 bg-white/80 text-black/60 hover:bg-white'
+          }`}
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
+        >
+          {transformEnabled ? 'On' : 'Off'}
+        </motion.button>
+      </div>
+
+      {/* DQ recommendations toggle */}
+      <div className="border border-black/10 rounded-lg p-4 bg-white/90 flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <div className="p-2 rounded-lg bg-[#0070AD]/10 text-[#0070AD]">
+            <FaWrench />
+          </div>
+          <div>
+            <div className="font-semibold text-zinc-900">Generate cleaning recommendations (LLM)</div>
+            <div className="text-sm text-black/60">Creates a prioritized plan to clean/fix issues (falls back if LLM not configured)</div>
+          </div>
+        </div>
+        <motion.button
+          type="button"
+          onClick={() => {
+            const next = !dqRecEnabled;
+            setDqRecEnabled(next);
+            if (onIncludeDqRecommendationsChange) onIncludeDqRecommendationsChange(next);
+          }}
+          className={`px-4 py-2 rounded-xl border text-sm font-semibold transition-colors ${
+            dqRecEnabled
+              ? 'border-[#0070AD]/50 bg-[#0070AD]/10 text-[#0070AD] hover:bg-[#0070AD]/15'
+              : 'border-black/10 bg-white/80 text-black/60 hover:bg-white'
+          }`}
+          whileHover={{ scale: 1.02 }}
+          whileTap={{ scale: 0.98 }}
+        >
+          {dqRecEnabled ? 'On' : 'Off'}
+        </motion.button>
+      </div>
+
       {/* Datasets summary */}
       <div className="border border-black/10 rounded-lg p-6 bg-white/90">
         <div className="flex items-center gap-3 mb-4">
@@ -349,6 +464,21 @@ export default function DataAssessmentReport({ files, database, onComplete, onFe
           </div>
         )}
       </div>
+
+      {/* Best UX panels: cleaning recommendations + transforms + advanced diagnostics */}
+      {assessment ? (
+        <ReportEnhancements
+          result={{
+            ...assessment,
+            // allow showing the already-generated transform suggestions, if present
+            transform_suggestions: transformSuggestions ? { sources: { result: transformSuggestions } } : undefined,
+          }}
+          userIntent={title}
+          enableDqRecommendations={dqRecEnabled}
+          enableTransformSuggestions={transformEnabled}
+          variant="pipeline"
+        />
+      ) : null}
 
       {/* Relationships */}
       <div className="border border-black/10 rounded-lg p-6 bg-white/90">

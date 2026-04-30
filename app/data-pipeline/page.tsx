@@ -19,6 +19,17 @@ function generateHtmlReportFromBackend(html: string): string {
   return html || '<!doctype html><html><head><meta charset="utf-8" /></head><body>No HTML report available.</body></html>';
 }
 
+function openHtmlReportInNewTab(html: string) {
+  if (typeof window === 'undefined') return;
+  const safeHtml = generateHtmlReportFromBackend(html);
+  // Use a blob URL so large reports don't hit URL length limits.
+  const blob = new Blob([safeHtml], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  window.open(url, '_blank', 'noopener,noreferrer');
+  // Best-effort cleanup after the new tab has had time to load.
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
 export default function DataPipelinePage() {
   const router = useRouter();
   const [currentStep, setCurrentStep] = useState<Step>('database');
@@ -30,6 +41,8 @@ export default function DataPipelinePage() {
   const [reportFormat, setReportFormat] = useState<string | null>(null);
   const [showReportView, setShowReportView] = useState(false);
   const [etlCode, setEtlCode] = useState<string | null>(null);
+  const [includeTransformSuggestions, setIncludeTransformSuggestions] = useState<boolean>(true);
+  const [includeDqRecommendations, setIncludeDqRecommendations] = useState<boolean>(true);
   const [userFeedback, setUserFeedback] = useState<Array<{
     step: string;
     liked: boolean;
@@ -64,8 +77,8 @@ export default function DataPipelinePage() {
 
   const handleAssessmentComplete = (data: any) => {
     setAssessmentData(data);
-    setDirection('forward');
-    setCurrentStep('report');
+    // Stay on assessment step so user can review/toggle options,
+    // then explicitly continue to the report step.
   };
 
   const handleReportFormatSelect = (format: string) => {
@@ -242,12 +255,32 @@ export default function DataPipelinePage() {
             )}
 
             {currentStep === 'assessment' && (
-              <DataAssessmentReport
-                files={selectedFiles}
-                database={selectedDatabase!}
-                onComplete={handleAssessmentComplete}
-                onFeedback={(liked, comment) => handleFeedback('assessment', liked, comment)}
-              />
+              <div className="space-y-4">
+                <DataAssessmentReport
+                  files={selectedFiles}
+                  database={selectedDatabase!}
+                  includeTransformSuggestions={includeTransformSuggestions}
+                  onIncludeTransformSuggestionsChange={setIncludeTransformSuggestions}
+                  includeDqRecommendations={includeDqRecommendations}
+                  onIncludeDqRecommendationsChange={setIncludeDqRecommendations}
+                  onComplete={handleAssessmentComplete}
+                  onFeedback={(liked, comment) => handleFeedback('assessment', liked, comment)}
+                />
+                {assessmentData && (
+                  <motion.button
+                    type="button"
+                    onClick={() => {
+                      setDirection('forward');
+                      setCurrentStep('report');
+                    }}
+                    className="w-full flex items-center justify-center gap-2 px-6 py-3 rounded-xl border border-[#0070AD]/40 bg-[#0070AD]/10 text-[#0070AD] font-semibold hover:bg-[#0070AD]/15 hover:border-[#0070AD]/60 transition-colors"
+                    whileHover={{ scale: 1.02 }}
+                    whileTap={{ scale: 0.98 }}
+                  >
+                    Continue to Report
+                  </motion.button>
+                )}
+              </div>
             )}
 
             {currentStep === 'report' && assessmentData && (
@@ -274,14 +307,51 @@ export default function DataPipelinePage() {
                       ))}
                     </div>
                     {reportFormat && (
+                      <div className="flex flex-wrap items-center gap-3">
+                        <motion.button
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          onClick={() => {
+                            if (reportFormat === 'HTML') {
+                              const html = typeof assessmentData?.report_html === 'string' ? assessmentData.report_html : '';
+                              openHtmlReportInNewTab(html);
+                              return;
+                            }
+                            setShowReportView(true);
+                          }}
+                          className="flex items-center gap-3 px-6 py-3 rounded-xl border border-[#0070AD]/40 bg-[#0070AD]/10 text-[#0070AD] font-semibold hover:bg-[#0070AD]/15 hover:border-[#0070AD]/60 transition-colors"
+                        >
+                          <FaEye className="w-5 h-5" />
+                          {reportFormat === 'HTML' ? 'Open HTML in new tab' : 'View Report'}
+                        </motion.button>
+
+                        {reportFormat === 'HTML' && (
+                          <motion.button
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            onClick={handleDownloadReport}
+                            className="flex items-center gap-3 px-6 py-3 rounded-xl border border-black/10 bg-white/85 text-zinc-900 font-semibold hover:bg-white hover:border-[#0070AD]/30 transition-colors"
+                            whileHover={{ scale: 1.02 }}
+                            whileTap={{ scale: 0.98 }}
+                          >
+                            <FaDownload className="w-5 h-5 text-[#0070AD]" />
+                            Download HTML
+                          </motion.button>
+                        )}
+                      </div>
+                    )}
+
+                    {reportFormat && (
                       <motion.button
                         initial={{ opacity: 0, y: 10 }}
                         animate={{ opacity: 1, y: 0 }}
-                        onClick={() => setShowReportView(true)}
-                        className="flex items-center gap-3 px-6 py-3 rounded-xl border border-[#0070AD]/40 bg-[#0070AD]/10 text-[#0070AD] font-semibold hover:bg-[#0070AD]/15 hover:border-[#0070AD]/60 transition-colors"
+                        onClick={handleProceedFromReport}
+                        className="mt-2 flex w-full items-center justify-center gap-2 px-6 py-3 rounded-xl border border-[#0070AD]/40 bg-[#0070AD]/10 text-[#0070AD] font-semibold hover:bg-[#0070AD]/15 hover:border-[#0070AD]/60 transition-colors"
+                        whileHover={{ scale: 1.02 }}
+                        whileTap={{ scale: 0.98 }}
                       >
-                        <FaEye className="w-5 h-5" />
-                        View Report
+                        Continue to Requirements
+                        <FaArrowRight className="w-4 h-4" />
                       </motion.button>
                     )}
                   </>
@@ -298,24 +368,9 @@ export default function DataPipelinePage() {
                           {typeof assessmentData?.report_markdown === 'string' ? assessmentData.report_markdown : 'No markdown report available.'}
                         </pre>
                       ) : (
-                        <>
-                          {typeof assessmentData?.report_html === 'string' ? (
-                            <div className="space-y-3">
-                              <div className="h-[78vh] w-full overflow-hidden rounded-xl border border-black/10 bg-white">
-                                <iframe
-                                  title="Assessment report"
-                                  className="h-full w-full"
-                                  srcDoc={assessmentData.report_html}
-                                  sandbox="allow-scripts allow-same-origin"
-                                />
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="text-sm text-black/70">
-                              No HTML report available. Use JSON or MD view.
-                            </div>
-                          )}
-                        </>
+                        <div className="text-sm text-black/70">
+                          HTML report opens in a new tab. Use Download to save as HTML.
+                        </div>
                       )}
                     </div>
                     <div className="flex gap-4">

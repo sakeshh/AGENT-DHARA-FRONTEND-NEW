@@ -22,6 +22,7 @@ import { Message } from '@/types';
 import Image from 'next/image';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import ReportEnhancements from '@/components/ReportEnhancements';
 
 interface ChatOption {
   id: string;
@@ -436,6 +437,22 @@ export default function ChatWindow() {
   const renderBotContent = (text: string, payload?: any) => {
     const renderStructuredReportFromResult = (result: any) => {
       if (!result || typeof result !== 'object') return null;
+      const ui = payload?.ui && typeof payload.ui === 'object' ? payload.ui : {};
+      const showCleaning = ui?.show_cleaning === true;
+      const showTransform = ui?.show_transform === true;
+      const onlyPanel = ui?.only_panel === 'cleaning' ? 'cleaning' : ui?.only_panel === 'transform' ? 'transform' : null;
+
+      if (onlyPanel) {
+        return (
+          <ReportEnhancements
+            result={result}
+            userIntent={typeof text === 'string' ? text : ''}
+            enableDqRecommendations={onlyPanel === 'cleaning'}
+            enableTransformSuggestions={onlyPanel === 'transform'}
+            variant="chat"
+          />
+        );
+      }
       const datasets = result?.datasets && typeof result.datasets === 'object' ? result.datasets : {};
       const dqDatasets =
         result?.data_quality_issues?.datasets && typeof result.data_quality_issues.datasets === 'object'
@@ -500,6 +517,15 @@ export default function ChatWindow() {
               <JsonTable value={relRows} />
             </div>
           ) : null}
+          {(showCleaning || showTransform) && (
+            <ReportEnhancements
+              result={result}
+              userIntent={typeof text === 'string' ? text : ''}
+              enableDqRecommendations={showCleaning}
+              enableTransformSuggestions={showTransform}
+              variant="chat"
+            />
+          )}
         </div>
       );
     };
@@ -828,18 +854,21 @@ export default function ChatWindow() {
     setShowOptions(false);
   };
 
-  const sendUserText = async (text: string) => {
+  const sendUserText = async (text: string, opts?: { silent?: boolean }) => {
+    const silent = Boolean(opts?.silent);
     const userMessage: Message = {
       id: Date.now().toString(),
       text,
       sender: 'user',
       timestamp: new Date(),
     };
-    setMessages((prev) => [...prev, userMessage]);
+    if (!silent) {
+      setMessages((prev) => [...prev, userMessage]);
+    }
     setIsLoadingAgent(true);
     setAgentError(null);
     try {
-      const messagesWithUser = [...messages, userMessage];
+      const messagesWithUser = silent ? [...messages, userMessage] : [...messages, userMessage];
       const { content, threadId, payload } = await fetchAgentReply(messagesWithUser);
       if (threadId) setAgentThreadId(threadId);
 
@@ -920,7 +949,19 @@ export default function ChatWindow() {
         options: interactiveOptions,
         payload,
       };
-      setMessages((prev) => [...prev, botResponse]);
+      if (silent) {
+        // Replace the last bot message (the one that had the refresh button),
+        // so the UI updates without echoing a "list tables" user bubble.
+        setMessages((prev) => {
+          if (!prev.length) return [botResponse];
+          const lastBotIdx = [...prev].reverse().findIndex((m) => m.sender === 'bot');
+          if (lastBotIdx < 0) return [...prev, botResponse];
+          const idxFromStart = prev.length - 1 - lastBotIdx;
+          return prev.map((m, i) => (i === idxFromStart ? botResponse : m));
+        });
+      } else {
+        setMessages((prev) => [...prev, botResponse]);
+      }
     } catch (err) {
       setAgentError("Couldn't reach the agent. Check your backend/agent configuration and try again.");
     } finally {
@@ -1073,10 +1114,28 @@ export default function ChatWindow() {
             const isUser = message.sender === 'user';
             const isHtmlReportMessage = false;
             const staggerDelay = Math.min(idx * 0.04, 0.2);
-            const opts = Array.isArray(message.options) ? message.options : [];
+            const payload = (message as any)?.payload;
+            const baseOpts = Array.isArray(message.options) ? message.options : [];
+            const opts = (() => {
+              const out = [...baseOpts];
+              // Screen 1: data source selection — add Refresh Sources (restarts flow).
+              if (message.sender === 'bot' && payload?.step === 'data_source') {
+                if (!out.some((o) => String(o?.id) === 'refresh-sources')) {
+                  out.push({ id: 'refresh-sources', text: 'Refresh sources', send: '__refresh_sources__' });
+                }
+              }
+              return out;
+            })();
             const hasOptions = message.sender === 'bot' && opts.length > 0;
             const hasTableToggles = hasOptions && opts.some((o) => isToggleTableOption(o.send));
             const hasFileToggles = hasOptions && opts.some((o) => isToggleFileOption(o.send));
+            // Screen 2: table selection — add Refresh Tables.
+            const optsWithRefresh = (() => {
+              if (!hasOptions) return opts;
+              if (!hasTableToggles) return opts;
+              if (opts.some((o) => String(o?.id) === 'refresh-tables')) return opts;
+              return [...opts, { id: 'refresh-tables', text: 'Refresh tables', send: '__refresh_tables__' }];
+            })();
             const selectAllOpt = hasOptions ? opts.find((o) => isSelectAllTablesOption(o.send)) : undefined;
             const allTableNumbers =
               selectAllOpt && String(selectAllOpt.send).includes(':')
@@ -1163,7 +1222,7 @@ export default function ChatWindow() {
                       )}
                       {hasOptions && (
                         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                          {opts.map((opt) => (
+                          {optsWithRefresh.map((opt) => (
                             <button
                               key={opt.id}
                               type="button"
@@ -1186,6 +1245,15 @@ export default function ChatWindow() {
                                 }
                                 if (isSelectAllFilesOption(opt.send) && parsedFiles) {
                                   setAllFilesForMessage(message.id, parsedFiles.mode, parsedFiles.nums);
+                                  return;
+                                }
+                                // Silent refresh actions (do not echo commands into chat).
+                                if (String(opt.send) === '__refresh_tables__') {
+                                  sendUserText('list tables', { silent: true });
+                                  return;
+                                }
+                                if (String(opt.send) === '__refresh_sources__') {
+                                  sendUserText('restart', { silent: true });
                                   return;
                                 }
                                 // Remove options from the previous message once a choice is made.

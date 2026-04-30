@@ -11,6 +11,9 @@ existing MCP-facing logic in `agent.mcp_interface.py`.
 from __future__ import annotations
 
 import asyncio
+import os
+import random
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -92,6 +95,10 @@ class ExtractionAgent:
         results: List[ExtractionResult] = []
         errors: List[Dict[str, Any]] = []
 
+        per_source_timeout_s = float(os.environ.get("EXTRACT_PER_SOURCE_TIMEOUT_SECONDS", "90") or "90")
+        max_retries = int(os.environ.get("EXTRACT_PER_SOURCE_RETRIES", "2") or "2")
+        backoff_base_s = float(os.environ.get("EXTRACT_RETRY_BACKOFF_BASE_SECONDS", "0.8") or "0.8")
+
         if stream_records is not None:
             try:
                 results.append(self.extract_stream_records(records=stream_records, name=stream_name))
@@ -99,17 +106,62 @@ class ExtractionAgent:
                 errors.append({"source": stream_name, "type": "stream", "error": str(e)})
 
         async def _run(idx: int, loc: Dict[str, Any]) -> None:
-            try:
-                r = await asyncio.to_thread(self.extract_one, source_root, loc, idx)
-                results.append(r)
-            except Exception as e:
-                errors.append(
-                    {
-                        "source": _location_display_name(loc, idx),
-                        "type": str((loc.get("type") or "")).lower(),
-                        "error": str(e),
-                    }
-                )
+            src_name = _location_display_name(loc, idx)
+            loc_type = str((loc.get("type") or "")).lower()
+            attempt = 0
+            last_err: Optional[Exception] = None
+            started = time.time()
+            while attempt <= max_retries:
+                attempt += 1
+                try:
+                    # Run sync extraction in a worker thread with a per-source timeout.
+                    coro = asyncio.to_thread(self.extract_one, source_root, loc, idx)
+                    r = await asyncio.wait_for(coro, timeout=per_source_timeout_s)
+                    results.append(r)
+                    return
+                except asyncio.TimeoutError as e:
+                    last_err = e
+                    if attempt > max_retries:
+                        break
+                except Exception as e:
+                    last_err = e
+                    # Retry only for likely transient failures. Keep conservative by default.
+                    msg = str(e).lower()
+                    transient = any(
+                        k in msg
+                        for k in (
+                            "timeout",
+                            "timed out",
+                            "connection reset",
+                            "connection aborted",
+                            "temporarily unavailable",
+                            "too many requests",
+                            "429",
+                            "503",
+                            "502",
+                            "network",
+                        )
+                    )
+                    if not transient or attempt > max_retries:
+                        break
+                # Backoff with jitter before retrying.
+                sleep_s = backoff_base_s * (2 ** max(0, attempt - 1))
+                sleep_s = min(sleep_s, 8.0) * (0.85 + random.random() * 0.3)
+                await asyncio.sleep(sleep_s)
+
+            elapsed_ms = int((time.time() - started) * 1000)
+            err_str = str(last_err) if last_err else "unknown error"
+            errors.append(
+                {
+                    "source": src_name,
+                    "type": loc_type,
+                    "error": err_str,
+                    "error_type": type(last_err).__name__ if last_err else "UnknownError",
+                    "attempts": attempt,
+                    "timeout_seconds": per_source_timeout_s,
+                    "elapsed_ms": elapsed_ms,
+                }
+            )
 
         if parallel:
             await asyncio.gather(*[_run(i, loc) for i, loc in enumerate(locations)])

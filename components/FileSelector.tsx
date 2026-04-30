@@ -32,31 +32,89 @@ export default function FileSelector({ database, onSelect, onNext, selectedFiles
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<string[]>(selectedFiles);
 
+  const loadSqlTables = async (opts?: { bypassCache?: boolean }) => {
+    const bypassCache = Boolean(opts?.bypassCache);
+    setLoading(true);
+    try {
+      // Prefer the cached discovery endpoint (auto-updates when new tables are added).
+      const ttl = bypassCache ? 0 : 30;
+      const res = await fetch(`/api/schema/tables?ttl_seconds=${ttl}`, { method: 'GET' });
+      const data = await res.json().catch(() => null);
+      const tables = Array.isArray(data?.tables) ? data.tables : [];
+      setFiles(
+        tables.map((t: string) => ({
+          name: String(t),
+          size: 'SQL table',
+          rows: 0,
+          type: 'table',
+        }))
+      );
+    } catch {
+      // Fallback to legacy list-tables endpoint
+      try {
+        const res = await fetch('/api/list-tables', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '',
+        });
+        const data = await res.json().catch(() => null);
+        const tables = Array.isArray(data?.tables) ? data.tables : [];
+        setFiles(
+          tables.map((t: string) => ({
+            name: String(t),
+            size: 'SQL table',
+            rows: 0,
+            type: 'table',
+          }))
+        );
+      } catch {
+        setFiles([]);
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
     let alive = true;
     (async () => {
       setLoading(true);
       try {
+        const normalizeType = (t: any): string => {
+          const s = String(t || '').toLowerCase();
+          if (s.includes('azure_blob')) return 'azure_blob';
+          if (s.includes('filesystem')) return 'filesystem';
+          if (s.includes('database')) return 'database';
+          return s || 'unknown';
+        };
+
+        const toRelativeIndex = (locs: any[], type: string, absIndex: number) => {
+          const absList = (locs || []).map((l: any) => ({ index: Number(l?.index ?? 0), type: normalizeType(l?.type) }));
+          const only = absList.filter((x: any) => x.type === type).map((x: any) => x.index);
+          const pos = only.indexOf(absIndex);
+          return pos >= 0 ? pos : 0;
+        };
+
         const src = parseSourceToken(database);
         if (src.kind === 'sql') {
-          const res = await fetch('/api/list-tables', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: '',
-          });
-          const data = await res.json().catch(() => null);
-          const tables = Array.isArray(data?.tables) ? data.tables : [];
           if (!alive) return;
-          setFiles(
-            tables.map((t: string) => ({
-              name: String(t),
-              size: 'SQL table',
-              rows: 0,
-              type: 'table',
-            }))
-          );
+          await loadSqlTables();
         } else if (src.kind === 'blob') {
           const sid = getSessionId();
+          // Persist selected blob location index (relative among azure_blob locations) before listing.
+          try {
+            const sourcesRes = await fetch('/api/sources');
+            const sourcesJson = await sourcesRes.json().catch(() => null);
+            const locs = Array.isArray(sourcesJson?.locations) ? sourcesJson.locations : [];
+            const rel = toRelativeIndex(locs, 'azure_blob', src.index);
+            await fetch('/api/session-context', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ session_id: sid, context: { selected_blob_location_index: rel } }),
+            });
+          } catch {
+            // ignore
+          }
           const res = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -75,6 +133,20 @@ export default function FileSelector({ database, onSelect, onNext, selectedFiles
           );
         } else if (src.kind === 'streams') {
           const sid = getSessionId();
+          // Persist selected filesystem location index (relative among filesystem locations) before listing.
+          try {
+            const sourcesRes = await fetch('/api/sources');
+            const sourcesJson = await sourcesRes.json().catch(() => null);
+            const locs = Array.isArray(sourcesJson?.locations) ? sourcesJson.locations : [];
+            const rel = toRelativeIndex(locs, 'filesystem', src.index);
+            await fetch('/api/session-context', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ session_id: sid, context: { selected_fs_location_index: rel } }),
+            });
+          } catch {
+            // ignore
+          }
           const res = await fetch('/api/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -146,6 +218,25 @@ export default function FileSelector({ database, onSelect, onNext, selectedFiles
         />
       </div>
 
+      {/* Refresh (SQL table discovery) */}
+      {parseSourceToken(database).kind === 'sql' && (
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-sm text-black/60 flex items-center gap-2">
+            <FaDatabase className="text-[#0070AD]/70" />
+            New table added? Refresh to discover latest tables.
+          </div>
+          <motion.button
+            type="button"
+            onClick={() => loadSqlTables({ bypassCache: true })}
+            className="px-4 py-2 rounded-lg border border-black/10 bg-white/85 text-sm font-medium text-black/70 hover:bg-white hover:border-[#0070AD]/30 transition-colors"
+            whileHover={{ scale: 1.02 }}
+            whileTap={{ scale: 0.98 }}
+          >
+            Refresh tables
+          </motion.button>
+        </div>
+      )}
+
       {/* Files List */}
       {loading ? (
         <div className="space-y-3">
@@ -184,8 +275,12 @@ export default function FileSelector({ database, onSelect, onNext, selectedFiles
                     <h3 className="font-semibold text-zinc-900">{file.name}</h3>
                     <div className="flex gap-4 text-sm text-black/60 mt-1">
                       <span>{file.size}</span>
-                      <span>•</span>
-                      <span>{file.rows.toLocaleString()} rows</span>
+                      {typeof file.rows === 'number' && file.rows > 0 ? (
+                        <>
+                          <span>•</span>
+                          <span>{file.rows.toLocaleString()} rows</span>
+                        </>
+                      ) : null}
                       <span>•</span>
                       <span className="capitalize">{file.type}</span>
                     </div>

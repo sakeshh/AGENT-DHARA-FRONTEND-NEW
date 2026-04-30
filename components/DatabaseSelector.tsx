@@ -32,6 +32,26 @@ export default function DatabaseSelector({ onSelect, onBack }: DatabaseSelectorP
   const [loading, setLoading] = useState(true);
   const [locations, setLocations] = useState<SourceLocation[]>([]);
 
+  const refreshLocations = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/sources');
+      const data = await res.json().catch(() => null);
+      const locs = Array.isArray(data?.locations) ? data.locations : [];
+      setLocations(
+        locs.map((x: any) => ({
+          index: Number(x?.index ?? 0),
+          id: x?.id ?? null,
+          type: x?.type ?? null,
+        }))
+      );
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const filteredLocations = locations
     .filter((l) => normalizeType(l.type) !== 'azure_blob_output') // pipeline inputs only
     .filter((l) => {
@@ -99,6 +119,18 @@ export default function DatabaseSelector({ onSelect, onBack }: DatabaseSelectorP
         <div className="flex-1">
           <h2 className="text-3xl font-bold text-zinc-900 mb-2">Select Data Source</h2>
           <p className="text-black/60">Choose where your data comes from, then select the specific source</p>
+        </div>
+        <div className="shrink-0">
+          <motion.button
+            type="button"
+            onClick={refreshLocations}
+            whileHover={{ scale: 1.02 }}
+            whileTap={{ scale: 0.98 }}
+            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-black/10 bg-white/80 text-sm font-medium text-black/70 hover:bg-white hover:border-[#0070AD]/30 transition-colors"
+          >
+            <FaPlug className="text-[#0070AD]/80" />
+            Refresh sources
+          </motion.button>
         </div>
       </div>
 
