@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from agent.openai_usage import usage_dict_from_response
 
 
 def _azure_openai_cfg() -> Optional[Dict[str, str]]:
@@ -36,9 +38,16 @@ Rules:
 """
 
 
-def nl_to_sql_select(*, question: str, table: str, columns: List[Dict[str, Any]], max_rows: Optional[int] = None) -> str:
+def nl_to_sql_select(
+    *,
+    question: str,
+    table: str,
+    columns: List[Dict[str, Any]],
+    max_rows: Optional[int] = None,
+) -> Tuple[str, Optional[Dict[str, int]]]:
     """
     Use OpenAI (or Azure OpenAI) to translate question → SELECT query for one table.
+    Returns (sql, usage_dict_or_none).
     """
     # Prefer central config.
     try:
@@ -99,5 +108,5 @@ User question: {question}
             max_tokens=600,
         )
     sql = (resp.choices[0].message.content or "").strip()
-    return sql
+    return sql, usage_dict_from_response(resp)
 

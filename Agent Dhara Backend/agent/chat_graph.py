@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, TypedDict, Tuple
 
 from agent.master_agent import load_sources_config
 from agent.model_config import load_llm_config
+from agent.openai_usage import usage_dict_from_response
 from agent.session_store import add_experience, list_recent_experiences, load_session, save_session
 
 try:
@@ -32,6 +33,8 @@ class ChatState(TypedDict, total=False):
     action_args: Dict[str, Any]
     reply: str
     payload: Dict[str, Any]
+    router_llm_usage: Dict[str, int]
+    nl_sql_llm_usage: Dict[str, int]
 
 
 def _flow_options(*items: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -99,6 +102,7 @@ show_null_columns
 extract_columns
 dq_overview
 dq_duplicates
+summarize_report
 list_blob_files
 select_blob_files
 assess_selected_files
@@ -108,6 +112,7 @@ assess_selected_local_files
 assess_selected_tables
 preview_local_file
 preview_blob_file
+show_selection_status
 
 Output schema:
 {
@@ -128,7 +133,11 @@ Behavior rules:
   choose action=assess_selected_files.
 - If the user asks to assess the *currently selected local files*, choose action=assess_selected_local_files.
 - If the user asks to assess the *currently selected tables*, choose action=assess_selected_tables.
-- If the user asks a data-quality question (nulls, duplicates, outliers, issues, quality summary) AFTER a report was generated,
+- If the user ONLY asks how many / which items are *selected*, or what the current selection is (with no DQ/report ask),
+  choose show_selection_status.
+- If the user asks you to summarize, explain in plain English, or give an executive summary of THE REPORT / assessment / findings,
+  choose summarize_report (not dq_overview).
+- If the user asks a data-quality question (nulls, duplicates, outliers, issues, terse quality totals) AFTER a report was generated,
   choose a DQ action (dq_overview / show_null_columns / dq_duplicates) and answer from the latest assessment.
 - If the user asks for extraction (show columns, show top rows, preview data) for selected datasets, choose an extraction action.
 
@@ -142,6 +151,8 @@ Examples (JSON only):
 {"action":"select_blob_files","args":{"all":true}}
 {"action":"assess_selected_files","args":{}}
 {"action":"dq_overview","args":{}}
+{"action":"summarize_report","args":{}}
+{"action":"show_selection_status","args":{}}
 {"action":"extract_columns","args":{}}
 """
 
@@ -610,6 +621,36 @@ def _pick_single_active_dataset(ctx: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _dataset_null_percent_rank(prof: Any, top_shown: int = 50) -> Tuple[List[Tuple[str, float]], str]:
+    """
+    From one dataset profile, build sorted (column, null_fraction) pairs and a short Markdown block for chat.
+    """
+    cols = (prof.get("columns") or {}) if isinstance(prof, dict) else {}
+    if not isinstance(cols, dict) or not cols:
+        return [], "*(no column profile)*"
+
+    null_cols: List[Tuple[str, float]] = []
+    for col, meta in cols.items():
+        if not isinstance(meta, dict):
+            continue
+        try:
+            pct = float(meta.get("null_percentage") or 0.0)
+        except Exception:
+            pct = 0.0
+        if pct > 0:
+            null_cols.append((str(col), pct))
+    null_cols.sort(key=lambda x: x[1], reverse=True)
+
+    if not null_cols:
+        return [], "✅ No null values detected (based on the last assessment sample)."
+
+    top = null_cols[: top_shown if top_shown > 0 else len(null_cols)]
+    lines = [f"- `{c}`: {round(p*100, 2)}%" for c, p in top]
+    more = f"\n…(+{len(null_cols)-len(top)} more columns with nulls)" if len(null_cols) > len(top) else ""
+    body = "\n".join(lines) + more
+    return null_cols, body
+
+
 def _assessment_signature(ctx: Dict[str, Any]) -> Dict[str, Any]:
     def _norm_list(x: Any) -> List[str]:
         if not isinstance(x, list):
@@ -677,12 +718,13 @@ def _node_show_cleaning_recommendations(state: ChatState) -> ChatState:
     result, err = _ensure_latest_assessment(state)
     if err:
         return {"reply": err, "payload": {}}
+    rec_usage: Optional[Dict[str, int]] = None
     try:
         from agent.dq_recommendations_agent import DQRecommendationsAgent, dq_recommendations_to_dict
 
         agent = DQRecommendationsAgent()
         merged_dq = (result.get("data_quality_issues") or {}) if isinstance(result, dict) else {}
-        rec = agent.recommend(merged_dq=merged_dq, user_intent=state.get("message", "") or "")
+        rec, rec_usage = agent.recommend(merged_dq=merged_dq, user_intent=state.get("message", "") or "")
         result = dict(result)
         result["dq_recommendations"] = dq_recommendations_to_dict(rec)
     except Exception:
@@ -701,14 +743,22 @@ def _node_show_cleaning_recommendations(state: ChatState) -> ChatState:
         {"id": "restart", "text": "✅ Restart", "send": "restart"},
     )
 
+    lum: Dict[str, Any] = {}
+    if isinstance(rec_usage, dict) and rec_usage:
+        lum["cleaning_recommendations"] = rec_usage
+
+    pl: Dict[str, Any] = {
+        "step": "report",
+        "result": result,
+        "ui": {"show_cleaning": True, "show_transform": False, "only_panel": "cleaning"},
+        "options": options,
+    }
+    if lum:
+        pl["llm_usage"] = lum
+
     return {
         "reply": "🧹 Cleaning recommendations (based on the latest assessment):",
-        "payload": {
-            "step": "report",
-            "result": result,
-            "ui": {"show_cleaning": True, "show_transform": False, "only_panel": "cleaning"},
-            "options": options,
-        },
+        "payload": pl,
     }
 
 
@@ -768,10 +818,41 @@ def _node_show_null_columns(state: ChatState) -> ChatState:
     args = state.get("action_args") or {}
     dataset = args.get("dataset") or args.get("table") or args.get("file")
     dataset_key = str(dataset) if dataset else _pick_single_active_dataset(ctx)
+
+    # Multiple datasets assessed (or user asked without naming one): summarize all, matching dq_overview behavior.
     if not dataset_key:
-        choices = list(datasets.keys())[:20]
-        hint = "Select one dataset first (e.g. `select table ...` or select a single file), then ask again."
-        return {"reply": f"I need a specific table/file to check. {hint}\n\nKnown datasets:\n- " + "\n- ".join(choices), "payload": {"datasets": list(datasets.keys())}}
+        max_sets = 20
+        ds_keys_all = list(datasets.keys())
+        ds_keys_cap = ds_keys_all[:max_sets]
+        sections: List[str] = []
+        per_ds_payload: List[Dict[str, Any]] = []
+
+        if len(ds_keys_all) > max_sets:
+            sections.append(f"*(Showing first {max_sets} of {len(ds_keys_all)} datasets.)*")
+
+        for dk_raw in ds_keys_cap:
+            dk = str(dk_raw)
+            prof = datasets.get(dk) or {}
+            if not isinstance(prof, dict):
+                sections.append(f"**{dk}**\n(no profile)")
+                per_ds_payload.append({"dataset": dk, "null_columns": [], "error": "missing_profile"})
+                continue
+            null_cols, body = _dataset_null_percent_rank(prof, top_shown=50)
+            sections.append(f"**{dk}**\n{body}")
+            per_ds_payload.append(
+                {"dataset": dk, "null_columns": [{"name": c, "null_percentage": p} for c, p in null_cols]}
+            )
+
+        headline = (
+            "Columns ranked by share of null/placeholder values (latest assessment):\n\n"
+            if len(ds_keys_cap) > 1
+            else ""
+        )
+        return {
+            "reply": headline + "\n\n".join(sections),
+            "payload": {"datasets": [p["dataset"] for p in per_ds_payload], "per_dataset": per_ds_payload},
+        }
+
     if dataset_key not in datasets:
         # Try fallback: sometimes selected file/table isn't the dataset key (e.g. prefixes). Best-effort contains match.
         matches = [k for k in datasets.keys() if dataset_key.lower() in str(k).lower()]
@@ -781,30 +862,15 @@ def _node_show_null_columns(state: ChatState) -> ChatState:
             return {"reply": f"Couldn't find `{dataset_key}` in the last assessment datasets.", "payload": {"datasets": list(datasets.keys())}}
 
     prof = datasets.get(dataset_key) or {}
-    cols = (prof.get("columns") or {}) if isinstance(prof, dict) else {}
-    if not isinstance(cols, dict) or not cols:
+    if not isinstance(prof, dict):
         return {"reply": f"No column profile found for `{dataset_key}`.", "payload": {}}
 
-    null_cols: List[Tuple[str, float]] = []
-    for col, meta in cols.items():
-        if not isinstance(meta, dict):
-            continue
-        try:
-            pct = float(meta.get("null_percentage") or 0.0)
-        except Exception:
-            pct = 0.0
-        if pct > 0:
-            null_cols.append((str(col), pct))
-    null_cols.sort(key=lambda x: x[1], reverse=True)
-
+    null_cols, body = _dataset_null_percent_rank(prof, top_shown=50)
     if not null_cols:
-        return {"reply": f"✅ `{dataset_key}`: No null values detected in any column (based on the last assessment sample).", "payload": {"dataset": dataset_key, "null_columns": []}}
+        return {"reply": f"✅ **`{dataset_key}`**: No null values detected in any column (based on the last assessment sample).", "payload": {"dataset": dataset_key, "null_columns": []}}
 
-    top = null_cols[:50]
-    lines = [f"- {c}: {round(p*100, 2)}%" for c, p in top]
-    more = f"\n…(+{len(null_cols)-len(top)} more)" if len(null_cols) > len(top) else ""
     return {
-        "reply": f"Columns with null values in `{dataset_key}` (showing {len(top)}/{len(null_cols)}):\n" + "\n".join(lines) + more,
+        "reply": f"Columns with null values in **`{dataset_key}`**:\n\n{body}",
         "payload": {"dataset": dataset_key, "null_columns": [{"name": c, "null_percentage": p} for c, p in null_cols]},
     }
 
@@ -920,6 +986,273 @@ def _node_dq_duplicates(state: ChatState) -> ChatState:
     return {"reply": "Duplicate issues found:\n" + "\n".join(lines) + more, "payload": {"duplicates": hits}}
 
 
+def _user_asks_selection_status(raw: str) -> bool:
+    """
+    Intent: how many / what items are selected in session (no assessment, no DQ overview).
+    Kept narrow to avoid clashing with 'how many nulls/issues in selected'.
+    """
+    r = (raw or "").strip().lower()
+    if not r:
+        return False
+    if any(
+        x in r
+        for x in ("null", "missing", "duplicate", "data quality", "issue", "problem", "assessment")
+    ):
+        return False
+
+    trivial = (
+        "selection status",
+        "selection count",
+        "what is selected",
+        "what's selected",
+        "whats selected",
+        "show selection",
+        "show my selection",
+        "show selected",
+        "list selection",
+        "list selected",
+        "which files are selected",
+        "which tables are selected",
+        "have i selected anything",
+        "anything selected",
+    )
+    if r in trivial:
+        return True
+
+    if ("what " in r or "which " in r or "tell me " in r) and ("selected" in r or "selection" in r):
+        return True
+
+    if ("how many" in r or "how much" in r) and (
+        r.endswith(" selected")
+        or " are selected" in r
+        or " are currently selected" in r
+        or "files selected" in r
+        or "file selected" in r
+        or "tables selected" in r
+        or "table selected" in r
+        or " of them selected" in r  # how many of them are selected
+    ):
+        return True
+
+    return False
+
+
+def _user_wants_narrative_report_summary(raw: str) -> bool:
+    """Natural-language intents that should yield a prose + prioritized summary (not bare counts)."""
+    r = (raw or "").strip().lower()
+    if not r:
+        return False
+    exact = {
+        "summarize the report",
+        "summarize report",
+        "report summary",
+        "summary of the report",
+        "summary report",
+        "executive summary",
+        "give me an executive summary",
+        "give me a summary",
+        "high level summary",
+        "high-level summary",
+        "tldr",
+        "tl;dr",
+        "what does this report say",
+        "what does the report say",
+        "explain the report",
+        "explain this report",
+        "brief me on the report",
+    }
+    if r in exact:
+        return True
+    if r.startswith("summarize ") and any(x in r for x in ("report", "findings", "assessment", "results")):
+        return True
+    if ("summary" in r or "summarize" in r) and any(x in r for x in ("report", "assessment", "finding", "findings")):
+        return True
+    return "in plain english" in r and ("report" in r or "assessment" in r)
+
+
+def _truncate_summary_text(s: str, max_len: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1].rstrip() + "…"
+
+
+def _markdown_narrative_assessment_summary(result: Dict[str, Any]) -> Optional[str]:
+    """
+    Readable summary: storyline + prioritized themes + sample issues + linkage + compact scorecard.
+    Uses deterministic text (no LLM) from fields already emitted by the assessment pipeline.
+    """
+    if not isinstance(result, dict):
+        return None
+    dq = result.get("data_quality_issues") or {}
+    if not isinstance(dq, dict):
+        return None
+    per = dq.get("datasets") or {}
+    if not isinstance(per, dict) or not per:
+        return None
+
+    rows: List[Tuple[str, int, int, int, int]] = []
+    total = {"issues": 0, "high": 0, "medium": 0, "low": 0}
+    for ds_name, block in per.items():
+        summ = (block or {}).get("summary") or {}
+        try:
+            ic = int(summ.get("issue_count") or 0)
+            hi = int(summ.get("high_severity") or 0)
+            me = int(summ.get("medium_severity") or 0)
+            lo = int(summ.get("low_severity") or 0)
+        except Exception:
+            ic = hi = me = lo = 0
+        total["issues"] += ic
+        total["high"] += hi
+        total["medium"] += me
+        total["low"] += lo
+        rows.append((str(ds_name), ic, hi, me, lo))
+    rows.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    n_ds = len(rows)
+
+    if total["high"] > 0:
+        lead = (
+            f"Across **{n_ds}** dataset(s), the scan raised **{total['issues']}** quality signals "
+            f"**(High {total['high']}, Medium {total['medium']}, Low {total['low']})**. "
+            f"Start with the **{total['high']} high-severity** items—these usually point to broken formats, missing keys, duplicates, or columns that block reliable joins."
+        )
+    elif total["medium"] > 0:
+        lead = (
+            f"The **{n_ds}** dataset(s) show **{total['issues']}** signals, mostly **medium/low** severity "
+            f"(medium **{total['medium']}**, low **{total['low']}**). "
+            "That pattern usually means clean-up work (normalization, trimming, type coercion) rather than structural failure."
+        )
+    else:
+        lead = (
+            f"**{n_ds}** dataset(s) report **{total['issues']}** low-severity observations in this sample—"
+            "worth tidying, but nothing urgent from a severity standpoint."
+        )
+
+    parts: List[str] = ["### Report summary", "", lead, ""]
+
+    exec_items = result.get("executive_summary_items") or []
+    if isinstance(exec_items, list) and exec_items:
+        parts.extend(["#### What to fix first (ranked themes)", ""])
+        for it in exec_items[:7]:
+            if not isinstance(it, dict):
+                continue
+            title = str(it.get("title") or "").strip() or "Issue"
+            sev = str(it.get("severity") or "").strip()
+            rec = _truncate_summary_text(str(it.get("recommendation") or ""), 220)
+            line = f"- **{title}**"
+            if sev:
+                line += f" — *{sev}*"
+            if rec:
+                line += f"  \n  *Next step:* {rec}"
+            parts.append(line)
+        parts.append("")
+
+    sev_rank = {"high": 3, "medium": 2, "low": 1}
+    sample_lines: List[str] = []
+    for ds_name, _ic, _hi, _me, _lo in rows[:12]:
+        issues = (per.get(ds_name) or {}).get("issues") or []
+        if not isinstance(issues, list) or not issues:
+            continue
+        scored = sorted(
+            issues,
+            key=lambda it: (
+                sev_rank.get(str((it or {}).get("severity") or "low").lower(), 0),
+                int((it or {}).get("count") or 0),
+            ),
+            reverse=True,
+        )
+        seen_types: set = set()
+        for it in scored:
+            if not isinstance(it, dict):
+                continue
+            typ = str(it.get("type") or "")
+            if typ in seen_types:
+                continue
+            seen_types.add(typ)
+            sev = str(it.get("severity") or "")
+            col = it.get("column")
+            msg = _truncate_summary_text(str(it.get("message") or it.get("detail") or ""), 140)
+            col_s = f" — column `{col}`" if col else ""
+            bit = f"- **`{ds_name}`** · {sev} · `{typ}`{col_s}"
+            if msg:
+                bit += f" — _{msg}_"
+            sample_lines.append(bit)
+            if len(seen_types) >= 2:
+                break
+    if sample_lines:
+        parts.extend(["#### Concrete examples (one line each)", ""] + sample_lines[:14] + [""])
+
+    rels = result.get("relationships") or []
+    if isinstance(rels, list) and rels:
+        parts.extend(["#### How the files relate", ""])
+        for rel in rels[:10]:
+            if not isinstance(rel, dict):
+                continue
+            a = rel.get("dataset_a") or rel.get("from") or "?"
+            b = rel.get("dataset_b") or rel.get("to") or "?"
+            ca = rel.get("column_a") or ""
+            cb = rel.get("column_b") or ""
+            card = rel.get("cardinality") or ""
+            ov = rel.get("overlap_count")
+            summ = str(rel.get("summary") or "").strip()
+            ov_s = f", ~**{ov}** overlapping keys" if ov is not None else ""
+            line = f"- `{a}` **{ca}** ↔ `{b}` **{cb}** — _{card}_{ov_s}._"
+            if summ:
+                line += f" {summ}"
+            parts.append(line)
+        parts.append("")
+
+    parts.extend(
+        [
+            "#### Quick scorecard",
+            "",
+            "| Dataset | Issues | High | Med | Low |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for n, ic, hi, me, lo in rows[:25]:
+        parts.append(f"| `{n}` | {ic} | {hi} | {me} | {lo} |")
+    if len(rows) > 25:
+        parts.append(f"| … | *+{len(rows) - 25} more datasets* |  |  |  |")
+    parts.extend(
+        [
+            "",
+            "---",
+            "",
+            "*Tip:* ask for **duplicates**, **columns with nulls**, or **cleaning recommendations** to go deeper on one theme.",
+        ]
+    )
+    return "\n".join(parts)
+
+
+def _node_summarize_report(state: ChatState) -> ChatState:
+    """Narrative summary of the latest assessment (prose + themes + examples), not only issue counts."""
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+    md = _markdown_narrative_assessment_summary(result if isinstance(result, dict) else {})
+    if not md:
+        return {
+            "reply": "I don’t have a structured assessment in this session yet. Generate a report first, then ask again.",
+            "payload": {},
+        }
+    opts = _flow_options(
+        {"id": "head", "text": "📊 View top 10 rows", "send": "view top 10 rows"},
+        {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+        {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+        {"id": "clean", "text": "🧹 Cleaning recommendations", "send": "cleaning recommendations"},
+        {"id": "transform", "text": "🛠️ Suggested transformations", "send": "suggested transformations"},
+        {"id": "dq", "text": "📊 Raw issue counts (overview)", "send": "data quality overview"},
+        {"id": "menu", "text": "📋 Menu", "send": "menu"},
+        {"id": "back", "text": "🔙 Back", "send": "back"},
+        {"id": "restart", "text": "✅ Restart", "send": "restart"},
+    )
+    return {
+        "reply": md,
+        "payload": {"step": "report_summary", "options": opts},
+    }
+
+
 def _node_extract_columns(state: ChatState) -> ChatState:
     """
     Extraction Agent: list columns for all selected datasets (tables/files) from the latest assessment profile.
@@ -1031,8 +1364,8 @@ def _llm_plan(*, user_text: str, session: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(args, dict):
             args = {}
         if not action:
-            return {"action": "help", "args": {}}
-        return {"action": action, "args": args}
+            return {"action": "help", "args": {}, "usage": usage_dict_from_response(resp)}
+        return {"action": action, "args": args, "usage": usage_dict_from_response(resp)}
     except Exception as e:
         # If the model fails to produce JSON, return a helpful message via 'help'
         return {"action": "help", "args": {"error": str(e)}}
@@ -1136,9 +1469,15 @@ def _node_route(state: ChatState) -> ChatState:
             if idxs:
                 return {"action": "select_local_files", "action_args": {"indices": idxs}}
 
+    # Selection meta (must run before DQ / router so "how many selected" isn't mis-read as DQ).
+    if _user_asks_selection_status(raw):
+        return {"action": "show_selection_status", "action_args": {}}
+
     # DQ shortcuts: allow follow-up questions after a report without forcing "select table".
     if ("null" in raw or "missing" in raw) and ("column" in raw or "columns" in raw or "fields" in raw):
         return {"action": "show_null_columns", "action_args": {}}
+    if _user_wants_narrative_report_summary(raw):
+        return {"action": "summarize_report", "action_args": {}}
     if any(k in raw for k in ("data quality", "dq", "quality issues", "issues summary", "quality summary", "dq summary")):
         return {"action": "dq_overview", "action_args": {}}
     if "duplicate" in raw:
@@ -1191,7 +1530,69 @@ def _node_route(state: ChatState) -> ChatState:
             return {"action": "set_action", "action_args": {"action": "report"}}
 
     plan = _llm_plan(user_text=state.get("message", ""), session=state.get("session") or {})
-    return {"action": str(plan.get("action") or "help"), "action_args": dict(plan.get("args") or {})}
+    out_r: ChatState = {
+        "action": str(plan.get("action") or "help"),
+        "action_args": dict(plan.get("args") or {}),
+    }
+    u = plan.get("usage")
+    if isinstance(u, dict) and u:
+        out_r["router_llm_usage"] = u  # type: ignore
+    return out_r
+
+
+def _node_show_selection_status(state: ChatState) -> ChatState:
+    """Tell the user what files/tables the backend session has selected (never runs assessment/DQ)."""
+    ctx = state["session"].setdefault("context", {})
+    local = [str(x) for x in (ctx.get("selected_local_files") or []) if str(x).strip()]
+    blob = [str(x) for x in (ctx.get("selected_blob_files") or []) if str(x).strip()]
+    tables: List[str] = []
+    for x in ctx.get("selected_tables") or []:
+        s = str(x).strip()
+        if s:
+            tables.append(s)
+    one = ctx.get("selected_table")
+    if isinstance(one, str) and one.strip():
+        os_ = one.strip()
+        if os_ not in tables:
+            tables = [os_] + tables
+
+    note = (
+        "\n\n---\n**Note:** The chat UI’s checkmarks stay local until **OK** runs and sends commands like "
+        "`select local files 1,2`. If OK shows `(0)`, the server may still have an **older selection** saved—"
+        "**restart** clears it, or confirm a new selection so counts match.\n\n"
+        "This reply is session state only; it is **not** a data-quality report."
+    )
+
+    chunks: List[str] = []
+    if local:
+        head = ", ".join(f"`{n}`" for n in local[:40])
+        more = f" …(+{len(local)-40})" if len(local) > 40 else ""
+        chunks.append(f"**Local file(s)** — **{len(local)}**:\n{head}{more}")
+    if blob:
+        head = ", ".join(f"`{n}`" for n in blob[:40])
+        more = f" …(+{len(blob)-40})" if len(blob) > 40 else ""
+        chunks.append(f"**Blob object(s)** — **{len(blob)}**:\n{head}{more}")
+    if tables:
+        head = ", ".join(f"`{n}`" for n in tables[:40])
+        more = f" …(+{len(tables)-40})" if len(tables) > 40 else ""
+        chunks.append(f"**SQL table(s)** — **{len(tables)}**:\n{head}{more}")
+
+    total = len(local) + len(blob) + len(tables)
+    if not chunks:
+        reply = "**0** items selected **in this backend session** right now.\n\n" + note.strip()
+    else:
+        reply = f"### Selection on server (**{total}** item(s))\n\n" + "\n\n".join(chunks) + note
+
+    return {
+        "reply": reply,
+        "payload": {
+            "step": "selection_status",
+            "count": total,
+            "selected_local_files": local,
+            "selected_blob_files": blob,
+            "selected_tables": tables,
+        },
+    }
 
 
 def _node_help(state: ChatState) -> ChatState:
@@ -1511,6 +1912,7 @@ def _node_select_blob_files(state: ChatState) -> ChatState:
                     selected.append(str(available[j]))
         if not selected:
             return {"reply": "Tell me which files to select (by indices or exact names) after running 'list files'.", "payload": {}}
+    _reset_file_preview_paging(ctx)
     ctx["selected_blob_files"] = selected
     # If user previously chose "Generate Report", run it now.
     if str(ctx.get("selected_action") or "").lower() == "report":
@@ -1603,6 +2005,7 @@ def _node_select_local_files(state: ChatState) -> ChatState:
                     selected.append(str(available[j]))
         if not selected:
             return {"reply": "Tell me which local files to select (by indices or exact names) after running 'list local files'.", "payload": {}}
+    _reset_file_preview_paging(ctx)
     ctx["selected_local_files"] = selected
     if str(ctx.get("selected_action") or "").lower() == "report":
         out = _node_assess_selected_local_files(state)
@@ -1651,68 +2054,170 @@ def _selected_file_mode_and_names(ctx: Dict[str, Any]) -> Tuple[str, List[str]]:
     return "none", []
 
 
+def _reset_file_preview_paging(ctx: Dict[str, Any]) -> None:
+    """Clear row offsets when the user changes the selected file set."""
+    ctx.pop("file_preview_offset", None)
+    ctx.pop("file_preview_offsets", None)
+
+
 def _node_preview_selected_file(state: ChatState) -> ChatState:
     """
-    Preview the currently selected file (first selected) with paging (10 rows at a time).
-    For multiple selected files, this previews the first one.
+    Preview selected file(s) with paging (default 10 rows at a time per file).
+    Multiple selections: show up to n rows from each file, with independent offsets.
     """
     ctx = state["session"].setdefault("context", {})
     mode, names = _selected_file_mode_and_names(ctx)
     if mode == "none" or not names:
         return {"reply": "No file selected. Select one or more files first.", "payload": {}}
 
-    fname = names[0]
     args = state.get("action_args") or {}
     try:
         n = int(args.get("n") or 10)
     except Exception:
         n = 10
     n = max(1, min(n, 50))
-    offset = int(ctx.get("file_preview_offset") or 0)
-    offset = max(0, offset)
+    max_files = 10
+    names_cap = names[:max_files]
+    more_files_note = f"\n\n_…(+{len(names) - max_files} more files not shown in this preview)_" if len(names) > max_files else ""
 
-    # Load a batch of rows (up to 500) using existing preview nodes.
-    if mode == "local":
-        out = _node_preview_local_file({"session": state["session"], "message": "", "action_args": {"name": fname, "n": 500}})
-    else:
-        out = _node_preview_blob_file({"session": state["session"], "message": "", "action_args": {"name": fname, "n": 500}})
-    rows = ((out.get("payload") or {}).get("rows") or [])
-    if not isinstance(rows, list):
-        rows = []
-    page = rows[offset : offset + n]
-    ctx["file_preview_offset"] = offset + len(page)
+    # --- Single file: keep legacy scalar offset (file_preview_offset).
+    if len(names_cap) == 1:
+        fname = names_cap[0]
+        offset = int(ctx.get("file_preview_offset") or 0)
+        offset = max(0, offset)
+        any_prior = offset > 0
 
-    rows_text = json.dumps(page, ensure_ascii=False, indent=2)
-    head_label = "📊 Next 10 rows" if offset > 0 else "📊 View top 10 rows"
-    # Themed HTML preview
-    cols = []
-    if page and isinstance(page[0], dict):
-        cols = list(page[0].keys())
-    html_rows = []
-    for r in page[:50]:
-        if isinstance(r, dict) and cols:
-            html_rows.append([r.get(c) for c in cols])
+        if mode == "local":
+            out = _node_preview_local_file(
+                {"session": state["session"], "message": "", "action_args": {"name": fname, "n": 500}}
+            )
         else:
-            html_rows.append([json.dumps(r, ensure_ascii=False)])
-    body_html = _html_table(cols if cols else ["row"], html_rows)
-    ui_html = _theme_wrap_html(title=f"Preview — {fname}", body_html=body_html)
+            out = _node_preview_blob_file(
+                {"session": state["session"], "message": "", "action_args": {"name": fname, "n": 500}}
+            )
+        rows = ((out.get("payload") or {}).get("rows") or [])
+        if not isinstance(rows, list):
+            rows = []
+        page = rows[offset : offset + n]
+        ctx["file_preview_offset"] = offset + len(page)
+
+        rows_text = json.dumps(page, ensure_ascii=False, indent=2)
+        head_label = "📊 Next 10 rows" if any_prior else "📊 View top 10 rows"
+        cols = []
+        if page and isinstance(page[0], dict):
+            cols = list(page[0].keys())
+        html_rows = []
+        for r in page[:50]:
+            if isinstance(r, dict) and cols:
+                html_rows.append([r.get(c) for c in cols])
+            else:
+                html_rows.append([json.dumps(r, ensure_ascii=False)])
+        body_html = _html_table(cols if cols else ["row"], html_rows)
+        ui_html = _theme_wrap_html(title=f"Preview — {fname}", body_html=body_html)
+        opts = _flow_options(
+            {"id": "head", "text": head_label, "send": "view top 10 rows"},
+            {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+            {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+            {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+            {"id": "menu", "text": "📋 Menu", "send": "menu"},
+            {"id": "back", "text": "🔙 Back", "send": "back"},
+            {"id": "restart", "text": "✅ Restart", "send": "restart"},
+        )
+        return {
+            "reply": f"Preview of `{fname}` (rows {offset + 1}–{offset + len(page)}):\n\n{rows_text}",
+            "payload": {
+                "step": "view_query",
+                "file": fname,
+                "rows": page,
+                "count": len(page),
+                "ui_html": ui_html,
+                "options": opts,
+            },
+        }
+
+    # --- Multiple files: per-file offsets in file_preview_offsets.
+    offsets = ctx.setdefault("file_preview_offsets", {})
+    for k in list(offsets.keys()):
+        if k not in names_cap:
+            del offsets[k]
+
+    any_prior = any(int(offsets.get(fname, 0)) > 0 for fname in names_cap)
+    head_label = "📊 Next 10 rows" if any_prior else "📊 View top 10 rows"
+    options = _flow_options(
+        {"id": "head", "text": head_label, "send": "view top 10 rows"},
+        {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
+        {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
+        {"id": "report", "text": "📄 Generate report", "send": "generate report"},
+        {"id": "menu", "text": "📋 Menu", "send": "menu"},
+        {"id": "back", "text": "🔙 Back", "send": "back"},
+        {"id": "restart", "text": "✅ Restart", "send": "restart"},
+    )
+
+    md_blocks: List[str] = []
+    html_parts: List[str] = []
+    preview_tables: List[Dict[str, Any]] = []
+    total_shown = 0
+
+    for fname in names_cap:
+        o = int(offsets.get(fname, 0))
+        o = max(0, o)
+        if mode == "local":
+            out = _node_preview_local_file(
+                {"session": state["session"], "message": "", "action_args": {"name": fname, "n": 500}}
+            )
+        else:
+            out = _node_preview_blob_file(
+                {"session": state["session"], "message": "", "action_args": {"name": fname, "n": 500}}
+            )
+        rows = ((out.get("payload") or {}).get("rows") or [])
+        if not isinstance(rows, list):
+            rows = []
+        page = rows[o : o + n]
+        offsets[fname] = o + len(page)
+        total_shown += len(page)
+
+        span_lo = o + 1
+        span_hi = o + len(page)
+        if not page:
+            md_blocks.append(f"### `{fname}`\n\n_(no more rows — end of file)_")
+            html_parts.append(f"<h2>{fname}</h2><p class='muted'>No more rows.</p>")
+            preview_tables.append({"file": fname, "rows": []})
+            continue
+
+        rows_text = json.dumps(page, ensure_ascii=False, indent=2)
+        md_blocks.append(f"### `{fname}` (rows {span_lo}–{span_hi})\n\n{rows_text}")
+
+        cols = list(page[0].keys()) if isinstance(page[0], dict) else []
+        html_rows = []
+        for r in page[:50]:
+            if isinstance(r, dict) and cols:
+                html_rows.append([r.get(c) for c in cols])
+            else:
+                html_rows.append([json.dumps(r, ensure_ascii=False)])
+        html_parts.append(f"<h2>{fname}</h2>" + _html_table(cols if cols else ["row"], html_rows))
+
+        page_clean: List[Any] = []
+        for r in page:
+            if isinstance(r, dict):
+                page_clean.append({k: v for k, v in r.items() if str(k) not in ("__source_file", "_source_file")})
+            else:
+                page_clean.append(r)
+        preview_tables.append({"file": fname, "rows": page_clean})
+
+    title = f"Preview — {len(names_cap)} files (up to {n} rows each)"
+    ui_html = _theme_wrap_html(title=title, body_html="".join(html_parts) if html_parts else "<p class='muted'>(empty)</p>")
+    reply_body = "\n\n".join(md_blocks) + more_files_note
+    summary = f"Showing **{total_shown}** row(s) across **{len(names_cap)}** file(s) (page size ≤{n} per file)." + more_files_note
+
     return {
-        "reply": f"Preview of `{fname}` (rows {offset + 1}–{offset + len(page)}):\n\n{rows_text}",
+        "reply": summary + "\n\n" + reply_body,
         "payload": {
             "step": "view_query",
-            "file": fname,
-            "rows": page,
-            "count": len(page),
+            "files": names_cap,
+            "preview_tables": preview_tables,
+            "count": total_shown,
             "ui_html": ui_html,
-            "options": _flow_options(
-                {"id": "head", "text": head_label, "send": "view top 10 rows"},
-                {"id": "schema", "text": "📊 Show schema", "send": "show schema"},
-                {"id": "meta", "text": "ℹ️ Show metadata", "send": "show metadata"},
-                {"id": "report", "text": "📄 Generate report", "send": "generate report"},
-                {"id": "menu", "text": "📋 Menu", "send": "menu"},
-                {"id": "back", "text": "🔙 Back", "send": "back"},
-                {"id": "restart", "text": "✅ Restart", "send": "restart"},
-            ),
+            "options": options,
         },
     }
 
@@ -2733,7 +3238,7 @@ def _node_nl_query(state: ChatState) -> ChatState:
     try:
         from agent.sql_nl_query import nl_to_sql_select
 
-        sql = nl_to_sql_select(question=question, table=table, columns=cols, max_rows=None)
+        sql, nlu = nl_to_sql_select(question=question, table=table, columns=cols, max_rows=None)
     except Exception as e:
         return {
             "reply": f"I can't translate your question to SQL yet: {e}",
@@ -2743,10 +3248,20 @@ def _node_nl_query(state: ChatState) -> ChatState:
         df = conn.execute_select(sql, max_rows=None)
         rows = df.head(50).to_dict(orient="records")
         from agent.pii_masking import mask_rows
+
         rows = mask_rows(rows)
-        return {"reply": f"Ran query on {table}. Returned {len(rows)} rows (showing up to 50).", "payload": {"sql": sql, "rows": rows}}
+        out_nl: ChatState = {
+            "reply": f"Ran query on {table}. Returned {len(rows)} rows (showing up to 50).",
+            "payload": {"sql": sql, "rows": rows},
+        }
+        if nlu:
+            out_nl["nl_sql_llm_usage"] = nlu  # type: ignore
+        return out_nl
     except Exception as e:
-        return {"reply": f"SQL execution failed: {e}", "payload": {"sql": sql}}
+        err_nl: ChatState = {"reply": f"SQL execution failed: {e}", "payload": {"sql": sql}}
+        if nlu:
+            err_nl["nl_sql_llm_usage"] = nlu  # type: ignore
+        return err_nl
 
 
 def _node_save_session(state: ChatState) -> ChatState:
@@ -2821,6 +3336,8 @@ def build_chat_graph():
     g.add_node("nl_query", _node_nl_query)
     g.add_node("show_null_columns", _node_show_null_columns)
     g.add_node("dq_overview", _node_dq_overview)
+    g.add_node("summarize_report", _node_summarize_report)
+    g.add_node("show_selection_status", _node_show_selection_status)
     g.add_node("dq_duplicates", _node_dq_duplicates)
     g.add_node("extract_columns", _node_extract_columns)
     g.add_node("save_session", _node_save_session)
@@ -2867,6 +3384,8 @@ def build_chat_graph():
             "nl_query": "nl_query",
             "show_null_columns": "show_null_columns",
             "dq_overview": "dq_overview",
+            "summarize_report": "summarize_report",
+            "show_selection_status": "show_selection_status",
             "dq_duplicates": "dq_duplicates",
             "extract_columns": "extract_columns",
         },
@@ -2905,6 +3424,8 @@ def build_chat_graph():
         "nl_query",
         "show_null_columns",
         "dq_overview",
+        "summarize_report",
+        "show_selection_status",
         "dq_duplicates",
         "extract_columns",
     ):
@@ -2915,6 +3436,18 @@ def build_chat_graph():
 
 def run_chat(*, session_id: str, message: str) -> Dict[str, Any]:
     graph = build_chat_graph()
-    out = graph.invoke({"session_id": session_id, "message": message})
-    return dict(out)
+    raw = dict(graph.invoke({"session_id": session_id, "message": message}))
+    # Merge LangGraph-side LLM usage into API payload for the frontend footer.
+    pl = dict(raw.get("payload") or {})
+    lum = dict(pl.get("llm_usage") or {})
+    ru = raw.get("router_llm_usage")
+    if isinstance(ru, dict) and ru:
+        lum["router"] = ru
+    nlu = raw.get("nl_sql_llm_usage")
+    if isinstance(nlu, dict) and nlu:
+        lum["nl_sql"] = nlu
+    if lum:
+        pl["llm_usage"] = lum
+    raw["payload"] = pl
+    return raw
 

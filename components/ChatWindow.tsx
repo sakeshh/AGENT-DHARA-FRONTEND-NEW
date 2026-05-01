@@ -434,6 +434,41 @@ export default function ChatWindow() {
     );
   };
 
+  const LlmUsageFooter = ({ usage }: { usage: Record<string, unknown> }) => {
+    const labels: Record<string, string> = {
+      router: 'Router',
+      nl_sql: 'NL→SQL',
+      cleaning_recommendations: 'Cleaning suggestions',
+    };
+    const segments: string[] = [];
+    let combined = 0;
+    for (const [step, raw] of Object.entries(usage || {})) {
+      if (!raw || typeof raw !== 'object') continue;
+      const u = raw as Record<string, unknown>;
+      const pt = typeof u.prompt_tokens === 'number' ? u.prompt_tokens : null;
+      const ct = typeof u.completion_tokens === 'number' ? u.completion_tokens : null;
+      const tt = typeof u.total_tokens === 'number' ? u.total_tokens : null;
+      if (typeof tt === 'number') combined += tt;
+      const detail =
+        typeof tt === 'number'
+          ? `${tt} total`
+          : [typeof pt === 'number' ? `prompt ${pt}` : '', typeof ct === 'number' ? `completion ${ct}` : '']
+              .filter(Boolean)
+              .join(', ') || '—';
+      segments.push(`${labels[step] ?? step}: ${detail}`);
+    }
+    if (!segments.length) return null;
+    return (
+      <p className="mt-2 border-t border-black/[0.06] pt-2 text-[11px] leading-snug text-black/50">
+        <span className="font-medium text-black/55">LLM tokens (API usage, approximate): </span>
+        {segments.join(' · ')}
+        {combined > 0 ? (
+          <span className="text-black/45"> · combined total {combined}</span>
+        ) : null}
+      </p>
+    );
+  };
+
   const renderBotContent = (text: string, payload?: any) => {
     const renderStructuredReportFromResult = (result: any) => {
       if (!result || typeof result !== 'object') return null;
@@ -529,6 +564,30 @@ export default function ChatWindow() {
         </div>
       );
     };
+
+    // Multi-file row preview: one table per file with the filename above each table.
+    if (Array.isArray(payload?.preview_tables) && payload.preview_tables.length > 0) {
+      return (
+        <div className="space-y-5">
+          {(payload.preview_tables as any[]).map((tbl: any, idx: number) => {
+            const fname = typeof tbl?.file === 'string' ? tbl.file : `File ${idx + 1}`;
+            const rws = Array.isArray(tbl?.rows) ? tbl.rows : [];
+            return (
+              <div key={`${fname}-${idx}`}>
+                <div className="mb-2 text-[13.5px] font-bold tracking-[0.01em] text-zinc-900">{fname}</div>
+                {rws.length > 0 ? (
+                  <JsonTable value={rws} />
+                ) : (
+                  <p className="rounded-lg border border-black/15 bg-white/60 px-3 py-2 text-[12.5px] italic text-black/60">
+                    End of file — no more rows to show.
+                  </p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
 
     // Prefer structured payload rendering when available (more reliable than parsing strings).
     if (Array.isArray(payload?.rows) && payload.rows.length > 0) {
@@ -748,7 +807,11 @@ export default function ChatWindow() {
   const renderRawBackendPayload = (payload?: any) => {
     if (!payload || typeof payload !== 'object') return null;
     const hasAny =
-      payload?.result !== undefined || payload?.schemas !== undefined || payload?.metadata !== undefined || payload?.rows !== undefined;
+      payload?.result !== undefined ||
+      payload?.schemas !== undefined ||
+      payload?.metadata !== undefined ||
+      payload?.rows !== undefined ||
+      payload?.preview_tables !== undefined;
     if (!hasAny) return null;
     return (
       <details className="rounded-xl border border-black/10 bg-white/70 px-3 py-2 text-[12px] text-zinc-900 shadow-[0_8px_22px_rgba(0,0,0,0.05)]">
@@ -764,6 +827,14 @@ export default function ChatWindow() {
             <div>
               <div className="mb-1 text-[11px] font-semibold text-black/70">payload.metadata</div>
               <JsonTable value={payload.metadata} />
+            </div>
+          ) : null}
+          {Array.isArray(payload?.preview_tables) && payload.preview_tables.length > 0 ? (
+            <div>
+              <div className="mb-1 text-[11px] font-semibold text-black/70">payload.preview_tables</div>
+              <pre className="max-h-[240px] overflow-auto whitespace-pre-wrap break-words rounded-md bg-white/90 p-2 font-mono text-[10px]">
+                {JSON.stringify(payload.preview_tables, null, 2)}
+              </pre>
             </div>
           ) : null}
           {payload?.rows !== undefined ? (
@@ -1214,6 +1285,10 @@ export default function ChatWindow() {
                       {message.sender === 'bot' ? (
                         <div className="space-y-2">
                           {renderBotContent(message.text, (message as any).payload)}
+                          {(message as any).payload?.llm_usage &&
+                          typeof (message as any).payload.llm_usage === 'object' ? (
+                            <LlmUsageFooter usage={(message as any).payload.llm_usage} />
+                          ) : null}
                           {showDebugPanels ? renderValidation((message as any).payload) : null}
                           {showDebugPanels ? renderRawBackendPayload((message as any).payload) : null}
                         </div>

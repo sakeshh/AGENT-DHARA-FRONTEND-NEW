@@ -140,7 +140,7 @@ def _node_dq_recommend(state: OrchestratorState) -> OrchestratorState:
     t0 = time.time()
     dq = state.get("data_quality") or {}
     agent = DQRecommendationsAgent()
-    rec = agent.recommend(merged_dq=dq, user_intent=state.get("user_request") or "")
+    rec, _usage = agent.recommend(merged_dq=dq, user_intent=state.get("user_request") or "")
     return {
         "dq_recommendations": dq_recommendations_to_dict(rec),
         "timings": _merge_timings(state, {"dq_recommend_ms": int((time.time() - t0) * 1000)}),

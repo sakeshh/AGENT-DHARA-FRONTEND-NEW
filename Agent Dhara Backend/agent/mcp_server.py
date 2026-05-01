@@ -274,7 +274,7 @@ def api_dq_recommend(payload: Dict[str, Any]) -> Dict[str, Any]:
         from agent.dq_recommendations_agent import DQRecommendationsAgent, dq_recommendations_to_dict
 
         agent = DQRecommendationsAgent()
-        rec = agent.recommend(merged_dq=dq, user_intent=user_intent)
+        rec, _usage = agent.recommend(merged_dq=dq, user_intent=user_intent)
         return {"ok": True, "recommendations": dq_recommendations_to_dict(rec)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

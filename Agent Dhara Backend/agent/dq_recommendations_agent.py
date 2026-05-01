@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.model_config import load_llm_config
+from agent.openai_usage import usage_dict_from_response
 
 
 @dataclass(frozen=True)
@@ -83,10 +84,15 @@ def _fallback(dq: Dict[str, Any]) -> DQRecommendations:
 
 
 class DQRecommendationsAgent:
-    def recommend(self, *, merged_dq: Dict[str, Any], user_intent: str = "") -> DQRecommendations:
+    def recommend(
+        self,
+        *,
+        merged_dq: Dict[str, Any],
+        user_intent: str = "",
+    ) -> Tuple[DQRecommendations, Optional[Dict[str, int]]]:
         cfg = load_llm_config(purpose="dq_recommendations")
         if cfg is None:
-            return _fallback(merged_dq)
+            return _fallback(merged_dq), None
 
         payload = {
             "user_intent": user_intent,
@@ -134,9 +140,10 @@ class DQRecommendationsAgent:
             for i, r in enumerate(recs):
                 if isinstance(r, dict) and "priority" not in r:
                     r["priority"] = i + 1
-            return DQRecommendations(recommendations=recs[:120], summary=summ)
+            usage = usage_dict_from_response(resp)
+            return DQRecommendations(recommendations=recs[:120], summary=summ), usage
         except Exception:
-            return _fallback(merged_dq)
+            return _fallback(merged_dq), None
 
 
 def dq_recommendations_to_dict(r: DQRecommendations) -> Dict[str, Any]:
