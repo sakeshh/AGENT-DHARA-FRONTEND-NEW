@@ -5,6 +5,9 @@ This module defines a small LangGraph workflow:
 - Route user request (MasterAgent.plan)
 - Extract per selected source location (ExtractionAgent, parallel)
 
+**Note:** Interactive chat uses a separate graph in `agent.chat_graph` (including
+`classify_intent` / conversational specialists); this orchestrator covers batch extraction/assessment flows.
+
 The workflow is designed to be callable from:
 - CLI glue code (future)
 - FastAPI endpoints (future)

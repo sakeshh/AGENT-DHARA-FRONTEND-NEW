@@ -76,13 +76,19 @@ def _first_location_index(source_root: Dict[str, Any], want_type: str) -> Option
     return None
 
 
-_MASTER_SYSTEM = """You are the Master (Supervisor) agent for a data exploration + data quality assistant.
+_MASTER_SYSTEM = """You are Agent Dhara’s Master (Supervisor) router for **data exploration + data quality only**.
 You MUST return ONLY valid JSON and nothing else.
 
 Your job:
 - Understand the user request in natural language.
 - Decide what action to take next (route to the right "agent": extraction vs data quality vs navigation).
 - Provide the minimal arguments needed to execute it.
+
+CORE PRODUCT RULES (must obey when choosing actions):
+- Answer the user’s **stated intent** with the **smallest** action that satisfies it. Prefer `summarize_report` for narrative “explain the report”, and DQ slice actions (`show_null_columns`, `dq_duplicates`, `dq_overview`) for narrow checks — do **not** default to huge prose unless the user clearly wants a full narrative.
+- Vague deictics (“this”, “too”, “fix this”) without a clear object → `show_selection_status` or `help` (ask what to operate on), not `summarize_report`.
+- Stocks / general coding / sports / trivia are **out of scope** → `help` with a short refusal tone is acceptable if no better action exists.
+- Never instruct downstream agents to invent data-quality issues or contradict a saved assessment verdict.
 
 Allowed actions (exact strings):
 help
@@ -103,6 +109,7 @@ extract_columns
 dq_overview
 dq_duplicates
 summarize_report
+relationships_overview
 list_blob_files
 select_blob_files
 assess_selected_files
@@ -137,7 +144,9 @@ Behavior rules:
   choose show_selection_status.
 - If the user asks you to summarize, explain in plain English, or give an executive summary of THE REPORT / assessment / findings,
   choose summarize_report (not dq_overview).
-- If the user asks a data-quality question (nulls, duplicates, outliers, issues, terse quality totals) AFTER a report was generated,
+- If the user asks about relationships between datasets/files, cardinality (one-to-many, many-to-one, etc.), how tables link or join,
+  foreign keys, overlaps between keys, or orphan / dangling key hints, choose relationships_overview (not dq_overview).
+- If the user asks a data-quality question (nulls, duplicates, outliers, per-dataset issue totals) AFTER a report was generated,
   choose a DQ action (dq_overview / show_null_columns / dq_duplicates) and answer from the latest assessment.
 - If the user asks for extraction (show columns, show top rows, preview data) for selected datasets, choose an extraction action.
 
@@ -152,6 +161,7 @@ Examples (JSON only):
 {"action":"assess_selected_files","args":{}}
 {"action":"dq_overview","args":{}}
 {"action":"summarize_report","args":{}}
+{"action":"relationships_overview","args":{}}
 {"action":"show_selection_status","args":{}}
 {"action":"extract_columns","args":{}}
 """
@@ -593,6 +603,31 @@ def _write_report_artifacts(
             f.write(report_html)
         paths["html"] = html_path
 
+    try:
+        import sys as _sys
+
+        _root = os.path.abspath(os.path.join(here, ".."))
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
+        import main as _main_mod
+
+        _sc = _main_mod.build_dq_scorecard(result)
+        _sug = result.get("transformation_suggestions") if isinstance(result.get("transformation_suggestions"), dict) else {}
+        if not isinstance(_sug.get("suggested_transformations"), list) or (_sug.get("_error")):
+            try:
+                from agent.transformation_suggester import suggest_transformations
+
+                _sug = suggest_transformations(result)
+            except Exception:
+                _sug = {"suggested_transformations": [], "summary": {}}
+        _mf = _main_mod.build_cleaning_manifest(result, _sug, _sc)
+        _mpath = os.path.join(reports_dir, "cleaning_manifest.json")
+        with open(_mpath, "w", encoding="utf-8") as _mfh:
+            json.dump(_mf, _mfh, indent=2, default=str)
+        paths["cleaning_manifest"] = _mpath
+    except Exception:
+        pass
+
     return {"reports_dir": reports_dir, "paths": paths}
 
 
@@ -666,6 +701,60 @@ def _assessment_signature(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "selected_blob_location_index": int(ctx.get("selected_blob_location_index") or 0),
         "selected_fs_location_index": int(ctx.get("selected_fs_location_index") or 0),
         "local_files_root": str(ctx.get("local_files_root") or ""),
+    }
+
+
+def _router_assessment_hints(ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Compact hints from last_assessment_result for the NL router LLM (supervisor context).
+    """
+    raw = ctx.get("last_assessment_result")
+    if not isinstance(raw, dict):
+        return None
+    ds_keys = raw.get("datasets") or {}
+    datasets = list(ds_keys.keys())[:35] if isinstance(ds_keys, dict) else []
+
+    rels_raw = raw.get("relationships") or []
+    rels_list = rels_raw if isinstance(rels_raw, list) else []
+    n_rels = len(rels_list)
+    cards_seen: List[str] = []
+    if rels_list:
+        for rel in rels_list[:80]:
+            if isinstance(rel, dict):
+                c = str(rel.get("cardinality") or "").strip()
+                if c:
+                    cards_seen.append(c)
+    cards_seen = sorted(set(cards_seen))[:10]
+
+    type_counts: Dict[str, int] = {}
+    dq_root = raw.get("data_quality_issues") or {}
+    per = dq_root.get("datasets") if isinstance(dq_root, dict) else None
+    if isinstance(per, dict):
+        for _dsn, block in per.items():
+            issues = (block or {}).get("issues") if isinstance(block, dict) else None
+            if not isinstance(issues, list):
+                continue
+            for iss in issues:
+                if isinstance(iss, dict):
+                    t = str(iss.get("type") or "").strip()
+                    if t:
+                        type_counts[t] = type_counts.get(t, 0) + 1
+    top_types = sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:12]
+
+    n_orphan = 0
+    gib = dq_root.get("global_issues") if isinstance(dq_root, dict) else None
+    if isinstance(gib, dict):
+        o = gib.get("orphan_foreign_keys")
+        if isinstance(o, list):
+            n_orphan = len(o)
+
+    return {
+        "has_cached_assessment": True,
+        "dataset_names": datasets,
+        "relationship_count": n_rels,
+        "cardinality_labels_present": cards_seen,
+        "top_data_quality_issue_types": [{"type": k, "occurrences_in_issue_list": v} for k, v in top_types],
+        "orphan_foreign_key_hint_count": n_orphan,
     }
 
 
@@ -1070,6 +1159,50 @@ def _user_wants_narrative_report_summary(raw: str) -> bool:
     return "in plain english" in r and ("report" in r or "assessment" in r)
 
 
+def _user_asks_relationships_focus(raw: str) -> bool:
+    """Follow-up intents about cardinality / joins / keys (not general executive summary)."""
+    r = (raw or "").strip().lower()
+    if not r:
+        return False
+    if _user_wants_narrative_report_summary(raw):
+        return False
+    # Avoid clashing with selection-only questions
+    if _user_asks_selection_status(raw):
+        return False
+    rel_tokens = (
+        "cardinality",
+        "relationship",
+        "relationships",
+        "how are the",
+        "how do the",
+        "how are my",
+        "how do my",
+        "link between",
+        "linked between",
+        "linking",
+        "foreign key",
+        "foreign keys",
+        "orphan key",
+        "orphan keys",
+        "orphan fk",
+        "dangling key",
+        "referential",
+        "overlap count",
+        "shared keys",
+        "which tables link",
+        "which files link",
+        "datasets link",
+        "join between",
+        "join the tables",
+        "joined",
+    )
+    if any(t in r for t in rel_tokens):
+        return True
+    if "join" in r and any(x in r for x in ("table", "file", "dataset", "data")):
+        return True
+    return False
+
+
 def _truncate_summary_text(s: str, max_len: int) -> str:
     s = (s or "").strip()
     if len(s) <= max_len:
@@ -1219,10 +1352,131 @@ def _markdown_narrative_assessment_summary(result: Dict[str, Any]) -> Optional[s
             "",
             "---",
             "",
-            "*Tip:* ask for **duplicates**, **columns with nulls**, or **cleaning recommendations** to go deeper on one theme.",
+            "*Tip:* ask about **relationships / cardinality**, **duplicates**, **columns with nulls**, or **cleaning recommendations** to go deeper.",
         ]
     )
     return "\n".join(parts)
+
+
+def _cardinality_glossary_line(label: str) -> str:
+    """Short deterministic explanation for common cardinality strings (G: grounded prose)."""
+    n = (label or "").strip().lower().replace(" ", "").replace("-", "_")
+    if not n:
+        return ""
+    if "manytomany" in n or n.endswith("m_n") or ("many" in n and n.count("many") >= 2):
+        return "Many rows on both sides can line up through the same key pattern; often modeled with a bridge entity in production schemas."
+    if "onetomany" in n or n == "one_to_many" or "1tom" in n:
+        return "One row on dataset A maps to potentially many matching rows on dataset B via the shared key column."
+    if "manytoone" in n or n == "many_to_one":
+        return "Many rows on A point to one matching row on B (same key value repeated on the A side)."
+    if "onetoone" in n or n == "one_to_one":
+        return "At most one row on each side aligns for a given key (1:1 in the sampled overlap)."
+    if "unknown" in n:
+        return "The engine could not infer a confident directional pattern from overlapping keys in the sample."
+    return "Inferred from key overlap in your loaded sample—it is not a guarantee of database-enforced constraints."
+
+
+def _node_relationships_overview(state: ChatState) -> ChatState:
+    """
+    Deterministic answer for cardinality / relationship / join questions (B+C+G).
+    Reads latest assessment JSON only—no free-form LLM generation.
+    """
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+    if not isinstance(result, dict):
+        return {"reply": "No structured assessment is available for this session yet.", "payload": {}}
+
+    rels_raw = result.get("relationships") or []
+    rels = rels_raw if isinstance(rels_raw, list) else []
+
+    dq = result.get("data_quality_issues") or {}
+    gbl = dq.get("global_issues") if isinstance(dq, dict) else None
+    gbl = gbl if isinstance(gbl, dict) else {}
+    orphans_raw = gbl.get("orphan_foreign_keys")
+    orphans = orphans_raw if isinstance(orphans_raw, list) else []
+
+    lines: List[str] = [
+        "### Relationships & cardinality (latest assessment)",
+        "",
+        "_These rows are derived from the assessment engine’s overlap scan on the data you loaded—not from live DB metadata._",
+        "",
+    ]
+
+    if not rels and not orphans:
+        lines.extend(
+            [
+                "No inferred **relationships** and no **orphan foreign-key hints** appear in this run.",
+                "",
+                "*Ask for **data quality overview** if you meant per-column issues rather than linkage between datasets.*",
+            ]
+        )
+        return {"reply": "\n".join(lines), "payload": {"step": "report", "relationships": [], "orphan_foreign_keys": []}}
+
+    if rels:
+        lines.extend(
+            [
+                "#### Detected links between datasets",
+                "",
+                "| Dataset A | Column A | Dataset B | Column B | Cardinality | Shared keys (overlap) |",
+                "|---|---|---|---|---:|---:|",
+            ]
+        )
+        for rel in rels[:40]:
+            if not isinstance(rel, dict):
+                continue
+            a = _md_escape(rel.get("dataset_a") or rel.get("from") or "")
+            b = _md_escape(rel.get("dataset_b") or rel.get("to") or "")
+            ca = _md_escape(rel.get("column_a") or "")
+            cb = _md_escape(rel.get("column_b") or "")
+            card_raw = rel.get("cardinality")
+            card = _md_escape(str(card_raw or "—"))
+            ov = rel.get("overlap_count")
+            try:
+                ov_s = str(int(ov)) if ov is not None else ""
+            except Exception:
+                ov_s = str(ov) if ov is not None else ""
+            lines.append(f"| `{a}` | `{ca}` | `{b}` | `{cb}` | {card} | {ov_s} |")
+        lines.append("")
+
+        cards_seen = sorted({str(r.get("cardinality") or "").strip() for r in rels if isinstance(r, dict) and r.get("cardinality")})
+        if cards_seen:
+            lines.extend(["#### What the cardinality labels mean", ""])
+            for c in cards_seen[:10]:
+                hint = _cardinality_glossary_line(c)
+                if hint:
+                    lines.append(f"- **{_md_escape(c)}** — {hint}")
+            lines.append("")
+
+    if orphans:
+        lines.extend(
+            [
+                "#### Orphan / referential hints (`global_issues`)",
+                "",
+                "_Values treated as FK-like references that lack a counterpart in the sampled parent keys._",
+                "",
+            ]
+        )
+        for i, o in enumerate(orphans[:20]):
+            if isinstance(o, dict):
+                snippet = json.dumps(o, ensure_ascii=False)
+            else:
+                snippet = str(o)
+            lines.append(f"{i + 1}. {snippet}")
+        if len(orphans) > 20:
+            lines.append(f"\n_(+{len(orphans) - 20} more rows omitted.)_")
+        lines.append("")
+
+    lines.append("---\n*Tip:* for **nulls** or **duplicates**, ask directly; for a full narrative, ask to **summarize the report**.")
+    reply = "\n".join(lines)
+    return {
+        "reply": reply,
+        "payload": {
+            "step": "report",
+            "relationships": rels,
+            "orphan_foreign_keys": orphans,
+        },
+    }
 
 
 def _node_summarize_report(state: ChatState) -> ChatState:
@@ -1327,15 +1581,18 @@ def _llm_plan(*, user_text: str, session: Dict[str, Any]) -> Dict[str, Any]:
         "recent_experiences": list(reversed(list_recent_experiences(session_id=sid, limit=10))),
     }
 
-    prompt = json.dumps(
-        {
-            "user_message": user,
-            "context": context_summary,
-            "available": available_lists,
-            "memory": memory,
-        },
-        ensure_ascii=False,
-    )
+    assessment_hints = _router_assessment_hints(ctx)
+
+    payload_for_router: Dict[str, Any] = {
+        "user_message": user,
+        "context": context_summary,
+        "available": available_lists,
+        "memory": memory,
+    }
+    if assessment_hints:
+        payload_for_router["last_assessment_hints"] = assessment_hints
+
+    prompt = json.dumps(payload_for_router, ensure_ascii=False)
     try:
         if cfg.provider == "azure_openai":
             from openai import AzureOpenAI  # type: ignore
@@ -1473,11 +1730,49 @@ def _node_route(state: ChatState) -> ChatState:
     if _user_asks_selection_status(raw):
         return {"action": "show_selection_status", "action_args": {}}
 
+    # Conversational intent routing (before generic DQ shortcuts: OOD, clarify, top-issues, etc.).
+    sess_c = state.get("session") or {}
+    ctx_c = sess_c.get("context", {}) if isinstance(sess_c, dict) else {}
+    if isinstance(ctx_c, dict):
+        from agent.conversational_intents import classify_intent, fallback_router_intent
+
+        msg_full = (state.get("message") or "").strip()
+        cid = classify_intent(msg_full, ctx_c)
+        if cid is None and len(msg_full) < 220:
+            fb = fallback_router_intent(msg_full, ctx_c)
+            if fb is not None:
+                cid = fb
+        if cid is not None:
+            intent = int(cid.get("intent") or 0)
+            has_res = isinstance(ctx_c.get("last_assessment_result"), dict)
+            if intent in (2, 3, 4, 5) and not has_res:
+                cid = None
+        if cid is not None:
+            intent = int(cid.get("intent") or 0)
+            route_map = {
+                1: "convo_full_report",
+                2: "convo_top_issues",
+                3: "convo_issue_filter",
+                4: "convo_triage",
+                5: "convo_cross_dataset",
+                6: "convo_clarify",
+                7: "convo_boundary_ood",
+                8: "convo_boundary_adv",
+            }
+            act = route_map.get(intent)
+            if act:
+                return {
+                    "action": act,
+                    "action_args": {"intent": intent, "reason": str(cid.get("reason") or "")},
+                }
+
     # DQ shortcuts: allow follow-up questions after a report without forcing "select table".
     if ("null" in raw or "missing" in raw) and ("column" in raw or "columns" in raw or "fields" in raw):
         return {"action": "show_null_columns", "action_args": {}}
     if _user_wants_narrative_report_summary(raw):
         return {"action": "summarize_report", "action_args": {}}
+    if _user_asks_relationships_focus(state.get("message", "") or ""):
+        return {"action": "relationships_overview", "action_args": {}}
     if any(k in raw for k in ("data quality", "dq", "quality issues", "issues summary", "quality summary", "dq summary")):
         return {"action": "dq_overview", "action_args": {}}
     if "duplicate" in raw:
@@ -3298,6 +3593,113 @@ def _node_save_session(state: ChatState) -> ChatState:
     return {}
 
 
+def _convo_followup_options() -> List[Dict[str, str]]:
+    return _flow_options(
+        {"id": "top", "text": "🎯 Top issues (short list)", "send": "list the top 5 data quality issues"},
+        {"id": "sum", "text": "📄 Narrative report summary", "send": "summarize the report"},
+        {"id": "rel", "text": "🔗 Relationships / joins", "send": "relationships between datasets"},
+        {"id": "dq", "text": "📊 DQ counts", "send": "data quality overview"},
+        {"id": "menu", "text": "📋 Menu", "send": "menu"},
+    )
+
+
+def _node_convo_top_issues(state: ChatState) -> ChatState:
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+    from agent.specialists.top_issues_specialist import format_top_issues
+
+    txt = format_top_issues(result, state.get("message") or "")
+    meta = state.get("action_args") or {}
+    return {
+        "reply": txt,
+        "payload": {"step": "convo", "intent": "top_issues", "intent_meta": meta, "options": _convo_followup_options()},
+    }
+
+
+def _node_convo_issue_filter(state: ChatState) -> ChatState:
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+    from agent.specialists.issue_filter_specialist import format_issue_filter
+
+    txt = format_issue_filter(result, state.get("message") or "")
+    meta = state.get("action_args") or {}
+    return {
+        "reply": txt,
+        "payload": {"step": "convo", "intent": "issue_filter", "intent_meta": meta, "options": _convo_followup_options()},
+    }
+
+
+def _node_convo_triage(state: ChatState) -> ChatState:
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+    from agent.specialists.triage_specialist import format_triage
+
+    txt = format_triage(result, state.get("message") or "")
+    meta = state.get("action_args") or {}
+    return {
+        "reply": txt,
+        "payload": {"step": "convo", "intent": "triage", "intent_meta": meta, "options": _convo_followup_options()},
+    }
+
+
+def _node_convo_cross_dataset(state: ChatState) -> ChatState:
+    result, err = _ensure_latest_assessment(state)
+    if err:
+        return {"reply": err, "payload": {}}
+    from agent.specialists.cross_dataset_agent import format_cross_dataset
+
+    txt = format_cross_dataset(result, state.get("message") or "")
+    meta = state.get("action_args") or {}
+    return {
+        "reply": txt,
+        "payload": {"step": "convo", "intent": "cross_dataset", "intent_meta": meta, "options": _convo_followup_options()},
+    }
+
+
+def _node_convo_clarify(state: ChatState) -> ChatState:
+    from agent.specialists.clarification_node import format_clarification
+
+    ctx = state["session"].get("context", {}) if isinstance(state.get("session"), dict) else {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+    txt = format_clarification(state.get("message") or "", ctx)
+    meta = state.get("action_args") or {}
+    return {
+        "reply": txt,
+        "payload": {"step": "convo", "intent": "clarify", "intent_meta": meta, "options": _convo_followup_options()},
+    }
+
+
+def _node_convo_boundary_ood(state: ChatState) -> ChatState:
+    from agent.specialists.boundary_refusal_node import format_boundary_ood
+
+    txt = format_boundary_ood(state.get("message") or "")
+    meta = state.get("action_args") or {}
+    return {
+        "reply": txt,
+        "payload": {"step": "convo", "intent": "boundary_ood", "intent_meta": meta, "options": _convo_followup_options()},
+    }
+
+
+def _node_convo_boundary_adv(state: ChatState) -> ChatState:
+    from agent.specialists.boundary_refusal_node import format_boundary_adversarial
+
+    ctx = state["session"].get("context", {}) if isinstance(state.get("session"), dict) else {}
+    res = ctx.get("last_assessment_result") if isinstance(ctx, dict) else None
+    txt = format_boundary_adversarial(
+        state.get("message") or "",
+        res if isinstance(res, dict) else None,
+    )
+    meta = state.get("action_args") or {}
+    return {
+        "reply": txt,
+        "payload": {"step": "convo", "intent": "boundary_adversarial", "intent_meta": meta, "options": _convo_followup_options()},
+    }
+
+
 def build_chat_graph():
     if StateGraph is None or END is None:
         raise ImportError("LangGraph not available")
@@ -3337,9 +3739,18 @@ def build_chat_graph():
     g.add_node("show_null_columns", _node_show_null_columns)
     g.add_node("dq_overview", _node_dq_overview)
     g.add_node("summarize_report", _node_summarize_report)
+    g.add_node("relationships_overview", _node_relationships_overview)
     g.add_node("show_selection_status", _node_show_selection_status)
     g.add_node("dq_duplicates", _node_dq_duplicates)
     g.add_node("extract_columns", _node_extract_columns)
+    g.add_node("convo_full_report", _node_summarize_report)
+    g.add_node("convo_top_issues", _node_convo_top_issues)
+    g.add_node("convo_issue_filter", _node_convo_issue_filter)
+    g.add_node("convo_triage", _node_convo_triage)
+    g.add_node("convo_cross_dataset", _node_convo_cross_dataset)
+    g.add_node("convo_clarify", _node_convo_clarify)
+    g.add_node("convo_boundary_ood", _node_convo_boundary_ood)
+    g.add_node("convo_boundary_adv", _node_convo_boundary_adv)
     g.add_node("save_session", _node_save_session)
 
     g.set_entry_point("load_session")
@@ -3385,9 +3796,18 @@ def build_chat_graph():
             "show_null_columns": "show_null_columns",
             "dq_overview": "dq_overview",
             "summarize_report": "summarize_report",
+            "relationships_overview": "relationships_overview",
             "show_selection_status": "show_selection_status",
             "dq_duplicates": "dq_duplicates",
             "extract_columns": "extract_columns",
+            "convo_full_report": "convo_full_report",
+            "convo_top_issues": "convo_top_issues",
+            "convo_issue_filter": "convo_issue_filter",
+            "convo_triage": "convo_triage",
+            "convo_cross_dataset": "convo_cross_dataset",
+            "convo_clarify": "convo_clarify",
+            "convo_boundary_ood": "convo_boundary_ood",
+            "convo_boundary_adv": "convo_boundary_adv",
         },
     )
 
@@ -3425,9 +3845,18 @@ def build_chat_graph():
         "show_null_columns",
         "dq_overview",
         "summarize_report",
+        "relationships_overview",
         "show_selection_status",
         "dq_duplicates",
         "extract_columns",
+        "convo_full_report",
+        "convo_top_issues",
+        "convo_issue_filter",
+        "convo_triage",
+        "convo_cross_dataset",
+        "convo_clarify",
+        "convo_boundary_ood",
+        "convo_boundary_adv",
     ):
         g.add_edge(n, "save_session")
     g.add_edge("save_session", END)

@@ -226,6 +226,13 @@ def build_args() -> argparse.Namespace:
     p.add_argument("--skip-azure", action="store_true", help="Do not access Azure Blob (offline)")
     p.add_argument("--dq-thresholds", default=None, help="Path to dq_thresholds.yaml (default: config/dq_thresholds.yaml)")
     p.add_argument(
+        "--export-manifest",
+        metavar="PATH",
+        default=None,
+        help="Write cleaning_manifest.json to PATH "
+        "(default with --reports-dir: <reports-dir>/cleaning_manifest.json unless overridden here).",
+    )
+    p.add_argument(
         "--llm-insights",
         action="store_true",
         help="After assessment, call Azure OpenAI for executive summary & risks (needs AZURE_OPENAI_* env).",
@@ -439,7 +446,12 @@ def _attach_run_metadata_and_suggestions(
         logger.warning("Report suggestions skipped: %s", e)
         result["transformation_suggestions"] = {
             "suggested_transformations": [],
-            "summary": {"total_suggestions": 0, "by_action": {}},
+            "summary": {
+                "total_suggestions": 0,
+                "by_action": {},
+                "auto_fixable_count": 0,
+                "manual_review_count": 0,
+            },
             "_error": str(e),
         }
 
@@ -460,10 +472,251 @@ def _dtype_with_inference(cmeta: Dict[str, Any]) -> str:
     return f"{d} ({inf})" if d == "object" and inf else str(d)
 
 
+def build_dq_scorecard(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Top-level readiness verdict and per-dataset score summary for banners
+    (HTML + Markdown reports).
+    """
+    datasets = result.get("datasets", {}) or {}
+    dq = result.get("data_quality_issues", {}) or {}
+    dq_ds = dq.get("datasets", {}) or {}
+
+    per_dataset: List[Dict[str, Any]] = []
+    total_rows = 0
+    total_high = total_medium = total_low = 0
+    total_affected_by_high = 0
+
+    for ds_name, ds_meta in datasets.items():
+        row_count = int(ds_meta.get("row_count", 0) or 0)
+        total_rows += row_count
+
+        summ = (dq_ds.get(ds_name) or {}).get("summary") or {}
+        raw_score = summ.get("dq_score_0_100")
+        try:
+            score = float(raw_score) if raw_score is not None else 0.0
+        except Exception:
+            score = 0.0
+
+        issues = (dq_ds.get(ds_name) or {}).get("issues") or []
+        if not isinstance(issues, list):
+            issues = []
+        high = sum(1 for i in issues if (i.get("severity") or "").lower() == "high")
+        medium = sum(1 for i in issues if (i.get("severity") or "").lower() == "medium")
+        low = sum(1 for i in issues if (i.get("severity") or "").lower() == "low")
+        affected_high = 0
+        for i in issues:
+            if (i.get("severity") or "").lower() == "high":
+                try:
+                    affected_high += int(i.get("count") or 0)
+                except Exception:
+                    pass
+
+        total_high += high
+        total_medium += medium
+        total_low += low
+        total_affected_by_high += affected_high
+
+        if score >= 70:
+            readiness = "READY"
+        elif score >= 35:
+            readiness = "NEEDS_WORK"
+        else:
+            readiness = "BLOCKED"
+
+        per_dataset.append(
+            {
+                "name": ds_name,
+                "dq_score": round(score, 1),
+                "readiness": readiness,
+                "row_count": row_count,
+                "high": high,
+                "medium": medium,
+                "low": low,
+                "rows_affected_by_high": affected_high,
+            }
+        )
+
+    order = {"BLOCKED": 0, "NEEDS_WORK": 1, "READY": 2}
+    per_dataset.sort(key=lambda x: (order[x["readiness"]], x["dq_score"]))
+
+    overall_score = (
+        sum(d["dq_score"] for d in per_dataset) / len(per_dataset) if per_dataset else 0.0
+    )
+
+    if any(d["readiness"] == "BLOCKED" for d in per_dataset):
+        verdict = "BLOCKED"
+    elif any(d["readiness"] == "NEEDS_WORK" for d in per_dataset):
+        verdict = "NEEDS_WORK"
+    else:
+        verdict = "READY"
+
+    # Sum of HIGH `count` can exceed row count (multiple issues touch the same row). Clamp UI % to [0, 100].
+    if total_rows > 0:
+        raw_pct = ((total_rows - total_affected_by_high) / total_rows) * 100.0
+        clean_rows_est = round(max(0.0, min(100.0, raw_pct)), 1)
+    else:
+        clean_rows_est = 100.0
+
+    return {
+        "verdict": verdict,
+        "overall_dq_score": round(overall_score, 1),
+        "total_issues": {"high": total_high, "medium": total_medium, "low": total_low},
+        "total_rows": total_rows,
+        "rows_affected_by_high": total_affected_by_high,
+        "estimated_clean_rows_pct": clean_rows_est,
+        "per_dataset": per_dataset,
+        "datasets_blocked": [d["name"] for d in per_dataset if d["readiness"] == "BLOCKED"],
+        "datasets_at_risk": [d["name"] for d in per_dataset if d["readiness"] == "NEEDS_WORK"],
+        "datasets_clean": [d["name"] for d in per_dataset if d["readiness"] == "READY"],
+    }
+
+
+def build_cleaning_manifest(
+    result: Dict[str, Any],
+    suggestions: Dict[str, Any],
+    scorecard: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Machine-readable per-column issue reference for ETL development."""
+    from datetime import datetime, timezone
+
+    datasets_out: Dict[str, Any] = {}
+    dq = result.get("data_quality_issues", {}) or {}
+    datasets_meta = result.get("datasets", {}) or {}
+    dq_ds = dq.get("datasets", {}) or {}
+
+    sug_by_key: Dict[str, Dict[str, Any]] = {}
+    for s in (suggestions or {}).get("suggested_transformations") or []:
+        if not isinstance(s, dict):
+            continue
+        ds = s.get("dataset") or ""
+        col = s.get("column")
+        it = s.get("issue_type")
+        sug_by_key[f"{ds}|{col}|{it}"] = s
+
+    for ds_name, ds_meta in datasets_meta.items():
+        issues_raw = (dq_ds.get(ds_name) or {}).get("issues", []) or []
+        ds_score_rows = [d for d in scorecard["per_dataset"] if d["name"] == ds_name]
+        readiness = ds_score_rows[0]["readiness"] if ds_score_rows else "UNKNOWN"
+        dq_score = ds_score_rows[0]["dq_score"] if ds_score_rows else 0.0
+
+        issues_out: List[Dict[str, Any]] = []
+        for issue in issues_raw:
+            if not isinstance(issue, dict):
+                continue
+            key = f"{ds_name}|{issue.get('column')}|{issue.get('type')}"
+            sug = sug_by_key.get(key, {})
+            manual_g = issue.get("manual_guidance") or sug.get("manual_guidance") or ""
+            issues_out.append(
+                {
+                    "column": issue.get("column"),
+                    "issue_type": issue.get("type"),
+                    "severity": issue.get("severity"),
+                    "rows_affected": issue.get("count"),
+                    "row_indexes": (issue.get("row_indexes") or [])[:100],
+                    "sample_bad_values": [str(v)[:80] for v in (issue.get("sample_values") or [])[:10]],
+                    "message": issue.get("message"),
+                    "recommended_action": issue.get("recommended_action")
+                    or sug.get("suggested_action")
+                    or "review_manually",
+                    "auto_fixable": bool(sug.get("auto_fixable"))
+                    if sug
+                    else bool(issue.get("auto_fixable", False)),
+                    "manual_guidance": manual_g,
+                }
+            )
+
+        severity_order = {"high": 0, "medium": 1, "low": 2}
+        issues_out.sort(key=lambda x: severity_order.get((x["severity"] or "low").lower(), 3))
+
+        datasets_out[ds_name] = {
+            "source_file": ds_name,
+            "row_count": ds_meta.get("row_count", 0),
+            "column_count": ds_meta.get("column_count", 0),
+            "dq_score": dq_score,
+            "readiness": readiness,
+            "total_issues": len(issues_out),
+            "issues_by_severity": {
+                "high": sum(1 for i in issues_out if (i["severity"] or "").lower() == "high"),
+                "medium": sum(1 for i in issues_out if (i["severity"] or "").lower() == "medium"),
+                "low": sum(1 for i in issues_out if (i["severity"] or "").lower() == "low"),
+            },
+            "issues": issues_out,
+        }
+
+    global_issues = dq.get("global_issues", {}) or {}
+    global_out: List[Dict[str, Any]] = []
+
+    for orphan in global_issues.get("orphan_foreign_keys", []) or []:
+        if not isinstance(orphan, dict):
+            continue
+        global_out.append(
+            {
+                "type": "orphan_foreign_key",
+                "from": orphan.get("from"),
+                "to": orphan.get("to"),
+                "orphan_count": orphan.get("orphan_count"),
+                "severity": "high",
+                "message": f"Orphan FKs: {orphan.get('from')} → {orphan.get('to')}",
+                "recommended_action": "validate_referential_integrity_or_stage",
+            }
+        )
+
+    for inc in global_issues.get("cross_dataset_inconsistencies", []) or []:
+        if not isinstance(inc, dict):
+            continue
+        global_out.append(
+            {
+                "type": "cross_dataset_inconsistency",
+                "dataset": inc.get("dataset"),
+                "column": inc.get("column"),
+                "datasets": inc.get("datasets"),
+                "severity": "medium",
+                "message": inc.get("message", ""),
+                "recommended_action": "review_manually",
+            }
+        )
+
+    return {
+        "manifest_version": "1.0",
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "verdict": scorecard["verdict"],
+        "overall_dq_score": scorecard["overall_dq_score"],
+        "total_datasets": len(datasets_out),
+        "summary": scorecard["total_issues"],
+        "datasets": datasets_out,
+        "global_issues": global_out,
+    }
+
+
 def build_markdown_report(result: Dict[str, Any]) -> str:
     """Build Markdown report from assessment result."""
     md: List[str] = []
     md.append("**Intelligent Data Assessment Report**\n")
+
+    sc = build_dq_scorecard(result)
+    v = sc["verdict"]
+    v_icon = "🔴" if v == "BLOCKED" else ("⚠️" if v == "NEEDS_WORK" else "✅")
+    v_label = v.replace("_", " ")
+    ti = sc["total_issues"]
+    md.append(f"## {v_icon} Data Quality Verdict: {v_label}")
+    md.append("")
+    md.append("| Metric | Value |")
+    md.append("|--------|-------|")
+    md.append(f"| Overall DQ Score | {sc['overall_dq_score']} / 100 |")
+    md.append(f"| High severity issues | {ti.get('high', 0)} |")
+    md.append(f"| Rows affected by HIGH issues | {sc['rows_affected_by_high']} |")
+    md.append(
+        f"| Approx. unaffected row share (HIGH; counts may overlap) | {sc['estimated_clean_rows_pct']}% |"
+    )
+    md.append("")
+    md.append("| Dataset | DQ Score | Readiness |")
+    md.append("|---------|----------|-----------|")
+    for d in sc["per_dataset"]:
+        r = d["readiness"]
+        ri = "🔴 BLOCKED" if r == "BLOCKED" else ("⚠️ NEEDS WORK" if r == "NEEDS_WORK" else "✅ READY")
+        md.append(f"| `{d['name']}` | {d['dq_score']} | {ri} |")
+    md.append("")
+
     datasets = result.get("datasets", {})
     rels = result.get("relationships", [])
     dq = result.get("data_quality_issues", {})
@@ -670,6 +923,7 @@ def build_html_report(result: Dict[str, Any]) -> str:
     dq_ds = dq.get("datasets", {})
     dq_global = dq.get("global_issues", {})
     exec_items = result.get("executive_summary_items") or []
+    scorecard = build_dq_scorecard(result)
     total_rows = sum(d.get("row_count", 0) for d in datasets.values())
     total_cols = sum(d.get("column_count", 0) for d in datasets.values())
     total_bytes = sum(d.get("data_volume_bytes", 0) for d in datasets.values())
@@ -911,13 +1165,64 @@ def build_html_report(result: Dict[str, Any]) -> str:
             except Exception:
                 score_html = f"<span class='badge sev-low'>DQ {esc(str(score))}/100</span>"
         clean_html = ""
+        try:
+            tr_i = int(rows) if rows is not None else 0
+        except Exception:
+            tr_i = 0
         if clean_h is not None or clean_hm is not None:
-            clean_html = "<div class='dataset-metrics'>"
+            rows_bits: List[str] = []
+            tail = ""
+            if tr_i > 0:
+                tail = f" <span class=\"muted\">(of {rows:,} sampled rows)</span>"
             if clean_h is not None:
-                clean_html += f"<span class='metric'><span class='label'>Clean after HIGH</span><span class='val'>{esc(str(clean_h))}</span></span>"
+                pct_h = None
+                if tr_i > 0:
+                    try:
+                        pct_h = round(100.0 * float(clean_h) / float(tr_i), 1)
+                    except Exception:
+                        pct_h = None
+                pct_part = (
+                    f" <span class=\"muted\">≈ {esc(pct_h)}% unaffected by HIGH severity</span>"
+                    if pct_h is not None
+                    else ""
+                )
+                rows_bits.append(
+                    "<div class=\"clean-est-row\">"
+                    "<span class=\"clean-est-label\">Rows with <strong>no HIGH</strong>-severity finding</span>"
+                    f"<span class=\"clean-est-value\">{esc(str(clean_h))}</span>"
+                    f"<span class=\"clean-est-tail\">{tail}{pct_part}</span>"
+                    "</div>"
+                )
             if clean_hm is not None:
-                clean_html += f"<span class='metric'><span class='label'>Clean after HIGH+MED</span><span class='val'>{esc(str(clean_hm))}</span></span>"
-            clean_html += "</div>"
+                pct_hm = None
+                if tr_i > 0:
+                    try:
+                        pct_hm = round(100.0 * float(clean_hm) / float(tr_i), 1)
+                    except Exception:
+                        pct_hm = None
+                pct_part = (
+                    f" <span class=\"muted\">≈ {esc(pct_hm)}% unaffected after HIGH+MEDIUM remediation</span>"
+                    if pct_hm is not None
+                    else ""
+                )
+                rows_bits.append(
+                    "<div class=\"clean-est-row\">"
+                    "<span class=\"clean-est-label\">Rows with <strong>no HIGH nor MEDIUM</strong> finding</span>"
+                    f"<span class=\"clean-est-value\">{esc(str(clean_hm))}</span>"
+                    f"<span class=\"clean-est-tail\">{tail}{pct_part}</span>"
+                    "</div>"
+                )
+            clean_html = (
+                '<aside class="dataset-clean-summary" aria-label="Remediation row estimates">'
+                "<p class=\"clean-summary-intro\">These counts are computed from overlapping HIGH/MEDIUM rows in this scan "
+                '(see <a href="#dq-scorecard">DQ verdict</a> for context).</p>'
+                + "".join(rows_bits)
+                + "</aside>"
+            )
+        n_high = len(buckets["high"])
+        n_med = len(buckets["medium"])
+        n_low = len(buckets["low"])
+        dq_details_open_attr = " open" if n_high > 0 else ""
         return f"""
         <div class="nest-file-card dataset-card depth-card" id="ds-{i}" data-path-group="{pi}">
           <button type="button" class="nest-toggle nest-level-3" aria-expanded="true" aria-controls="dbc-{i}">
@@ -934,9 +1239,14 @@ def build_html_report(result: Dict[str, Any]) -> str:
             <h4 class="block-title">Profile</h4>
             {profile_tbl}
             <h4 class="block-title">Data quality</h4>
+            <details class="dq-issue-details"{dq_details_open_attr}>
+              <summary class="dq-issue-summary">{esc(name)} — {n_high + n_med + n_low} issues ({n_high} HIGH · {n_med} MEDIUM · {n_low} LOW)</summary>
+              <div class="dq-issue-body">
             {render_dq_table('High severity', buckets['high'])}
             {render_dq_table('Medium severity', buckets['medium'])}
             {render_dq_table('Low severity', buckets['low'])}
+              </div>
+            </details>
           </div>
         </div>"""
 
@@ -1104,40 +1414,76 @@ def build_html_report(result: Dict[str, Any]) -> str:
     ts_block = result.get("transformation_suggestions") or {}
     raw_sug = list(ts_block.get("suggested_transformations") or [])
     _sev_rank = {"high": 0, "medium": 1, "low": 2}
-    top_sug = sorted(
-        raw_sug,
+    auto_sug = [s for s in raw_sug if s.get("suggested_action") != "review_manually"]
+    man_sug = [s for s in raw_sug if s.get("suggested_action") == "review_manually"]
+    auto_sug.sort(
         key=lambda x: (
             _sev_rank.get((x.get("severity") or "low").lower(), 3),
             str(x.get("dataset") or ""),
-        ),
-    )[:32]
+        )
+    )
+    man_sug.sort(
+        key=lambda x: (
+            _sev_rank.get((x.get("severity") or "low").lower(), 3),
+            str(x.get("dataset") or ""),
+        )
+    )
     nav_fix_link = ""
     suggestions_section_html = ""
-    if top_sug and not ts_block.get("_error"):
+    if raw_sug and not ts_block.get("_error"):
         nav_fix_link = (
             '\n  <a href="#suggested-fixes" class="nav-jump" data-expand-suggestions="1">Fix suggestions</a>'
         )
         total_ct = int(ts_block.get("summary", {}).get("total_suggestions") or len(raw_sug))
-        _srows = []
-        for s in top_sug:
-            _srows.append(
+        auto_ct = int(ts_block.get("summary", {}).get("auto_fixable_count") or len(auto_sug))
+        man_ct = int(ts_block.get("summary", {}).get("manual_review_count") or len(man_sug))
+        _auto_rows = []
+        for s in auto_sug:
+            _auto_rows.append(
                 "<tr>"
                 f'<td><span class="badge sug-act">{esc(s.get("suggested_action", ""))}</span></td>'
                 f'<td><code>{esc(s.get("dataset") or "—")}</code></td>'
                 f'<td><code>{esc(s.get("column") or "—")}</code></td>'
                 f'<td><span class="badge sev-{esc((s.get("severity") or "low").lower())}">{esc(s.get("severity"))}</span></td>'
-                f'<td class="msg-cell">{esc((s.get("message") or "")[:220])}</td>'
+                f'<td class="msg-cell">{esc((s.get("message") or "")[:400])}</td>'
                 "</tr>"
             )
-        _sug_inner = (
-            '<p class="section-lead">Rule-based actions from DQ signals. Showing <strong>'
-            f"{len(top_sug)}</strong> of <strong>{total_ct}</strong>. Full manifest: "
-            "the assessment JSON output.</p>"
-            '<div class="table-wrap"><table class="data-table suggestions-table"><thead><tr>'
+        _man_rows = []
+        for s in man_sug:
+            _man_rows.append(
+                "<tr>"
+                f'<td><code>{esc(s.get("dataset") or "—")}</code></td>'
+                f'<td><code>{esc(s.get("column") or "—")}</code></td>'
+                f'<td><code>{esc(s.get("issue_type") or "—")}</code></td>'
+                f'<td><span class="badge sev-{esc((s.get("severity") or "low").lower())}">{esc(s.get("severity"))}</span></td>'
+                f"<td>{esc(s.get('row_count_affected')) if s.get('row_count_affected') is not None else '—'}</td>"
+                f'<td class="msg-cell manual-guidance-cell">{esc(s.get("manual_guidance") or "")}</td>'
+                "</tr>"
+            )
+        _auto_tbl = (
+            "<h3 class=\"sug-subtitle sug-auto\">Auto-fixable issues</h3>"
+            "<p class=\"section-lead\">Rule-based actions from DQ signals. "
+            f"Showing all <strong>{len(auto_sug)}</strong> auto-fixable suggestion(s) "
+            f"(of <strong>{total_ct}</strong> total).</p>"
+            '<div class="table-wrap"><table class="data-table suggestions-table suggestions-auto"><thead><tr>'
             "<th>Action</th><th>Dataset</th><th>Column</th><th>Severity</th><th>Context</th>"
             "</tr></thead><tbody>"
-            + "".join(_srows)
+            + ("".join(_auto_rows) if _auto_rows else "<tr><td colspan='5' class='muted'>(none)</td></tr>")
             + "</tbody></table></div>"
+        )
+        _man_tbl = (
+            '<h3 class="sug-subtitle sug-manual">⚠️ Manual review required (ETL design decisions)</h3>'
+            f"<p class=\"section-lead\">{man_ct} item(s) need human decisions before coding ETL logic.</p>"
+            '<div class="table-wrap"><table class="data-table suggestions-table suggestions-manual"><thead><tr>'
+            "<th>Dataset</th><th>Column</th><th>Issue type</th><th>Severity</th><th>Rows affected</th><th>ETL guidance</th>"
+            "</tr></thead><tbody>"
+            + ("".join(_man_rows) if _man_rows else "<tr><td colspan='6' class='muted'>(none)</td></tr>")
+            + "</tbody></table></div>"
+        )
+        _sug_inner = (
+            f"<p class=\"sug-summary-inline muted\">Summary: total={total_ct}, auto-fixable={auto_ct}, manual review={man_ct}</p>"
+            + _auto_tbl
+            + _man_tbl
         )
         suggestions_section_html = (
             '<section id="suggested-fixes" class="suggestions-section-wrap">'
@@ -1161,6 +1507,106 @@ def build_html_report(result: Dict[str, Any]) -> str:
             "</div></section>"
         )
 
+    v_vc = scorecard["verdict"]
+    v_human = v_vc.replace("_", " ")
+    ban_cls = {
+        "BLOCKED": "scorecard-banner scorecard-blocked",
+        "NEEDS_WORK": "scorecard-banner scorecard-needs",
+        "READY": "scorecard-banner scorecard-ready",
+    }.get(v_vc, "scorecard-banner scorecard-ready")
+    ti_sc = scorecard["total_issues"]
+    ds_score_bits = []
+    for d in scorecard["per_dataset"]:
+        try:
+            pct = float(d["dq_score"])
+        except Exception:
+            pct = 0.0
+        w = max(0.0, min(100.0, pct))
+        fc = "score-fill-low" if pct < 35 else ("score-fill-med" if pct < 70 else "score-fill-high")
+        br = d["readiness"]
+        rb = "badge-ready" if br == "READY" else ("badge-needs" if br == "NEEDS_WORK" else "badge-blocked")
+        icon = "✅" if br == "READY" else ("⚠️" if br == "NEEDS_WORK" else "🔴")
+        ds_score_bits.append(
+            f'<div class="ds-score-row"><span class="ds-name">{esc(d["name"])}</span>'
+            f'<div class="score-bar"><div class="score-fill {fc}" style="width:{w}%"></div></div>'
+            f'<span class="score-value">{esc(d["dq_score"])}/100</span>'
+            f'<span class="badge {rb}">{icon} {esc(br)}</span></div>'
+        )
+    verdict_title_icon = "🔴" if v_vc == "BLOCKED" else ("⚠️" if v_vc == "NEEDS_WORK" else "✅")
+    scorecard_banner_html = (
+        '<section id="dq-scorecard" class="dq-scorecard-section">'
+        f'<div class="{ban_cls}">'
+        f'<div class="scorecard-verdict-row"><span class="v-ico">{verdict_title_icon}</span> '
+        f'<span class="v-text">Data quality verdict: <strong>{esc(v_human)}</strong></span></div>'
+        "<div class=\"scorecard-metrics\">Overall DQ score: "
+        f"<strong>{esc(scorecard['overall_dq_score'])}</strong> / 100 · "
+        f"High severity issues: <strong>{ti_sc.get('high', 0)}</strong> · "
+        f"Rows affected by HIGH: <strong>{esc(scorecard['rows_affected_by_high'])}</strong> · "
+        "<span title=\"Based on summed HIGH issue counts; same row may be counted multiple times — value is clamped 0–100%.\">"
+        f'Approx. row share unaffected by HIGH (UI estimate): <strong>{esc(scorecard["estimated_clean_rows_pct"])}%</strong>'
+        "</span></div>"
+        f'<div class="scorecard-bar-list">{"".join(ds_score_bits)}</div>'
+        "</div>"
+        '<div class="manifest-callout">'
+        "<strong>Machine-readable manifest</strong> — export run writes <code>cleaning_manifest.json</code> next to "
+        "<code>report.html</code>. Use it when implementing ETL: issues, row indexes, samples, and recommended actions." 
+        "</div>"
+        "</section>"
+    )
+
+    _report_extra_css = """
+.dq-scorecard-section { margin: 0 0 1.25rem 0; max-width: 1100px; margin-left: auto; margin-right: auto; padding: 0 1rem; }
+.scorecard-banner { border-radius: 12px; padding: 1rem 1.25rem 1.1rem; border: 2px solid #cbd5e1; }
+.scorecard-blocked { background: #fee2e2; border-color: #b91c1c; }
+.scorecard-needs { background: #fef3c7; border-color: #b45309; }
+.scorecard-ready { background: #dcfce7; border-color: #15803d; }
+.scorecard-verdict-row { font-size: 1.25rem; font-weight: 700; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.35rem; }
+.scorecard-metrics { font-size: 0.95rem; margin-bottom: 0.75rem; color: #1f2937; }
+.scorecard-bar-list { margin-top: 0.5rem; }
+.ds-score-row { display: flex; align-items: center; gap: 0.6rem; margin: 0.45rem 0; flex-wrap: wrap; }
+.ds-name { min-width: 140px; font-weight: 600; font-size: 0.88rem; }
+.score-bar { flex: 1; min-width: 120px; height: 10px; background: rgba(255,255,255,0.65); border-radius: 999px; overflow: hidden; border: 1px solid rgba(0,0,0,0.08); }
+.score-fill { height: 100%; border-radius: 999px; }
+.score-fill-low { background: linear-gradient(90deg, #ef4444, #f87171); }
+.score-fill-med { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+.score-fill-high { background: linear-gradient(90deg, #22c55e, #4ade80); }
+.score-value { font-size: 0.85rem; font-weight: 600; min-width: 52px; text-align: right; }
+.badge-blocked { background: #fecaca; color: #7f1d1d; }
+.badge-needs { background: #fde68a; color: #78350f; }
+.badge-ready { background: #bbf7d0; color: #14532d; }
+.manifest-callout { margin-top: 0.75rem; padding: 0.65rem 0.85rem; border-radius: 8px; border: 1px dashed #64748b; background: #f8fafc; font-size: 0.88rem; }
+.dq-issue-details { border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.25rem 0.5rem; margin-top: 0.35rem; background: rgba(248,250,252,0.9); }
+.dq-issue-summary { cursor: pointer; font-weight: 600; padding: 0.35rem 0.25rem; }
+.dq-issue-body { padding: 0.35rem 0.15rem 0.6rem; }
+.suggestions-manual .manual-guidance-cell { font-size: 0.82rem; }
+.suggestions-manual thead { background: #fef9c3; }
+.suggestions-auto thead { background: #ccfbf1; }
+.sug-subtitle { margin: 1rem 0 0.35rem; font-size: 1rem; }
+.sug-summary-inline { margin: 0 0 0.5rem 0; }
+.dataset-clean-summary {
+  margin: 0.6rem 0 1rem;
+  padding: 0.65rem 0.85rem;
+  border-radius: 8px;
+  border-left: 4px solid #0070ad;
+  background: rgba(0, 112, 173, 0.06);
+  font-size: 0.9rem;
+}
+.clean-summary-intro { margin: 0 0 0.55rem 0; font-size: 0.84rem; color: #334155; line-height: 1.4; }
+.clean-est-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 0.85rem;
+  row-gap: 0.25rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.07);
+}
+.clean-est-row:last-child { border-bottom: none; }
+.clean-est-label { flex: 1 1 50%; min-width: min(100%, 280px); line-height: 1.35; }
+.clean-est-value { font-weight: 700; font-size: 1.12rem; flex: 0 0 auto; }
+.clean-est-tail { flex: 1 1 100%; margin: 0; line-height: 1.35; }
+"""
+
     _report_css = get_report_html_css()
     return (
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
@@ -1169,12 +1615,15 @@ def build_html_report(result: Dict[str, Any]) -> str:
         "<title>Data assessment report</title>\n"
         "<style>\n"
         + _report_css
+        + "\n"
+        + _report_extra_css
         + "\n</style>\n"
         "</head>\n<body>\n"
         + f"""<div id="toast" class="toast" role="status">Copied to clipboard</div>
 <div class="wrap">
 <nav class="nav-rail" aria-label="Quick navigation">
   <span class="nav-brand">AGENT DHARA</span>
+  <a href="#dq-scorecard" class="nav-jump">DQ verdict</a>
   <a href="#overview" class="nav-jump">Overview</a>
   <a href="#datasets" class="nav-jump" data-expand-datasets="1">Datasets</a>
   <a href="#relations" class="nav-jump" data-expand-relations="1">Relations</a>
@@ -1189,6 +1638,7 @@ def build_html_report(result: Dict[str, Any]) -> str:
   <div class="sub">Generated {esc(dt)}</div>
 </header>
 </div>
+{scorecard_banner_html}
 <section id="overview">
 <h2>Overview</h2>
 <p class="section-lead">Aggregate view of assessed datasets: volume, shape, and footprint.</p>
@@ -1856,6 +2306,33 @@ def main():
         with open(os.path.join(reports_dir, "report.html"), "w", encoding="utf-8") as f:
             f.write(html_full)
         logger.info("Wrote %s", os.path.join(reports_dir, "report.html"))
+        if args.export_manifest:
+            manifest_path = args.export_manifest
+        else:
+            manifest_path = os.path.join(reports_dir, "cleaning_manifest.json")
+        try:
+            sc_m = build_dq_scorecard(result)
+            mf = build_cleaning_manifest(result, result.get("transformation_suggestions") or {}, sc_m)
+            _ensure_parent(manifest_path)
+            with open(manifest_path, "w", encoding="utf-8") as mf_h:
+                json.dump(mf, mf_h, indent=2, default=to_json_safe)
+            logger.info("Cleaning manifest written: %s", manifest_path)
+            print(f"✅ Cleaning manifest written: {manifest_path}")
+        except Exception as e:
+            logger.warning("Cleaning manifest skipped: %s", e)
+
+    elif getattr(args, "export_manifest", None):
+        try:
+            sc_m = build_dq_scorecard(result)
+            mf = build_cleaning_manifest(result, result.get("transformation_suggestions") or {}, sc_m)
+            manifest_path = args.export_manifest
+            _ensure_parent(manifest_path)
+            with open(manifest_path, "w", encoding="utf-8") as mf_h:
+                json.dump(mf, mf_h, indent=2, default=to_json_safe)
+            logger.info("Cleaning manifest written: %s", manifest_path)
+            print(f"✅ Cleaning manifest written: {manifest_path}")
+        except Exception as e:
+            logger.warning("Cleaning manifest failed: %s", e)
 
     pf_input = None
     try:

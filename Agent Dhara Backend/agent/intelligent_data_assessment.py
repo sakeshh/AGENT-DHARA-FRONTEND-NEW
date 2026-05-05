@@ -1667,6 +1667,203 @@ def run_extended_dq_checks(
     return issues
 
 
+def check_conditional_rules(df: pd.DataFrame, rules: List[Dict[str, Any]], ds_name: str) -> List[Dict[str, Any]]:
+    """
+    Evaluates cross-column conditional rules from dq_thresholds.yaml (`conditional_rules`).
+    Returns DQ-shaped issue dicts.
+    """
+    issues: List[Dict[str, Any]] = []
+
+    for rule in rules or []:
+        if not isinstance(rule, dict):
+            continue
+        rule_type = rule.get("type")
+        severity = str(rule.get("severity", "medium")).lower()
+
+        try:
+            if rule_type == "conditional_not_null":
+                when_col = rule["when_column"]
+                when_val = rule["when_value"]
+                then_col = rule["then_column"]
+                if when_col not in df.columns or then_col not in df.columns:
+                    continue
+                mask = (
+                    df[when_col].astype(str).str.strip().eq(str(when_val)) & df[then_col].isna()
+                )
+                bad_rows = df.loc[mask]
+                if len(bad_rows) > 0:
+                    issues.append(
+                        dq_issue(
+                            severity,
+                            "conditional_not_null",
+                            f"'{then_col}' must not be null when '{when_col}' = '{when_val}'. "
+                            f"{len(bad_rows)} violations found.",
+                            column=then_col,
+                            count=int(len(bad_rows)),
+                            rows=bad_rows.index.tolist(),
+                            sample=list(bad_rows[then_col].head(5)),
+                        )
+                    )
+                    issues[-1]["recommended_action"] = "add_conditional_not_null_check_in_etl"
+                    issues[-1]["auto_fixable"] = False
+                    issues[-1]["manual_guidance"] = (
+                        f"Add ETL guard: when {when_col} = '{when_val}', "
+                        f"reject or flag rows where {then_col} IS NULL."
+                    )
+                    issues[-1]["rule_context"] = rule
+
+            elif rule_type == "conditional_format":
+                when_col = rule["when_column"]
+                when_val = rule["when_value"]
+                then_col = rule["then_column"]
+                then_regex = str(rule["then_regex"])
+                if when_col not in df.columns or then_col not in df.columns:
+                    continue
+                pattern = re.compile(then_regex)
+                m_when = df[when_col].astype(str).str.strip().eq(str(when_val))
+                then_series = df[then_col]
+
+                def _ok(cell: Any) -> bool:
+                    if pd.isna(cell):
+                        return False
+                    return pattern.match(str(cell)) is not None
+
+                mask = m_when & ~then_series.map(_ok)
+                bad_rows = df.loc[mask]
+                if len(bad_rows) > 0:
+                    issues.append(
+                        dq_issue(
+                            severity,
+                            "conditional_format",
+                            f"'{then_col}' must match '{then_regex}' when '{when_col}' = '{when_val}'. "
+                            f"{len(bad_rows)} violations.",
+                            column=then_col,
+                            count=int(len(bad_rows)),
+                            rows=bad_rows.index.tolist(),
+                            sample=list(bad_rows[then_col].head(5)),
+                        )
+                    )
+                    issues[-1]["recommended_action"] = "add_conditional_format_check_in_etl"
+                    issues[-1]["auto_fixable"] = False
+                    issues[-1]["manual_guidance"] = (
+                        f"Add ETL format branch: when {when_col} = '{when_val}', "
+                        f"validate {then_col} against pattern: {then_regex}"
+                    )
+                    issues[-1]["rule_context"] = rule
+
+            elif rule_type == "conditional_range":
+                when_col = rule["when_column"]
+                when_val = rule["when_value"]
+                then_col = rule["then_column"]
+                min_val = rule.get("min")
+                max_val = rule.get("max")
+                if when_col not in df.columns or then_col not in df.columns:
+                    continue
+                cond = df[when_col].astype(str).str.strip().eq(str(when_val))
+                sub = df.loc[cond]
+                if sub.empty:
+                    continue
+                numeric = pd.to_numeric(sub[then_col], errors="coerce")
+                viol = numeric.isna() & sub[then_col].notna()
+                if min_val is not None:
+                    viol |= numeric.notna() & (numeric < float(min_val))
+                if max_val is not None:
+                    viol |= numeric.notna() & (numeric > float(max_val))
+                bad_rows = sub.loc[viol]
+                if len(bad_rows) > 0:
+                    issues.append(
+                        dq_issue(
+                            severity,
+                            "conditional_range",
+                            f"'{then_col}' must be between {min_val} and {max_val} when "
+                            f"'{when_col}' = '{when_val}'. {len(bad_rows)} violations.",
+                            column=then_col,
+                            count=int(len(bad_rows)),
+                            rows=bad_rows.index.tolist(),
+                            sample=list(bad_rows[then_col].head(5)),
+                        )
+                    )
+                    issues[-1]["recommended_action"] = "add_conditional_range_check_in_etl"
+                    issues[-1]["auto_fixable"] = False
+                    issues[-1]["manual_guidance"] = (
+                        f"Add ETL range guard: when {when_col} = '{when_val}', "
+                        f"reject rows where {then_col} < {min_val} or > {max_val}."
+                    )
+                    issues[-1]["rule_context"] = rule
+
+            elif rule_type == "mutual_exclusion":
+                columns = rule.get("columns") or []
+                existing = [c for c in columns if c in df.columns]
+                if len(existing) < 2:
+                    continue
+                mask = df[existing].notna().all(axis=1)
+                bad_rows = df.loc[mask]
+                if len(bad_rows) > 0:
+                    col_label = ",".join(existing)
+                    issues.append(
+                        dq_issue(
+                            severity,
+                            "mutual_exclusion",
+                            f"Columns {existing} must not all be filled simultaneously. "
+                            f"{len(bad_rows)} rows violate mutual exclusion.",
+                            column=col_label,
+                            count=int(len(bad_rows)),
+                            rows=bad_rows.index.tolist(),
+                        )
+                    )
+                    issues[-1]["recommended_action"] = "add_mutual_exclusion_check_in_etl"
+                    issues[-1]["auto_fixable"] = False
+                    issues[-1]["manual_guidance"] = (
+                        f"Add ETL validation: only one of {existing} should be non-null per row."
+                    )
+                    issues[-1]["rule_context"] = rule
+
+            elif rule_type == "at_least_one":
+                columns = rule.get("columns") or []
+                existing = [c for c in columns if c in df.columns]
+                if not existing:
+                    continue
+                mask = df[existing].isna().all(axis=1)
+                bad_rows = df.loc[mask]
+                if len(bad_rows) > 0:
+                    col_label = ",".join(existing)
+                    issues.append(
+                        dq_issue(
+                            severity,
+                            "at_least_one",
+                            f"At least one of {existing} must be non-null. "
+                            f"{len(bad_rows)} rows have all null.",
+                            column=col_label,
+                            count=int(len(bad_rows)),
+                            rows=bad_rows.index.tolist(),
+                        )
+                    )
+                    issues[-1]["recommended_action"] = "add_at_least_one_check_in_etl"
+                    issues[-1]["auto_fixable"] = False
+                    issues[-1]["manual_guidance"] = (
+                        f"Add ETL guard: reject rows where ALL of {existing} are null."
+                    )
+                    issues[-1]["rule_context"] = rule
+
+        except Exception as e:
+            issues.append(
+                {
+                    "severity": "low",
+                    "type": "conditional_rule_error",
+                    "column": None,
+                    "count": None,
+                    "row_indexes": [],
+                    "sample_values": [],
+                    "message": f"Rule evaluation error ({rule_type}): {str(e)}",
+                    "fixability": "COMPLEX",
+                    "recommended_action": "review_manually",
+                    "auto_fixable": False,
+                }
+            )
+
+    return issues
+
+
 def analyze_dataset_quality(
     name: str,
     df: pd.DataFrame,
@@ -1720,6 +1917,13 @@ def analyze_dataset_quality(
                                        column=col))
 
     issues.extend(run_extended_dq_checks(df, profile, thresholds))
+
+    conditional_rules = (thresholds or {}).get("conditional_rules") or []
+    if conditional_rules:
+        cond_iss = check_conditional_rules(df, conditional_rules, name)
+        for ci in cond_iss:
+            enrich_issue_with_fixability(ci)
+        issues.extend(cond_iss)
 
     # DQ score (0-100) and clean row estimates
     try:

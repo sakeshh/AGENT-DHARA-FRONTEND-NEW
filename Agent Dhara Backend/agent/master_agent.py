@@ -321,3 +321,13 @@ class MasterAgent:
         locations = select_locations(source_root, merged or None)
         return source_root, locations
 
+
+def classify_intent(message: str, context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """
+    Classify a chat message into conversational intents (1–8) used by `agent.chat_graph`.
+    Returns None when the legacy LLM router should decide.
+    """
+    from agent.conversational_intents import classify_intent as _classify_intent
+
+    return _classify_intent(message, context or {})
+

@@ -4,6 +4,7 @@ import { useMemo, useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { FaChartBar, FaExclamationTriangle, FaCheckCircle, FaThumbsUp, FaThumbsDown, FaWrench } from 'react-icons/fa';
 import ReportEnhancements from '@/components/ReportEnhancements';
+import { sourceRootLabel } from '@/lib/assessmentDisplay';
 
 interface DataAssessmentReportProps {
   files: string[];
@@ -80,20 +81,6 @@ type UiDatasetSummary = {
   low: number;
 };
 
-function sourceLabelFromRoot(sourceRoot?: string): string {
-  const sr = String(sourceRoot || '');
-  if (!sr) return '';
-  if (sr.startsWith('__database__')) {
-    const label = sr.includes(':') ? sr.split(':', 2)[1] : '';
-    return `Azure SQL${label ? ` (${label})` : ''}`;
-  }
-  if (sr.startsWith('azure_blob:')) {
-    const prefix = sr.split(':', 2)[1] ?? '';
-    return `Azure Blob${prefix ? ` (${prefix})` : ''}`;
-  }
-  return `Filesystem (${sr})`;
-}
-
 function normalizeSeverity(s: any): Severity {
   const t = String(s || '').toLowerCase();
   if (t === 'high') return 'high';
@@ -129,7 +116,7 @@ export default function DataAssessmentReport({
       const summ = dq?.[name]?.summary || {};
       return {
         name,
-        sourceLabel: sourceLabelFromRoot(meta?.source_root),
+        sourceLabel: sourceRootLabel(meta?.source_root),
         rows: Number(meta?.row_count ?? 0) || 0,
         cols: Number(meta?.column_count ?? 0) || 0,
         issues: Number(summ?.issue_count ?? 0) || 0,

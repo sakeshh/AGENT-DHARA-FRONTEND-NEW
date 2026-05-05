@@ -23,6 +23,12 @@ import Image from 'next/image';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import ReportEnhancements from '@/components/ReportEnhancements';
+import {
+  humanizeSeverityLabel,
+  humanizeSnakeIdentifier,
+  prettyTableHeaderKey,
+  sourceRootLabel,
+} from '@/lib/assessmentDisplay';
 
 interface ChatOption {
   id: string;
@@ -350,7 +356,7 @@ export default function ChatWindow() {
     }
   };
 
-  const JsonTable = ({ value }: { value: any }) => {
+  const JsonTable = ({ value, prettyHeaders }: { value: any; prettyHeaders?: boolean }) => {
     const [showAll, setShowAll] = useState(false);
     const arr = Array.isArray(value) ? value : null;
     if (!arr || arr.length === 0) {
@@ -382,7 +388,7 @@ export default function ChatWindow() {
                   key={c}
                   className="border-b border-black/60 border-r border-black/40 px-3 py-2 text-left font-semibold tracking-[0.01em] text-zinc-900 last:border-r-0"
                 >
-                  {c}
+                  {prettyHeaders ? prettyTableHeaderKey(c) : c}
                 </th>
               ))}
             </tr>
@@ -505,7 +511,7 @@ export default function ChatWindow() {
           high: summ?.high_severity ?? 0,
           medium: summ?.medium_severity ?? 0,
           low: summ?.low_severity ?? 0,
-          source: meta?.source_root ?? '',
+          source: sourceRootLabel(meta?.source_root ?? ''),
         };
       });
 
@@ -515,8 +521,8 @@ export default function ChatWindow() {
         for (const it of issues) {
           issuesRows.push({
             dataset: dsName,
-            severity: it?.severity ?? '',
-            type: it?.type ?? '',
+            severity: humanizeSeverityLabel(it?.severity ?? ''),
+            type: humanizeSnakeIdentifier(it?.type ?? ''),
             column: it?.column ?? '',
             count: it?.count ?? '-',
             message: it?.message ?? '',
@@ -537,19 +543,21 @@ export default function ChatWindow() {
       return (
         <div className="space-y-4">
           <div>
-            <div className="mb-1 text-[12px] font-semibold text-black/70">Datasets (from backend `result`)</div>
-            <JsonTable value={datasetRows} />
+            <div className="mb-1 text-[13px] font-semibold tracking-[0.01em] text-zinc-900">Datasets</div>
+            <JsonTable value={datasetRows} prettyHeaders />
           </div>
           {issuesRows.length > 0 ? (
             <div>
-              <div className="mb-1 text-[12px] font-semibold text-black/70">Data quality issues (from backend `result`)</div>
-              <JsonTable value={issuesRows} />
+              <div className="mb-1 text-[13px] font-semibold tracking-[0.01em] text-zinc-900">
+                Data quality issues
+              </div>
+              <JsonTable value={issuesRows} prettyHeaders />
             </div>
           ) : null}
           {relRows.length > 0 ? (
             <div>
-              <div className="mb-1 text-[12px] font-semibold text-black/70">Relationships (from backend `result`)</div>
-              <JsonTable value={relRows} />
+              <div className="mb-1 text-[13px] font-semibold tracking-[0.01em] text-zinc-900">Relationships</div>
+              <JsonTable value={relRows} prettyHeaders />
             </div>
           ) : null}
           {(showCleaning || showTransform) && (
@@ -594,7 +602,7 @@ export default function ChatWindow() {
       return <JsonTable value={payload.rows} />;
     }
 
-    // For reports, render directly from backend `payload.result` so values match exactly.
+    // Structured report tables are built from `payload.result`; cells are normalized for UI (sources, severity, issue types).
     // (Markdown is still available as a fallback.)
     if (payload?.result && typeof payload.result === 'object' && (payload?.step === 'report' || payload?.report_markdown)) {
       return renderStructuredReportFromResult(payload.result);

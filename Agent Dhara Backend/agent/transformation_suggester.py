@@ -62,6 +62,84 @@ _NUMERIC_COL_PATTERNS = ("_id", "id", "amount", "price", "total", "count", "quan
 # Column names that suggest string (skip coerce for invalid_numeric)
 _STRING_COL_NAMES = {"name", "email", "sku", "category", "status", "description", "order_id"}
 
+MANUAL_GUIDANCE: Dict[str, str] = {
+    "orphan_foreign_key": (
+        "Validate referential integrity in staging: reject orphan keys or load dimension tables first "
+        "(SCD/type-2 patterns if applicable)."
+    ),
+    "constant_column": (
+        "Drop this column in ETL — it has zero information variance across all rows. "
+        "Including it wastes storage and adds no value to downstream queries."
+    ),
+    "dominant_value_skew": (
+        "Investigate before ETL — check if the dominant value is a legitimate default "
+        "or a pipeline fill artifact. If artificial, trace back to source system."
+    ),
+    "skewed_distribution": (
+        "Flag for business review — extreme skew may indicate a data collection issue "
+        "or a valid rare-event column. Confirm before applying any ETL transformation."
+    ),
+    "integer_stored_as_float": (
+        "Cast to INT in ETL schema definition if no legitimate decimal values exist. "
+        "Reduces storage and prevents float precision issues in aggregations."
+    ),
+    "duplicate_column_names": (
+        "Rename or drop duplicate columns BEFORE any ETL load step. "
+        "Duplicate column names will cause silent data loss or errors in most warehouses."
+    ),
+    "case_insensitive_column_collision": (
+        "Standardize ALL column names to lowercase snake_case in ETL schema definition. "
+        "e.g. CustomerID and customerid → customer_id"
+    ),
+    "very_wide_table": (
+        "Review with stakeholders — tables with 200+ columns are a strong signal of "
+        "poor schema design. Consider vertical partitioning in ETL (split into entity tables)."
+    ),
+    "column_name_whitespace": (
+        "Strip and normalize column names in ETL ingestion step before schema mapping. "
+        "Whitespace in column names causes failures in most SQL engines."
+    ),
+    "very_high_cardinality": (
+        "If this is a free-text or UUID column, consider hashing or bucketing in ETL. "
+        "High cardinality string columns are expensive for GROUP BY and JOIN operations."
+    ),
+    "potential_primary_key": (
+        "Validate and promote to explicit PRIMARY KEY constraint in warehouse schema. "
+        "Add a NOT NULL + UNIQUE constraint in the ETL target table DDL."
+    ),
+    "date_range_violation": (
+        "Validate acceptable date range with business team before writing ETL filter logic. "
+        "Add a range guard in ETL: reject or flag rows outside the agreed date window."
+    ),
+    "future_dates": (
+        "Nullify or reject in ETL — future dates in this column are almost certainly "
+        "data entry errors. Add an ETL validation rule: date <= current_date."
+    ),
+    "ancient_dates": (
+        "Flag for review — dates before 1900 are likely sentinel/default values "
+        "(e.g. 1970-01-01 epoch, 1900-01-01 placeholder). Handle explicitly in ETL."
+    ),
+    "very_wide_date_span": (
+        "Investigate date range span — a 100+ year date span in one column may indicate "
+        "mixed date formats being parsed differently. Verify ETL date parser handles all formats."
+    ),
+    "binary_like_column": (
+        "Cast to BOOLEAN in ETL schema — map Y/N, 1/0, yes/no, true/false to native BOOLEAN. "
+        "Avoids ambiguity in downstream analytics and BI tools."
+    ),
+    "empty_dataset": (
+        "Do NOT load — dataset is empty. Add an ETL pre-check that aborts the pipeline "
+        "and raises an alert if row count = 0 at ingestion."
+    ),
+}
+
+
+def _get_manual_guidance(issue_type: str) -> str:
+    return MANUAL_GUIDANCE.get(
+        issue_type,
+        "Review manually before writing ETL logic for this column/dataset.",
+    )
+
 
 def _should_coerce_numeric(ds_name: str, col: str, issue_type: str, assessment_result: Dict[str, Any]) -> bool:
     """Only coerce when column is semantically numeric. Skip name, email, sku, category, etc."""
@@ -121,46 +199,71 @@ def suggest_transformations(assessment_result: Dict[str, Any]) -> Dict[str, Any]
             col = issue.get("column")
             action = ISSUE_TO_ACTION.get(issue_type, "review_manually")
             if action == "review_manually":
+                suggested.append(
+                    {
+                        "dataset": ds_name,
+                        "column": col,
+                        "issue_type": issue_type,
+                        "severity": issue.get("severity", "medium"),
+                        "message": issue.get("message", ""),
+                        "suggested_action": "review_manually",
+                        "manual_guidance": _get_manual_guidance(issue_type),
+                        "row_count_affected": issue.get("count"),
+                        "auto_fixable": False,
+                    }
+                )
                 continue
             if action == "coerce_numeric" and not _should_coerce_numeric(ds_name, col, issue_type, assessment_result):
                 action = "trim"
-            suggested.append({
-                "dataset": ds_name,
-                "column": col,
-                "issue_type": issue_type,
-                "severity": issue.get("severity", "medium"),
-                "message": issue.get("message", ""),
-                "suggested_action": action,
-                "row_count_affected": issue.get("count"),
-            })
+            suggested.append(
+                {
+                    "dataset": ds_name,
+                    "column": col,
+                    "issue_type": issue_type,
+                    "severity": issue.get("severity", "medium"),
+                    "message": issue.get("message", ""),
+                    "suggested_action": action,
+                    "manual_guidance": "",
+                    "row_count_affected": issue.get("count"),
+                    "auto_fixable": True,
+                }
+            )
             if col and action in ("coerce_numeric", "parse_dates"):
                 trim_columns.add((ds_name, col))
 
     # Robust: add trim before coerce/parse (handles " 123 ", " 2024-01-15 ")
     for (ds_name, col) in trim_columns:
         if not any(s["dataset"] == ds_name and s["column"] == col and s["suggested_action"] == "trim" for s in suggested):
-            suggested.append({
-                "dataset": ds_name,
-                "column": col,
-                "issue_type": "proactive_trim",
-                "severity": "low",
-                "message": "Trim before coerce/parse",
-                "suggested_action": "trim",
-                "row_count_affected": None,
-            })
+            suggested.append(
+                {
+                    "dataset": ds_name,
+                    "column": col,
+                    "issue_type": "proactive_trim",
+                    "severity": "low",
+                    "message": "Trim before coerce/parse",
+                    "suggested_action": "trim",
+                    "manual_guidance": "",
+                    "row_count_affected": None,
+                    "auto_fixable": True,
+                }
+            )
 
     # Global issues: orphan FKs → suggest referential cleanup or staging checks
     global_issues = dq.get("global_issues", {})
     for orphan in global_issues.get("orphan_foreign_keys", []):
-        suggested.append({
-            "dataset": None,
-            "column": None,
-            "issue_type": "orphan_foreign_key",
-            "severity": "medium",
-            "message": f"Orphans: {orphan.get('from')} → {orphan.get('to')}",
-            "suggested_action": "validate_referential_integrity_or_stage",
-            "row_count_affected": orphan.get("orphan_count"),
-        })
+        suggested.append(
+            {
+                "dataset": None,
+                "column": None,
+                "issue_type": "orphan_foreign_key",
+                "severity": "medium",
+                "message": f"Orphans: {orphan.get('from')} → {orphan.get('to')}",
+                "suggested_action": "validate_referential_integrity_or_stage",
+                "manual_guidance": _get_manual_guidance("orphan_foreign_key"),
+                "row_count_affected": orphan.get("orphan_count"),
+                "auto_fixable": True,
+            }
+        )
 
     # Summary
     by_action: Dict[str, int] = {}
@@ -176,6 +279,8 @@ def suggest_transformations(assessment_result: Dict[str, Any]) -> Dict[str, Any]
             "by_action": by_action,
             "by_dataset": by_dataset_count,
             "total_suggestions": len(suggested),
+            "auto_fixable_count": sum(1 for s in suggested if s.get("suggested_action") != "review_manually"),
+            "manual_review_count": sum(1 for s in suggested if s.get("suggested_action") == "review_manually"),
         },
     }
 

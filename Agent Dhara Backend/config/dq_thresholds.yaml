@@ -102,3 +102,29 @@ dq_score:
 #   - dataset: "orders"
 #     column: "order_id"
 #     rule: "not_null"
+#     params: {}
+
+# Cross-column conditional business rules (after standard DQ checks). Default: none enabled.
+conditional_rules: []
+#
+# conditional_rules:
+#   - type: conditional_not_null
+#     when_column: status
+#     when_value: "shipped"
+#     then_column: ship_date
+#     severity: high
+#
+#   - type: conditional_format
+#     when_column: country
+#     when_value: "IN"
+#     then_column: phone
+#     then_regex: '^[6-9]\\d{9}$'
+#     severity: medium
+#
+#   - type: mutual_exclusion
+#     columns: [refund_amount, discount_amount]
+#     severity: high
+#
+#   - type: at_least_one
+#     columns: [email, phone, address]
+#     severity: medium
