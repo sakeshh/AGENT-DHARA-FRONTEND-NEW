@@ -4,8 +4,8 @@ Conversational intent classification for post-assessment chat.
 Intent IDs:
   1 REPORT_GENERATE
   2 ISSUE_LIST
-  3 ISSUE_DETAIL
-  4 PRIORITIZE
+  3 ISSUE_DETAIL / ISSUE_FILTER
+  4 PRIORITIZE / TRIAGE
   5 CROSS_DATASET
   6 CLARIFY
   7 OUT_OF_SCOPE
@@ -52,14 +52,43 @@ def _is_adversarial(low: str) -> bool:
 
 
 def _is_ood(low: str) -> bool:
-    keys = (
-        "stock price", "share price", "nifty", "sensex", "nyse", "nasdaq",
-        "fastapi", "django app", "flask app", "write a python", "write python",
-        "quantum computing", "quantum ", "explain quantum", "president of the",
-        "prime minister", "ipl match", "ipl ", "world cup", "super bowl",
-        "latest news", "who won",
+    """
+    Out-of-domain detection — catches anything not related to DQ assessment.
+    Covers: code generation, general knowledge, finance, sports, coding help.
+    """
+    # ── Code / script generation (most important new addition) ──────────────
+    code_keys = (
+        "generate code", "write code", "etl code", "generate etl code",
+        "generate etl", "write etl", "create etl", "build etl",
+        "python code", "python script", "write python", "write a python",
+        "write sql", "generate sql", "create sql", "sql script",
+        "write script", "generate script", "create script", "build script",
+        "write a script", "give me code", "give code", "show me code",
+        "write me code", "code for this", "code to fix", "code to clean",
+        "automate this", "automate the fix", "write automation",
+        "write pipeline", "build pipeline", "create pipeline",
+        "write a pipeline", "generate pipeline", "build a pipeline",
+        "spark code", "pyspark", "pandas code", "write pandas",
+        "write pyspark", "generate pyspark", "write spark",
+        "write dbt", "generate dbt", "dbt model", "write dbt model",
+        "write airflow", "generate airflow", "airflow dag",
+        "write dag", "generate dag",
     )
-    return any(k in low for k in keys)
+    if any(k in low for k in code_keys):
+        return True
+
+    # ── General knowledge / off-domain ──────────────────────────────────────
+    general_keys = (
+        "stock price", "share price", "nifty", "sensex", "nyse", "nasdaq",
+        "fastapi", "django app", "flask app",
+        "quantum computing", "quantum ", "explain quantum",
+        "president of the", "prime minister",
+        "ipl match", "ipl ", "world cup", "super bowl",
+        "latest news", "who won",
+        "write a poem", "tell me a joke", "what is the weather",
+        "how to cook", "recipe for",
+    )
+    return any(k in low for k in general_keys)
 
 
 def _is_clarify(low: str, raw: str) -> bool:
@@ -100,6 +129,10 @@ def _is_triage(low: str) -> bool:
         "business team", "which dataset is blocked", "blocked and why",
         "safest to load", "manual-review", "manual review burden",
         "source-system", "source system", "user-entry", "user entry",
+        "what should i fix", "what to fix first", "where do i start",
+        "where should i start", "fix order", "order of fixing",
+        "what needs fixing first", "most urgent", "urgent issues",
+        "critical first", "fix critical", "tackle first",
     ))
 
 
@@ -109,6 +142,11 @@ def _is_issue_filter(low: str) -> bool:
         "duplicate-related", "duplicate issues", "duplicate only",
         "duplicates only", "email issues", "invalid email", "phone issues",
         "identifier", "primary key",
+        "only nulls", "just nulls", "show nulls", "show null",
+        "only duplicates", "just duplicates", "show duplicates",
+        "only email", "just email issues", "show email",
+        "only phone", "just phone", "show phone issues",
+        "format issues only", "type issues only",
     ))
 
 
@@ -126,6 +164,18 @@ def _is_issue_list(low: str) -> bool:
         "rows should worry", "worry me the most", "auto-fixable", "manual review",
         "which columns", "business risks", "business risk", "data engineer",
         "data engineer-focused", "auto fixable",
+        # natural language additions
+        "what problems", "what are the problems", "what issues",
+        "what are the issues", "show me issues", "show issues",
+        "what went wrong", "tell me the issues", "list the problems",
+        "what should i know", "what do i need to fix",
+        "give me a summary", "summarise issues", "summarize issues",
+        "how bad is", "how clean is", "is this data clean",
+        "is my data clean", "is the data good", "is it clean",
+        "what's the status", "status of the data", "data status",
+        "give me an overview", "overview of issues",
+        "focused on", "should i focus", "focus on",
+        "what to be aware of", "be aware of",
     )
     if any(k in low for k in keys):
         return True
@@ -136,13 +186,35 @@ def _is_issue_list(low: str) -> bool:
 
 
 def _is_full_report(low: str) -> bool:
+    """
+    Only triggers on EXPLICIT report generation requests.
+    Never triggers on bare 'generate' or 'create' without 'report'.
+    """
     return any(k in low for k in (
-        "executive summary", "full narrative", "full report", "detailed report",
-        "entire report", "markdown report", "html report", "narrative summary",
-        "summarize the report", "summary of the report",
-        "plain english summary of the report", "engineer-focused summary",
-        "data engineer-focused summary", "rank issues by severity",
+        "executive summary",
+        "full narrative",
+        "full report",
+        "detailed report",
+        "entire report",
+        "markdown report",
+        "html report",
+        "narrative summary",
+        "summarize the report",
+        "summary of the report",
+        "plain english summary of the report",
+        "engineer-focused summary",
+        "rank issues by severity",
         "generate a report",
+        "generate dq report",
+        "generate quality report",
+        "generate data quality report",
+        "create a report",
+        "create dq report",
+        "build a report",
+        "give me a report",
+        "show me a report",
+        "produce a report",
+        # NOTE: bare "generate" / "generate etl" removed — caught by _is_ood()
     ))
 
 
@@ -157,8 +229,11 @@ def classify_intent(message: str, context: Dict[str, Any]) -> Optional[Dict[str,
     if raw.strip().startswith("```"):
         return None
 
+    # Safety checks run first — before any other matching
     if _is_adversarial(low):
         return {"intent": 8, "reason": "adversarial_policy"}
+
+    # OOD check runs BEFORE report/issue checks to prevent misrouting
     if _is_ood(low):
         return {"intent": 7, "reason": "out_of_domain"}
 
