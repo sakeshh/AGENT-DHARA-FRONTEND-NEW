@@ -1734,14 +1734,10 @@ def _node_route(state: ChatState) -> ChatState:
     sess_c = state.get("session") or {}
     ctx_c = sess_c.get("context", {}) if isinstance(sess_c, dict) else {}
     if isinstance(ctx_c, dict):
-        from agent.conversational_intents import classify_intent, fallback_router_intent
+        from agent.router_orchestrator import route_message
 
         msg_full = (state.get("message") or "").strip()
-        cid = classify_intent(msg_full, ctx_c)
-        if cid is None and len(msg_full) < 220:
-            fb = fallback_router_intent(msg_full, ctx_c)
-            if fb is not None:
-                cid = fb
+        cid = route_message(msg_full, ctx_c)
         if cid is not None:
             intent = int(cid.get("intent") or 0)
             has_res = isinstance(ctx_c.get("last_assessment_result"), dict)
@@ -3603,6 +3599,17 @@ def _convo_followup_options() -> List[Dict[str, str]]:
     )
 
 
+
+def _apply_formatter(raw_txt: str, message: str) -> str:
+    """Pass specialist output through LLM formatter for natural reply."""
+    if not raw_txt or not raw_txt.strip():
+        return raw_txt
+    try:
+        from agent.llm_formatter import format_specialist_output
+        return format_specialist_output(raw_txt, message)
+    except Exception:
+        return raw_txt
+
 def _node_convo_top_issues(state: ChatState) -> ChatState:
     result, err = _ensure_latest_assessment(state)
     if err:
@@ -3610,6 +3617,7 @@ def _node_convo_top_issues(state: ChatState) -> ChatState:
     from agent.specialists.top_issues_specialist import format_top_issues
 
     txt = format_top_issues(result, state.get("message") or "")
+    txt = _apply_formatter(txt, state.get("message") or "")
     meta = state.get("action_args") or {}
     return {
         "reply": txt,
@@ -3624,6 +3632,7 @@ def _node_convo_issue_filter(state: ChatState) -> ChatState:
     from agent.specialists.issue_filter_specialist import format_issue_filter
 
     txt = format_issue_filter(result, state.get("message") or "")
+    txt = _apply_formatter(txt, state.get("message") or "")
     meta = state.get("action_args") or {}
     return {
         "reply": txt,
@@ -3638,6 +3647,7 @@ def _node_convo_triage(state: ChatState) -> ChatState:
     from agent.specialists.triage_specialist import format_triage
 
     txt = format_triage(result, state.get("message") or "")
+    txt = _apply_formatter(txt, state.get("message") or "")
     meta = state.get("action_args") or {}
     return {
         "reply": txt,
@@ -3652,6 +3662,7 @@ def _node_convo_cross_dataset(state: ChatState) -> ChatState:
     from agent.specialists.cross_dataset_agent import format_cross_dataset
 
     txt = format_cross_dataset(result, state.get("message") or "")
+    txt = _apply_formatter(txt, state.get("message") or "")
     meta = state.get("action_args") or {}
     return {
         "reply": txt,
