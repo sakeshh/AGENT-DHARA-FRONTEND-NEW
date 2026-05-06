@@ -1,20 +1,16 @@
 """
 Router Orchestrator — unified entry point for all intent routing.
 
-Replaces direct calls to classify_intent() in chat_graph.py / langgraph_orchestrator.py.
-Implements the layered routing strategy:
-
-  Layer 1 → Adversarial / safety guard   (rule-based, unbypassable)
-  Layer 2 → Keyword matching             (existing code, free, 0ms)
-  Layer 3 → LLM Router                  (fallback, ~100 tokens)
-  Layer 4 → Final fallback              (return None → handled upstream)
+Layered routing strategy:
+  Layer 1 → Adversarial / safety guard        (rule-based, unbypassable)
+  Layer 1b→ Code generation guard             (rule-based, unbypassable)
+  Layer 2 → Keyword matching                  (existing code, free, 0ms)
+  Layer 3 → LLM Router                        (fallback, ~100-150 tokens)
+  Layer 4 → Final fallback                    (return None)
 
 Usage:
     from agent.router_orchestrator import route_message
-
     result = route_message(user_message, context)
-    # result = {"intent": int, "tool": str, "reason": str, "source": str}
-    # result = None → no intent matched, caller should use generic fallback
 """
 from __future__ import annotations
 import logging
@@ -31,6 +27,34 @@ from agent.agent_system_prompt import OUT_OF_SCOPE_REPLY, ADVERSARIAL_REPLY
 
 logger = logging.getLogger(__name__)
 
+# ── Hardcoded code-generation guard (triple safety net) ─────────────────────
+_CODE_KEYWORDS = (
+    "generate code", "write code", "etl code", "generate etl code",
+    "generate etl", "write etl", "create etl", "build etl",
+    "python code", "python script", "write python", "write a python",
+    "write sql", "generate sql", "sql script",
+    "write script", "generate script", "create script",
+    "write a script", "give me code", "give code", "show me code",
+    "write me code", "code for this", "code to fix", "code to clean",
+    "write pipeline", "build pipeline", "create pipeline",
+    "generate pipeline", "build a pipeline", "write a pipeline",
+    "pyspark", "spark code", "write pandas", "pandas code",
+    "write dbt", "generate dbt", "dbt model",
+    "write airflow", "generate airflow", "airflow dag",
+    "write dag", "generate dag",
+    "automate this", "automate the fix", "write automation",
+)
+
+_CODE_OOS_REPLY = (
+    "I can't generate ETL code or scripts. "
+    "I only analyse data quality issues from your assessment.\n\n"
+    "Try asking:\n"
+    "- 'What are the top issues in my data?'\n"
+    "- 'Which datasets should I fix first?'\n"
+    "- 'Show me null issues only'\n"
+    "- 'Generate a DQ report'"
+)
+
 
 def route_message(
     message: str,
@@ -40,21 +64,15 @@ def route_message(
     """
     Route a user message through all intent layers.
 
-    Args:
-        message:          Raw user message string.
-        context:          Session context dict (must contain last_assessment_result).
-        use_llm_fallback: Set False to disable LLM layer (testing / cost control).
-
-    Returns:
-        dict with keys: intent, tool, reason, source
-        None if no layer matched.
+    Returns dict with: intent, tool, reason, source
+    Returns None if no layer matched.
     """
     if not message or not message.strip():
         return None
 
     low = message.lower().strip()
 
-    # ── Layer 1: Safety guard (rule-based, never delegate to LLM) ────────────
+    # ── Layer 1a: Adversarial guard ──────────────────────────────────────────
     if _is_adversarial(low):
         logger.info("Router: adversarial detected")
         return {
@@ -65,6 +83,18 @@ def route_message(
             "reply": ADVERSARIAL_REPLY,
         }
 
+    # ── Layer 1b: Code generation guard (before keyword matching) ────────────
+    if any(k in low for k in _CODE_KEYWORDS):
+        logger.info("Router: code generation request blocked")
+        return {
+            "intent": 7,
+            "tool": "none",
+            "reason": "code_generation_not_supported",
+            "source": "code_guard",
+            "reply": _CODE_OOS_REPLY,
+        }
+
+    # ── Layer 1c: General OOD keyword guard ──────────────────────────────────
     if _is_ood(low):
         logger.info("Router: out-of-domain keyword detected")
         return {
@@ -89,18 +119,17 @@ def route_message(
         logger.info("Router: keyword fallback → intent=%d", result.get("intent"))
         return result
 
-    # ── Layer 3: LLM Router ───────────────────────────────────────────────────
+    # ── Layer 3: LLM Router (fires only on keyword miss) ─────────────────────
     if use_llm_fallback:
-        logger.info("Router: keyword missed, calling LLM router")
+        logger.info("Router: keyword missed → calling LLM router for: %s", message[:80])
         result = llm_classify_intent(message)
         if result:
-            # If LLM says out-of-scope, attach the standard reply
             if result.get("tool") == "none":
                 result["reply"] = OUT_OF_SCOPE_REPLY
             return result
 
     # ── Layer 4: No match ────────────────────────────────────────────────────
-    logger.info("Router: no layer matched for message: %s", message[:80])
+    logger.info("Router: no layer matched → message: %s", message[:80])
     return None
 
 
@@ -113,16 +142,6 @@ def route_and_get_reply(
 ) -> str:
     """
     Convenience wrapper: route → call specialist → optionally format with LLM.
-
-    Args:
-        specialist_fn:    The specialist function to call (takes assessment, message).
-        message:          Raw user message.
-        context:          Session context.
-        assessment:       The DQ assessment result dict.
-        use_llm_formatter: Whether to pass specialist output through LLM formatter.
-
-    Returns:
-        Final reply string.
     """
     raw = specialist_fn(assessment, message)
 
