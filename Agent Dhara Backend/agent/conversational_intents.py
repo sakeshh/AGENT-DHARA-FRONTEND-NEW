@@ -10,6 +10,13 @@ Intent IDs:
   6 CLARIFY
   7 OUT_OF_SCOPE
   8 ADVERSARIAL
+
+Routing order (3-layer funnel):
+  Layer 1 — Safety checks (adversarial / OOD) — always rule-based, zero LLM cost
+  Layer 2 — Keyword matcher (classify_intent) — fast, free, handles known patterns
+  Layer 3 — LangChain ToolCallingAgent fallback — fires ONLY when keyword match returns None
+             The LLM sees only the user message (~100 tokens), never the full report.
+             If LangChain unavailable, falls back gracefully to legacy llm_router.
 """
 from __future__ import annotations
 import re
@@ -56,7 +63,6 @@ def _is_ood(low: str) -> bool:
     Out-of-domain detection — catches anything not related to DQ assessment.
     Covers: code generation, general knowledge, finance, sports, coding help.
     """
-    # ── Code / script generation (most important new addition) ──────────────
     code_keys = (
         "generate code", "write code", "etl code", "generate etl code",
         "generate etl", "write etl", "create etl", "build etl",
@@ -77,7 +83,6 @@ def _is_ood(low: str) -> bool:
     if any(k in low for k in code_keys):
         return True
 
-    # ── General knowledge / off-domain ──────────────────────────────────────
     general_keys = (
         "stock price", "share price", "nifty", "sensex", "nyse", "nasdaq",
         "fastapi", "django app", "flask app",
@@ -164,7 +169,6 @@ def _is_issue_list(low: str) -> bool:
         "rows should worry", "worry me the most", "auto-fixable", "manual review",
         "which columns", "business risks", "business risk", "data engineer",
         "data engineer-focused", "auto fixable",
-        # natural language additions
         "what problems", "what are the problems", "what issues",
         "what are the issues", "show me issues", "show issues",
         "what went wrong", "tell me the issues", "list the problems",
@@ -214,7 +218,6 @@ def _is_full_report(low: str) -> bool:
         "give me a report",
         "show me a report",
         "produce a report",
-        # NOTE: bare "generate" / "generate etl" removed — caught by _is_ood()
     ))
 
 
@@ -260,3 +263,56 @@ def classify_intent(message: str, context: Dict[str, Any]) -> Optional[Dict[str,
         return {"intent": 2, "reason": "nl_question_with_assessment"}
 
     return None
+
+
+def classify_intent_with_llm_fallback(
+    message: str,
+    context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    3-layer agentic router:
+
+    Layer 1 — Safety checks  (adversarial / OOD) — always rule-based, zero LLM cost.
+    Layer 2 — Keyword matcher (classify_intent)  — fast, free, handles known patterns.
+    Layer 3 — LangChain ToolCallingAgent         — fires ONLY when keyword match returns None.
+                The LLM receives ONLY the user message (~100 tokens).
+                Raw report data is NEVER sent to the LLM.
+                If LangChain is unavailable, gracefully returns intent 7 (out_of_scope).
+
+    Returns:
+        dict  — {intent: int, reason: str, source: str}
+        None  — caller should treat as out-of-scope / show help message
+    """
+    # ── Layer 1: safety (inline, no import needed) ─────────────────────────
+    raw = (message or "").strip()
+    if not raw:
+        return None
+    low = raw.lower()
+
+    if _is_adversarial(low):
+        return {"intent": 8, "reason": "adversarial_policy", "source": "safety_rule"}
+    if _is_ood(low):
+        return {"intent": 7, "reason": "out_of_domain", "source": "ood_rule"}
+
+    # ── Layer 2: keyword matcher ───────────────────────────────────────────
+    keyword_result = classify_intent(message, context)
+    if keyword_result is not None:
+        keyword_result.setdefault("source", "keyword_matcher")
+        return keyword_result
+
+    # ── Layer 3: LangChain ToolCallingAgent fallback ───────────────────────
+    # Only fires when keyword matcher returned None — keeps LLM cost minimal.
+    try:
+        from agent.langchain_tool_router import classify_intent_via_langchain  # type: ignore
+        lc_result = classify_intent_via_langchain(message, context)
+        if lc_result is not None:
+            lc_result.setdefault("source", "langchain_tool_agent")
+            return lc_result
+    except Exception as _exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "LangChain ToolCallingAgent fallback failed: %s — defaulting to out_of_scope.", _exc
+        )
+
+    # ── Nothing matched: politely decline ─────────────────────────────────
+    return {"intent": 7, "reason": "no_tool_matched", "source": "exhausted_all_layers"}
