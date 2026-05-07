@@ -1,144 +1,74 @@
-# Fixes — `fix/routing-session-guards`
+# Fixes — `master`
 
-This PR applies **5 targeted fixes** to resolve the broken source-selection flow,
-`last_step: unknown` display, and report-UI appearing before any assessment exists.
+This file documents backend/UX fixes that were applied directly to `master`.
 
----
+## 1. `Agent Dhara Backend/agent/session_store.py`
 
-## Files Changed
+- Deep-merges `session["context"]` in `save_session` instead of overwriting the
+  entire context dict. This prevents keys like `selected_source`,
+  `selected_blob_files`, etc. from being lost when multiple nodes write
+  partial context.
+- Ensures that new or recovered sessions always have
+  `context.last_step = "awaiting_source_selection"`, avoiding the
+  `last_step: unknown` display in the UI.
 
-### 1. `Agent Dhara Backend/agent/session_store.py`
-**Fix: Deep-merge context on `save_session`**
+## 2. `Agent Dhara Backend/agent/routing_guards.py` (new)
 
-Previously, `save_session` would overwrite the entire session object including the
-`context` dict. This caused keys set by one node (e.g. `selected_source`) to be
-lost when a subsequent node saved back a partial context.
+- Provides `normalize_source_message(msg, ctx)` to map bare keywords like
+  `"blob"`, `"sql"`, `"local"` to deterministic commands such as
+  `"select source blob"` **before** the LLM router sees the message.
+- Provides `guard_needs_assessment(action, ctx)` to block report-only
+  actions when no assessment result is present yet, returning helpful
+  source/assessment guidance instead.
+- Provides `guard_needs_source(action, ctx)` to block non-navigation
+  actions when no source has been selected.
+- Exposes `RESET_CONTEXT_KEYS` so `reset_flow` / new-chat logic can clear
+  all chat-selection state consistently from one place.
 
-**Change:** Before writing, load the existing session from SQLite and deep-merge the
-`context` dict so new keys win on conflict but existing keys are preserved.
+### How to wire into `chat_graph.py`
 
-Also: `load_session` now always seeds `context.last_step = "awaiting_source_selection"`
-on a fresh session so `last_step` is never `"unknown"`.
-
----
-
-### 2. `Agent Dhara Backend/agent/routing_guards.py` *(new file)*
-**Fix: Centralised pre-dispatch guards + source keyword normalisation**
-
-Extracts reusable logic that was previously missing or scattered:
-
-- `REPORT_ACTIONS` — set of actions that require a completed assessment.
-- `guard_needs_assessment(action, ctx)` — returns a ready-made blocked reply
-  (with source-selection or "run assessment" buttons) when a report action is
-  requested before any assessment has been run. Returns `None` to allow.
-- `guard_needs_source(action, ctx)` — similar guard for actions that need a source.
-- `normalize_source_message(msg, ctx)` — maps bare user input like `"blob"` or
-  `"sql"` to deterministic commands like `"select source blob"` before the LLM
-  router sees the message. Only active when no source is selected yet.
-- `RESET_CONTEXT_KEYS` — canonical list of keys to wipe on `reset_flow` / new chat.
-
-**How to wire into `chat_graph.py`:**
+Add at the top of the file:
 
 ```python
 from agent.routing_guards import (
-    REPORT_ACTIONS,
     guard_needs_assessment,
     guard_needs_source,
     normalize_source_message,
     RESET_CONTEXT_KEYS,
 )
+```
 
-# 1. Normalise message BEFORE calling the LLM router:
+Before the LLM router call, normalise the message:
+
+```python
+ctx = state["session"].setdefault("context", {})
 state["message"] = normalize_source_message(state["message"], ctx)
+```
 
-# 2. After the LLM returns `action`, guard before dispatch:
+After the router chooses `action`, guard before dispatch:
+
+```python
 blocked = guard_needs_assessment(action, ctx)
 if blocked:
     return blocked
 
-# 3. In reset_flow node — use RESET_CONTEXT_KEYS:
+blocked = guard_needs_source(action, ctx)
+if blocked:
+    return blocked
+```
+
+In your `reset_flow` node, reset keys using `RESET_CONTEXT_KEYS`:
+
+```python
 for key in RESET_CONTEXT_KEYS:
     ctx.pop(key, None)
 ctx["last_step"] = "awaiting_source_selection"
 ```
 
----
+These small edits ensure that:
 
-### 3. `Agent Dhara Backend/agent/chat_graph.py` — inline changes needed
-
-The guards module is a **drop-in helper**. The three wiring points above need to be
-added manually to `chat_graph.py` at the relevant locations:
-
-| Location in `chat_graph.py` | Change |
-|---|---|
-| Top of the master router node, before LLM call | Add `normalize_source_message` |
-| After LLM resolves `action`, before dispatch switch | Add `guard_needs_assessment` + `guard_needs_source` |
-| Inside `_node_reset_flow` | Replace ad-hoc key deletions with `RESET_CONTEXT_KEYS` loop + set `last_step` |
-| Every `_node_*` function that sets `selected_*` keys | Add `ctx["last_step"] = "<step_name>"` |
-
----
-
-### 4. `components/ChatWindow.tsx` — inline changes needed
-
-Add these two blocks to `ChatWindow.tsx`:
-
-#### a) Step indicator (above chat messages)
-
-```tsx
-const FLOW_STEPS = ["Select Source", "Select Files/Tables", "Run Assessment", "View Report"];
-const currentFlowStep =
-  !sessionContext?.selected_source ? 0
-  : (!sessionContext?.selected_blob_files?.length &&
-     !sessionContext?.selected_tables?.length &&
-     !sessionContext?.selected_local_files?.length) ? 1
-  : !sessionContext?.last_assessment_result ? 2
-  : 3;
-
-// Render:
-<div className="flex gap-2 px-4 py-2 border-b border-gray-700 text-xs">
-  {FLOW_STEPS.map((step, i) => (
-    <span key={step} className={`px-2 py-1 rounded-full ${
-      i === currentFlowStep
-        ? "bg-blue-600 text-white"
-        : i < currentFlowStep
-        ? "bg-green-800 text-green-200"
-        : "bg-gray-800 text-gray-400"
-    }`}>
-      {i < currentFlowStep ? "✓ " : ""}{step}
-    </span>
-  ))}
-</div>
-```
-
-#### b) Source selection buttons (shown when no source selected)
-
-```tsx
-{!sessionContext?.selected_source && (
-  <div className="flex gap-3 flex-wrap p-3">
-    {[
-      { label: "☁️ Azure Blob",  send: "select source blob" },
-      { label: "🗄️ Database",    send: "select source database" },
-      { label: "📁 Local Files", send: "select source local" },
-    ].map(opt => (
-      <button
-        key={opt.send}
-        onClick={() => sendMessage(opt.send)}
-        className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium transition-colors"
-      >
-        {opt.label}
-      </button>
-    ))}
-  </div>
-)}
-```
-
----
-
-## Testing Checklist
-
-- [ ] Fresh session → only source buttons shown, free text still works
-- [ ] Type `blob` → normalised to `select source blob`, lists blob files
-- [ ] Ask `summarize report` before assessment → blocked with source buttons
-- [ ] Run assessment → `last_step` shows `assessment_complete` not `unknown`
-- [ ] Restart → all context keys cleared, source buttons shown again
-- [ ] Reload page → `last_step` correctly restored from SQLite, not `unknown`
+- Typing `blob` at the start of a fresh session is treated as
+  "select Blob source" instead of jumping directly into report
+  clarification.
+- Report navigation actions are only available **after** an
+  assessment has actually been run.

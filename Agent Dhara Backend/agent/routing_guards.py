@@ -3,14 +3,10 @@ routing_guards.py
 -----------------
 Centralised pre-dispatch guards and message normalisation helpers used by chat_graph.py.
 
-Usage in chat_graph.py:
-
-    from agent.routing_guards import (
-        REPORT_ACTIONS,
-        guard_needs_assessment,
-        normalize_source_message,
-        RESET_CONTEXT_KEYS,
-    )
+This file is imported from chat_graph.py to:
+- normalise bare source keywords like "blob" → "select source blob" before LLM routing
+- block report-only actions when no assessment exists
+- keep the set of context keys to clear on reset_flow in a single place
 """
 from __future__ import annotations
 
@@ -18,7 +14,6 @@ from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # Actions that require a completed assessment in session context.
-# Attempting these on a fresh/empty session should be blocked.
 # ---------------------------------------------------------------------------
 REPORT_ACTIONS: frozenset = frozenset({
     "summarize_report",
@@ -68,11 +63,7 @@ _SOURCE_ALIASES: Dict[str, str] = {
 
 
 def normalize_source_message(msg: str, ctx: Dict[str, Any]) -> str:
-    """
-    If the session has no selected_source yet and the user typed a bare
-    source keyword (e.g. "blob"), expand it to the deterministic command
-    so the LLM router receives an unambiguous instruction.
-    """
+    """Expand bare source keywords to deterministic commands on fresh sessions."""
     if ctx.get("selected_source"):
         return msg  # source already set — never override
     stripped = (msg or "").strip().lower()
@@ -80,40 +71,30 @@ def normalize_source_message(msg: str, ctx: Dict[str, Any]) -> str:
 
 
 def _flow_options_minimal() -> List[Dict[str, str]]:
-    """Source-selection buttons for the guard reply payload."""
+    """Source-selection buttons for guard replies."""
     return [
-        {"id": "blob",  "text": "\u2601\ufe0f Azure Blob",  "send": "select source blob"},
-        {"id": "db",    "text": "\U0001f5c4\ufe0f Database",    "send": "select source database"},
-        {"id": "local", "text": "\U0001f4c1 Local Files", "send": "select source local"},
+        {"id": "blob",  "text": "☁️ Azure Blob",  "send": "select source blob"},
+        {"id": "db",    "text": "🗄️ Database",    "send": "select source database"},
+        {"id": "local", "text": "📁 Local Files", "send": "select source local"},
     ]
 
 
-def guard_needs_assessment(
-    action: str,
-    ctx: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+def guard_needs_assessment(action: str, ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Returns a ready-made ChatState dict (reply + payload) when `action` requires
-    a completed assessment but none exists yet.  Returns None if the action is
-    allowed to proceed.
-
-    Example usage in chat_graph.py dispatch:
-
-        blocked = guard_needs_assessment(action, ctx)
-        if blocked:
-            return blocked
+    If `action` is a report-only action but no assessment exists in context,
+    return a ready-made reply that guides the user back to source/assessment.
+    Otherwise return None to let dispatch continue.
     """
     if action not in REPORT_ACTIONS:
         return None
     if ctx.get("last_assessment_result"):
         return None
 
-    # Block — no assessment exists yet
     source_selected = ctx.get("selected_source")
     if source_selected:
-        # Source chosen but no assessment yet — guide to next step
+        # Source chosen but assessment not run yet
         reply = (
-            "\u26a0\ufe0f No assessment has been run yet for the selected source.\n"
+            "⚠️ No assessment has been run yet for the selected source.\n"
             "Please select your files / tables and run an assessment first."
         )
         return {
@@ -121,16 +102,16 @@ def guard_needs_assessment(
             "payload": {
                 "step": "awaiting_assessment",
                 "options": [
-                    {"id": "assess", "text": "\U0001f680 Run Assessment", "send": "assess selected files"},
-                    {"id": "back",   "text": "\U0001f519 Back",           "send": "back"},
-                    {"id": "restart","text": "\u2705 Restart",           "send": "restart"},
+                    {"id": "assess", "text": "🚀 Run Assessment", "send": "assess selected files"},
+                    {"id": "back",   "text": "🔙 Back",           "send": "back"},
+                    {"id": "restart","text": "✅ Restart",        "send": "restart"},
                 ],
             },
         }
 
     # No source at all — restart from the top
     reply = (
-        "\u26a0\ufe0f No data source selected yet.\n"
+        "⚠️ No data source selected yet.\n"
         "Please choose a source to get started."
     )
     return {
@@ -147,10 +128,7 @@ def guard_needs_source(
     ctx: Dict[str, Any],
     source_required_actions: Optional[frozenset] = None,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Returns a guard reply when `action` requires a selected_source but none exists.
-    Pass a custom frozenset of action names, or it will guard ALL non-navigation actions.
-    """
+    """Block non-navigation actions when no selected_source exists."""
     _NAV_ACTIONS = frozenset({"help", "reset_flow", "back_flow", "list_sources", "select_source", "show_selection_status"})
     if action in _NAV_ACTIONS:
         return None
@@ -160,7 +138,7 @@ def guard_needs_source(
         return None
 
     return {
-        "reply": "\u26a0\ufe0f Please select a data source first.",
+        "reply": "⚠️ Please select a data source first.",
         "payload": {
             "step": "select_source",
             "options": _flow_options_minimal(),

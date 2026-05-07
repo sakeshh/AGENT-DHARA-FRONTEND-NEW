@@ -72,7 +72,7 @@ def save_session(session: Dict[str, Any]) -> None:
     sid = (session.get("session_id") or "default").strip() or "default"
     now = time.time()
 
-    # --- FIX: Deep-merge context so individual keys set by nodes are never lost ---
+    # --- Deep-merge context so individual keys set by nodes are never lost ---
     conn = _connect()
     try:
         existing_row = conn.execute(
@@ -125,6 +125,7 @@ def list_sessions(*, limit: int = 50) -> List[Dict[str, Any]]:
                 title = payload.get("title") if isinstance(payload, dict) else None
                 msgs = payload.get("messages") if isinstance(payload, dict) else None
                 if isinstance(msgs, list) and msgs:
+                    # pick last user message as preview
                     for m in reversed(msgs):
                         if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
                             last = str(m.get("content"))
@@ -137,7 +138,7 @@ def list_sessions(*, limit: int = 50) -> List[Dict[str, Any]]:
                     "created_at": created_at,
                     "updated_at": updated_at,
                     "title": title,
-                    "preview": (last[:120] + "\u2026") if last and len(last) > 120 else last,
+                    "preview": (last[:120] + "…") if last and len(last) > 120 else last,
                 }
             )
         return out
