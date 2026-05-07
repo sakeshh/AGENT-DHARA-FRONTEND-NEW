@@ -2,14 +2,26 @@
 Router Orchestrator — unified entry point for all intent routing.
 
 Layered routing strategy:
-  Layer 1  → Adversarial / safety guard        (rule-based, unbypassable)
-  Layer 1b → Code generation guard             (rule-based, unbypassable)
-  Layer 1c → General OOD keyword guard         (rule-based)
-  Layer 2a → Primary keyword classifier        (existing code, free, 0ms)
-  Layer 2b → Fallback keyword heuristics       (free, 0ms)
-  Layer 3  → LangChain ToolCallingAgent        (PRIMARY agentic router, ~100 tokens)
+  Layer 0  → Fresh-session fallback guard    (NEW — catches empty-context turns)
+  Layer 0b → Source keyword normalisation    (NEW — "blob" → "select source blob")
+  Layer 1  → Adversarial / safety guard      (rule-based, unbypassable)
+  Layer 1b → Code generation guard           (rule-based, unbypassable)
+  Layer 1c → General OOD keyword guard       (rule-based)
+  Layer 2a → Primary keyword classifier      (existing code, free, 0ms)
+  Layer 2b → Fallback keyword heuristics     (free, 0ms)
+  Layer 3  → LangChain ToolCallingAgent      (PRIMARY agentic router, ~100 tokens)
              └─ Falls back to legacy LLM JSON router if LangChain unavailable
   Layer 4  → Final fallback (return None)
+
+FIX LOG (2026-05-07)
+---------------------
+- Added Layer 0: guard_fresh_session_fallback() fires before any routing when
+  the session has no selected_source, no assessment, and last_step is unknown.
+  This prevents the clarification-mode dead-end on fresh sessions.
+- Added Layer 0b: normalize_source_message() rewrites bare source keywords
+  ("blob", "azure", "db", "local" …) to their canonical deterministic commands
+  before keyword matching so Layer 2a always receives a parseable message.
+- Both helpers are imported from routing_guards to keep logic centralised.
 
 Usage:
     from agent.router_orchestrator import route_message
@@ -27,6 +39,10 @@ from agent.conversational_intents import (
 )
 from agent.llm_router import classify_intent_for_chat
 from agent.agent_system_prompt import OUT_OF_SCOPE_REPLY, ADVERSARIAL_REPLY
+from agent.routing_guards import (
+    normalize_source_message,
+    guard_fresh_session_fallback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +88,25 @@ def route_message(
     """
     if not message or not message.strip():
         return None
+
+    # ── Layer 0: Fresh-session fallback (NEW) ────────────────────────────────
+    # Intercept ambiguous messages in completely empty sessions before any
+    # routing occurs.  Sends the user to source selection immediately.
+    guard_reply = guard_fresh_session_fallback(message, context)
+    if guard_reply is not None:
+        logger.info("Router: fresh-session fallback fired")
+        return {
+            "intent": -1,
+            "tool": "none",
+            "reason": "fresh_session_fallback",
+            "source": "routing_guard",
+            **guard_reply,
+        }
+
+    # ── Layer 0b: Source keyword normalisation (NEW) ─────────────────────────
+    # Rewrite "blob", "azure", "database", "local" etc. to their canonical
+    # deterministic commands so Layer 2a can always match them.
+    message = normalize_source_message(message, context)
 
     low = message.lower().strip()
 

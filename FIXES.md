@@ -1,74 +1,78 @@
-# Fixes — `master`
+# Agent Dhara — Bug Fixes (2026-05-07)
 
-This file documents backend/UX fixes that were applied directly to `master`.
+## Problem
 
-## 1. `Agent Dhara Backend/agent/session_store.py`
+Typing a bare source keyword like `blob` on a fresh session caused the agent to
+enter **report-clarification mode** even though no data source had been selected
+and no assessment had been run. The UI showed:
 
-- Deep-merges `session["context"]` in `save_session` instead of overwriting the
-  entire context dict. This prevents keys like `selected_source`,
-  `selected_blob_files`, etc. from being lost when multiple nodes write
-  partial context.
-- Ensures that new or recovered sessions always have
-  `context.last_step = "awaiting_source_selection"`, avoiding the
-  `last_step: unknown` display in the UI.
+- `Available: (none selected in this session yet)`
+- `Last step: unknown`
 
-## 2. `Agent Dhara Backend/agent/routing_guards.py` (new)
+This was a dead-end — no buttons, no way forward without refreshing the page.
 
-- Provides `normalize_source_message(msg, ctx)` to map bare keywords like
-  `"blob"`, `"sql"`, `"local"` to deterministic commands such as
-  `"select source blob"` **before** the LLM router sees the message.
-- Provides `guard_needs_assessment(action, ctx)` to block report-only
-  actions when no assessment result is present yet, returning helpful
-  source/assessment guidance instead.
-- Provides `guard_needs_source(action, ctx)` to block non-navigation
-  actions when no source has been selected.
-- Exposes `RESET_CONTEXT_KEYS` so `reset_flow` / new-chat logic can clear
-  all chat-selection state consistently from one place.
+---
 
-### How to wire into `chat_graph.py`
+## Root Causes
 
-Add at the top of the file:
+| # | File | Issue |
+|---|------|-------|
+| 1 | `router_orchestrator.py` | `normalize_source_message()` and `guard_fresh_session_fallback()` existed in `routing_guards.py` but were **never imported or called** in the orchestrator. |
+| 2 | `routing_guards.py` | `guard_fresh_session_fallback()` did not exist — only `guard_needs_source()` and `guard_needs_assessment()` were present, and they were not called from the main routing path. |
+| 3 | `session_store.py` | New sessions were created without a `last_step` key, so it defaulted to `None`/`"unknown"` instead of `"awaiting_source_selection"`. The guard could not distinguish a fresh session from a mid-flow session. |
 
-```python
-from agent.routing_guards import (
-    guard_needs_assessment,
-    guard_needs_source,
-    normalize_source_message,
-    RESET_CONTEXT_KEYS,
-)
+---
+
+## Fixes Applied
+
+### `routing_guards.py`
+- Added `guard_fresh_session_fallback(msg, ctx)`: fires before any routing for
+  fully empty sessions; returns source-selection options immediately.
+- Extended `_SOURCE_ALIASES` with more aliases (`csv`, `excel`, `parquet`,
+  `adls`, `s3`, `postgres`, `mysql`, `mssql`, `sqlite`, `storage`, `files`).
+- `guard_needs_source()` now has a clear docstring explaining the change:
+  it blocks ALL non-navigation actions by default (not just an optional
+  allow-list subset).
+- All `payload` dicts now include `current_step` alongside `step` for
+  frontend compatibility.
+
+### `router_orchestrator.py`
+- Added **Layer 0**: imports and calls `guard_fresh_session_fallback()` before
+  any other layer. Returns a guided source-selection response if fired.
+- Added **Layer 0b**: calls `normalize_source_message()` to rewrite bare
+  source keywords before the keyword classifier runs.
+
+### `session_store.py`
+- Added `_DEFAULT_SESSION_PAYLOAD` constant: new sessions initialise
+  `last_step` as `"awaiting_source_selection"` instead of being absent.
+- `load_session()` back-fills `last_step` for older sessions where the value
+  is `None`, `""`, or `"unknown"` and no source has been selected.
+- Added `reset_session(session_id)` helper for clean resets from chat.
+
+---
+
+## Correct Flow After Fix
+
+```
+User types: "blob"
+    ↓
+Layer 0b  normalize_source_message()  →  "select source blob"
+    ↓
+Layer 2a  keyword classifier          →  intent: select_source, source: blob
+    ↓
+Agent sets selected_source = "blob", last_step = "list_blob_files"
+    ↓
+UI shows blob file listing
 ```
 
-Before the LLM router call, normalise the message:
+If the user types something completely unrecognised on a fresh session:
 
-```python
-ctx = state["session"].setdefault("context", {})
-state["message"] = normalize_source_message(state["message"], ctx)
 ```
-
-After the router chooses `action`, guard before dispatch:
-
-```python
-blocked = guard_needs_assessment(action, ctx)
-if blocked:
-    return blocked
-
-blocked = guard_needs_source(action, ctx)
-if blocked:
-    return blocked
+User types: "what is my data quality?"
+    ↓
+Layer 0  guard_fresh_session_fallback()  →  source-selection buttons shown
+    ↓
+User clicks "Azure Blob"
+    ↓
+normal flow continues
 ```
-
-In your `reset_flow` node, reset keys using `RESET_CONTEXT_KEYS`:
-
-```python
-for key in RESET_CONTEXT_KEYS:
-    ctx.pop(key, None)
-ctx["last_step"] = "awaiting_source_selection"
-```
-
-These small edits ensure that:
-
-- Typing `blob` at the start of a fresh session is treated as
-  "select Blob source" instead of jumping directly into report
-  clarification.
-- Report navigation actions are only available **after** an
-  assessment has actually been run.

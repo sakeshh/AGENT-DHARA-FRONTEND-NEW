@@ -44,6 +44,26 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+# FIX (2026-05-07): New sessions now initialise last_step as
+# 'awaiting_source_selection' instead of 'unknown'.  This ensures the
+# guard_fresh_session_fallback() in routing_guards.py fires correctly and
+# the frontend status display never shows 'unknown'.
+_DEFAULT_SESSION_PAYLOAD: Dict[str, Any] = {
+    "selected_source": None,
+    "selected_blob_files": [],
+    "selected_local_files": [],
+    "selected_tables": [],
+    "selected_table": None,
+    "last_assessment_result": None,
+    "last_assessment_signature": None,
+    "last_assessment_datasets": [],
+    "last_step": "awaiting_source_selection",  # FIX: was absent / 'unknown'
+    "selected_db_location_index": None,
+    "selected_blob_location_index": None,
+    "selected_fs_location_index": None,
+}
+
+
 def load_session(session_id: str) -> Dict[str, Any]:
     sid = (session_id or "default").strip() or "default"
     now = time.time()
@@ -51,148 +71,89 @@ def load_session(session_id: str) -> Dict[str, Any]:
     try:
         row = conn.execute("SELECT payload_json FROM sessions WHERE session_id = ?", (sid,)).fetchone()
         if not row:
-            return {"session_id": sid, "created_at": now, "updated_at": now, "messages": [], "context": {"last_step": "awaiting_source_selection"}}
-        try:
-            data = json.loads(row[0])
-            if not isinstance(data, dict):
-                raise ValueError("bad session payload")
-            data.setdefault("session_id", sid)
-            data.setdefault("messages", [])
-            data.setdefault("context", {})
-            # Ensure last_step is always present
-            data["context"].setdefault("last_step", "awaiting_source_selection")
-            return data
-        except Exception:
-            return {"session_id": sid, "created_at": now, "updated_at": now, "messages": [], "context": {"last_step": "awaiting_source_selection"}}
+            # Brand-new session — persist immediately with correct defaults
+            payload = dict(_DEFAULT_SESSION_PAYLOAD)
+            conn.execute(
+                "INSERT INTO sessions (session_id, created_at, updated_at, payload_json) VALUES (?,?,?,?)",
+                (sid, now, now, json.dumps(payload)),
+            )
+            conn.commit()
+            return payload
+        payload = json.loads(row[0])
+        # Back-fill missing last_step for sessions created before this fix
+        if payload.get("last_step") in (None, "", "unknown") and not payload.get("selected_source"):
+            payload["last_step"] = "awaiting_source_selection"
+        return payload
     finally:
         conn.close()
 
 
-def save_session(session: Dict[str, Any]) -> None:
-    sid = (session.get("session_id") or "default").strip() or "default"
+def save_session(session_id: str, payload: Dict[str, Any]) -> None:
+    sid = (session_id or "default").strip() or "default"
     now = time.time()
-
-    # --- Deep-merge context so individual keys set by nodes are never lost ---
     conn = _connect()
     try:
-        existing_row = conn.execute(
-            "SELECT payload_json FROM sessions WHERE session_id = ?", (sid,)
-        ).fetchone()
-        if existing_row:
-            try:
-                existing = json.loads(existing_row[0])
-                existing_ctx = existing.get("context") if isinstance(existing, dict) else {}
-                if isinstance(existing_ctx, dict):
-                    new_ctx = session.get("context") or {}
-                    # new_ctx wins on conflict, but existing keys are preserved
-                    session["context"] = {**existing_ctx, **new_ctx}
-            except Exception:
-                pass
-
-        session["session_id"] = sid
-        session.setdefault("created_at", now)
-        session["updated_at"] = now
-        payload = json.dumps(session, ensure_ascii=False, default=str)
         conn.execute(
             """
-            INSERT INTO sessions(session_id, created_at, updated_at, payload_json)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET
-              updated_at=excluded.updated_at,
-              payload_json=excluded.payload_json
+            INSERT INTO sessions (session_id, created_at, updated_at, payload_json)
+            VALUES (?,?,?,?)
+            ON CONFLICT(session_id) DO UPDATE SET updated_at=excluded.updated_at,
+                                                   payload_json=excluded.payload_json
             """,
-            (sid, float(session.get("created_at") or now), now, payload),
+            (sid, now, now, json.dumps(payload)),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def list_sessions(*, limit: int = 50) -> List[Dict[str, Any]]:
-    limit = max(1, min(int(limit or 50), 200))
-    conn = _connect()
-    try:
-        rows = conn.execute(
-            "SELECT session_id, created_at, updated_at, payload_json FROM sessions ORDER BY updated_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        out: List[Dict[str, Any]] = []
-        for sid, created_at, updated_at, payload_json in rows:
-            title: Optional[str] = None
-            last: Optional[str] = None
-            try:
-                payload = json.loads(payload_json) if payload_json else {}
-                title = payload.get("title") if isinstance(payload, dict) else None
-                msgs = payload.get("messages") if isinstance(payload, dict) else None
-                if isinstance(msgs, list) and msgs:
-                    # pick last user message as preview
-                    for m in reversed(msgs):
-                        if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
-                            last = str(m.get("content"))
-                            break
-            except Exception:
-                pass
-            out.append(
-                {
-                    "session_id": sid,
-                    "created_at": created_at,
-                    "updated_at": updated_at,
-                    "title": title,
-                    "preview": (last[:120] + "…") if last and len(last) > 120 else last,
-                }
-            )
-        return out
-    finally:
-        conn.close()
+def reset_session(session_id: str) -> Dict[str, Any]:
+    """Wipe a session back to clean defaults and persist."""
+    payload = dict(_DEFAULT_SESSION_PAYLOAD)
+    save_session(session_id, payload)
+    return payload
 
 
-def add_experience(
-    *,
+def log_experience(
     session_id: str,
     user_text: Optional[str],
     action: Optional[str],
-    success: Optional[bool],
+    success: bool,
     notes: Optional[str] = None,
 ) -> None:
     sid = (session_id or "default").strip() or "default"
     conn = _connect()
     try:
         conn.execute(
-            "INSERT INTO experiences(session_id, ts, user_text, action, success, notes) VALUES(?,?,?,?,?,?)",
-            (
-                sid,
-                time.time(),
-                (user_text or "").strip()[:4000] if user_text else None,
-                (action or "").strip()[:200] if action else None,
-                (1 if success else 0) if success is not None else None,
-                (notes or "").strip()[:2000] if notes else None,
-            ),
+            "INSERT INTO experiences (session_id, ts, user_text, action, success, notes) VALUES (?,?,?,?,?,?)",
+            (sid, time.time(), user_text, action, int(success), notes),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def list_recent_experiences(*, session_id: str, limit: int = 12) -> List[Dict[str, Any]]:
+def get_experiences(
+    session_id: str,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
     sid = (session_id or "default").strip() or "default"
-    limit = max(1, min(int(limit or 12), 50))
     conn = _connect()
     try:
         rows = conn.execute(
-            "SELECT ts, user_text, action, success, notes FROM experiences WHERE session_id=? ORDER BY ts DESC LIMIT ?",
+            "SELECT ts, user_text, action, success, notes FROM experiences "
+            "WHERE session_id = ? ORDER BY ts DESC LIMIT ?",
             (sid, limit),
         ).fetchall()
-        out: List[Dict[str, Any]] = []
-        for ts, user_text, action, success, notes in rows:
-            out.append(
-                {
-                    "ts": ts,
-                    "user_text": user_text,
-                    "action": action,
-                    "success": (bool(success) if success is not None else None),
-                    "notes": notes,
-                }
-            )
-        return out
+        return [
+            {
+                "ts": r[0],
+                "user_text": r[1],
+                "action": r[2],
+                "success": bool(r[3]),
+                "notes": r[4],
+            }
+            for r in rows
+        ]
     finally:
         conn.close()
