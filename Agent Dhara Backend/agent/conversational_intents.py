@@ -1,27 +1,66 @@
 """
 Conversational intent classification for post-assessment chat.
 
-Intent IDs:
-  1 REPORT_GENERATE
-  2 ISSUE_LIST
-  3 ISSUE_DETAIL / ISSUE_FILTER
-  4 PRIORITIZE / TRIAGE
-  5 CROSS_DATASET
-  6 CLARIFY
-  7 OUT_OF_SCOPE
-  8 ADVERSARIAL
+## ROUTING STRATEGY (v3 — 3-layer agentic pipeline)
 
-Routing order (3-layer funnel):
-  Layer 1 — Safety checks (adversarial / OOD) — always rule-based, zero LLM cost
-  Layer 2 — Keyword matcher (classify_intent) — fast, free, handles known patterns
-  Layer 3 — LangChain ToolCallingAgent fallback — fires ONLY when keyword match returns None
-             The LLM sees only the user message (~100 tokens), never the full report.
-             If LangChain unavailable, falls back gracefully to legacy llm_router.
+    User message
+        ↓
+    [LAYER 1]  Safety checks — adversarial / OOD  (rule-based, free, instant)
+        ↓ (if safe)
+    [LAYER 2]  Keyword matching                    (fast, free, covers known patterns)
+        ↓ (if no keyword match)
+    [LAYER 3]  LLM ToolCallingAgent (LangChain)    (PRIMARY agentic router)
+        ↓ (if LangChain unavailable / error)
+    [LAYER 3b] Legacy LLM JSON router              (FALLBACK)
+        ↓ (if LLM picks no tool)
+    [LAYER 3c] Graceful "I am unable to do this task" reply
+
+Key design rules:
+  - LLM is NEVER sent raw dataset rows — only the user's message (~100 tokens max)
+  - Safety checks ALWAYS run first (zero cost)
+  - Keyword layer is kept for speed and zero-cost on obvious intents
+  - LLM layer fires only when keyword matching returns None
+  - When LLM returns intent=7 (out-of-scope), a descriptive unable-reply is surfaced
+    so the user knows what IS possible, not just a blank refusal
+
+Intent IDs:
+  1  REPORT_GENERATE
+  2  ISSUE_LIST
+  3  ISSUE_DETAIL / ISSUE_FILTER
+  4  PRIORITIZE / TRIAGE
+  5  CROSS_DATASET
+  6  CLARIFY
+  7  OUT_OF_SCOPE
+  8  ADVERSARIAL
 """
 from __future__ import annotations
+
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Graceful unable-reply — shown when LLM finds no matching tool
+# More helpful than a blank OOD refusal — tells user what THEY CAN ask
+# ---------------------------------------------------------------------------
+_UNABLE_REPLY = (
+    "I'm unable to help with that specific request. "
+    "Here's what I *can* do with your assessed datasets:\n\n"
+    "- 📋 **List issues** — *\"what are the top issues?\"*\n"
+    "- 🔍 **Filter by type** — *\"show only null issues\"* / *\"show duplicates\"*\n"
+    "- 🚦 **ETL triage** — *\"which datasets are safe to load?\"*\n"
+    "- 🔗 **Cross-dataset** — *\"compare customers and orders\"*\n"
+    "- 📄 **Generate report** — *\"generate a full data quality report\"*\n\n"
+    "Try rephrasing your question around one of these areas."
+)
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
 
 def select_best_response(specialist_outputs: List[str], message: str = "") -> str:
     del message
@@ -42,10 +81,19 @@ def fallback_router_intent(message: str, context: Dict[str, Any]) -> Optional[Di
     return None
 
 
+def get_unable_reply() -> str:
+    """Return the graceful unable-to-help message for truly out-of-scope requests."""
+    return _UNABLE_REPLY
+
+
 def _peek_assessment(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     r = context.get("last_assessment_result")
     return r if isinstance(r, dict) else None
 
+
+# ---------------------------------------------------------------------------
+# Safety check functions (LAYER 1 — always run first, always rule-based)
+# ---------------------------------------------------------------------------
 
 def _is_adversarial(low: str) -> bool:
     patterns = (
@@ -95,6 +143,10 @@ def _is_ood(low: str) -> bool:
     )
     return any(k in low for k in general_keys)
 
+
+# ---------------------------------------------------------------------------
+# Keyword intent detectors (LAYER 2)
+# ---------------------------------------------------------------------------
 
 def _is_clarify(low: str, raw: str) -> bool:
     if len(raw.strip()) <= 28:
@@ -190,10 +242,7 @@ def _is_issue_list(low: str) -> bool:
 
 
 def _is_full_report(low: str) -> bool:
-    """
-    Only triggers on EXPLICIT report generation requests.
-    Never triggers on bare 'generate' or 'create' without 'report'.
-    """
+    """Only triggers on EXPLICIT report generation requests."""
     return any(k in low for k in (
         "executive summary",
         "full narrative",
@@ -221,7 +270,20 @@ def _is_full_report(low: str) -> bool:
     ))
 
 
+# ---------------------------------------------------------------------------
+# LAYER 2: Pure keyword classifier (no LLM, no cost)
+# ---------------------------------------------------------------------------
+
 def classify_intent(message: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Layer 2: keyword-based intent classification.
+
+    Returns a result dict when a keyword pattern matches, or None when no
+    keyword pattern matches (caller should escalate to LLM router).
+
+    Safety checks (adversarial / OOD) run here too so they are enforced even
+    when this function is called directly (e.g. from tests).
+    """
     raw = (message or "").strip()
     if not raw:
         return None
@@ -232,11 +294,10 @@ def classify_intent(message: str, context: Dict[str, Any]) -> Optional[Dict[str,
     if raw.strip().startswith("```"):
         return None
 
-    # Safety checks run first — before any other matching
+    # Safety checks (LAYER 1) run before anything else
     if _is_adversarial(low):
         return {"intent": 8, "reason": "adversarial_policy"}
 
-    # OOD check runs BEFORE report/issue checks to prevent misrouting
     if _is_ood(low):
         return {"intent": 7, "reason": "out_of_domain"}
 
@@ -262,57 +323,123 @@ def classify_intent(message: str, context: Dict[str, Any]) -> Optional[Dict[str,
     if has_assessment and len(low.split()) >= 4 and "?" in raw:
         return {"intent": 2, "reason": "nl_question_with_assessment"}
 
+    # No keyword match → return None so caller escalates to LLM router
     return None
 
 
-def classify_intent_with_llm_fallback(
-    message: str,
-    context: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    """
-    3-layer agentic router:
+# ---------------------------------------------------------------------------
+# LAYER 3: LLM router (fires only when keyword matching returns None)
+# ---------------------------------------------------------------------------
 
-    Layer 1 — Safety checks  (adversarial / OOD) — always rule-based, zero LLM cost.
-    Layer 2 — Keyword matcher (classify_intent)  — fast, free, handles known patterns.
-    Layer 3 — LangChain ToolCallingAgent         — fires ONLY when keyword match returns None.
-                The LLM receives ONLY the user message (~100 tokens).
-                Raw report data is NEVER sent to the LLM.
-                If LangChain is unavailable, gracefully returns intent 7 (out_of_scope).
+def _classify_via_llm(message: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Layer 3: LLM-based intent classification.
+
+    Tries LangChain ToolCallingAgent first, falls back to legacy LLM JSON router.
+    Sends ~100 tokens (user message only). Never sends raw dataset rows.
 
     Returns:
-        dict  — {intent: int, reason: str, source: str}
-        None  — caller should treat as out-of-scope / show help message
+        dict  — intent classified by LLM
+        None  — LLM completely unavailable (both LangChain and legacy failed)
     """
-    # ── Layer 1: safety (inline, no import needed) ─────────────────────────
-    raw = (message or "").strip()
-    if not raw:
-        return None
-    low = raw.lower()
-
-    if _is_adversarial(low):
-        return {"intent": 8, "reason": "adversarial_policy", "source": "safety_rule"}
-    if _is_ood(low):
-        return {"intent": 7, "reason": "out_of_domain", "source": "ood_rule"}
-
-    # ── Layer 2: keyword matcher ───────────────────────────────────────────
-    keyword_result = classify_intent(message, context)
-    if keyword_result is not None:
-        keyword_result.setdefault("source", "keyword_matcher")
-        return keyword_result
-
-    # ── Layer 3: LangChain ToolCallingAgent fallback ───────────────────────
-    # Only fires when keyword matcher returned None — keeps LLM cost minimal.
+    # Try LangChain ToolCallingAgent (PRIMARY)
     try:
         from agent.langchain_tool_router import classify_intent_via_langchain  # type: ignore
-        lc_result = classify_intent_via_langchain(message, context)
-        if lc_result is not None:
-            lc_result.setdefault("source", "langchain_tool_agent")
-            return lc_result
-    except Exception as _exc:
-        import logging
-        logging.getLogger(__name__).warning(
-            "LangChain ToolCallingAgent fallback failed: %s — defaulting to out_of_scope.", _exc
-        )
+        result = classify_intent_via_langchain(message, context)
+        if result is not None:
+            logger.info(
+                "[LLM-LAYER3] LangChain ToolCallingAgent → intent=%d source=%s",
+                result.get("intent", -1),
+                result.get("source", ""),
+            )
+            return result
+    except Exception as exc:
+        logger.warning("[LLM-LAYER3] LangChain ToolCallingAgent failed: %s — trying legacy fallback", exc)
 
-    # ── Nothing matched: politely decline ─────────────────────────────────
-    return {"intent": 7, "reason": "no_tool_matched", "source": "exhausted_all_layers"}
+    # Try Legacy LLM JSON router (FALLBACK)
+    try:
+        from agent.llm_router import llm_classify_intent  # type: ignore
+        result = llm_classify_intent(message)
+        if result is not None:
+            logger.info(
+                "[LLM-LAYER3] Legacy LLM JSON router → intent=%d source=%s",
+                result.get("intent", -1),
+                result.get("source", ""),
+            )
+            return result
+    except Exception as exc:
+        logger.warning("[LLM-LAYER3] Legacy LLM JSON router failed: %s", exc)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main entry point — full 3-layer pipeline
+# ---------------------------------------------------------------------------
+
+def classify_intent_full(message: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Full 3-layer agentic routing pipeline.
+
+    Layer 1: Safety checks (adversarial / OOD) — rule-based, instant, zero cost
+    Layer 2: Keyword matching — fast, free, covers known exact patterns
+    Layer 3: LLM ToolCallingAgent → LLM JSON fallback → graceful unable-reply
+
+    Returns a dict ALWAYS (never None). Guaranteed keys: intent, reason, source.
+    Extra key `unable_reply` (str) is set when intent=7 and LLM determined OOS
+    so chat_graph can surface a helpful "here's what I can do" message.
+
+    This is the preferred entry point for chat_graph.py and any new code.
+    Legacy code may still call classify_intent() directly (keyword-only, returns None on miss).
+    """
+    raw = (message or "").strip()
+    if not raw:
+        return {"intent": 6, "reason": "empty_message", "source": "pre_check"}
+
+    low = raw.lower()
+
+    # ── LAYER 1: Safety (always first, rule-based) ─────────────────────
+    if _is_adversarial(low):
+        logger.info("[ROUTER] LAYER1 adversarial blocked")
+        return {"intent": 8, "reason": "adversarial_policy", "source": "safety_check"}
+
+    if _is_ood(low):
+        logger.info("[ROUTER] LAYER1 OOD blocked")
+        return {
+            "intent": 7,
+            "reason": "out_of_domain_keyword",
+            "source": "safety_check",
+            "unable_reply": _UNABLE_REPLY,
+        }
+
+    # ── LAYER 2: Keyword matching ─────────────────────────────────────
+    kw_result = classify_intent(message, context)
+    if kw_result is not None:
+        logger.info(
+            "[ROUTER] LAYER2 keyword match → intent=%d reason=%s",
+            kw_result.get("intent", -1),
+            kw_result.get("reason", ""),
+        )
+        kw_result.setdefault("source", "keyword")
+        return kw_result
+
+    # ── LAYER 3: LLM router (keyword miss → escalate to LLM) ──────────
+    logger.info("[ROUTER] LAYER2 keyword miss — escalating to LLM router for: %s", raw[:80])
+    llm_result = _classify_via_llm(message, context)
+
+    if llm_result is not None:
+        intent = llm_result.get("intent", 7)
+        if intent == 7:
+            # LLM deliberately found no matching tool — surface helpful reply
+            logger.info("[ROUTER] LAYER3 LLM → no matching tool, returning unable-reply")
+            llm_result["unable_reply"] = _UNABLE_REPLY
+        return llm_result
+
+    # ── LAYER 3c: LLM completely unavailable → graceful degradation ─────
+    logger.warning("[ROUTER] All layers failed (LLM unavailable) — returning unable-reply")
+    return {
+        "intent": 7,
+        "reason": "all_layers_failed",
+        "source": "graceful_degradation",
+        "unable_reply": _UNABLE_REPLY,
+    }
