@@ -1,89 +1,117 @@
 """
-Conversational intent classification for post-assessment chat.
+conversational_intents.py
+─────────────────────────
+Post-assessment chat intent classifier for Agent Dhara.
 
-## ROUTING STRATEGY (v3 — 3-layer agentic pipeline)
-
-    User message
-        ↓
-    [LAYER 1]  Safety checks — adversarial / OOD  (rule-based, free, instant)
-        ↓ (if safe)
-    [LAYER 2]  Keyword matching                    (fast, free, covers known patterns)
-        ↓ (if no keyword match)
-    [LAYER 3]  LLM ToolCallingAgent (LangChain)    (PRIMARY agentic router)
-        ↓ (if LangChain unavailable / error)
-    [LAYER 3b] Legacy LLM JSON router              (FALLBACK)
-        ↓ (if LLM picks no tool)
-    [LAYER 3c] Graceful "I am unable to do this task" reply
-
-Key design rules:
-  - LLM is NEVER sent raw dataset rows — only the user's message (~100 tokens max)
-  - Safety checks ALWAYS run first (zero cost)
-  - Keyword layer is kept for speed and zero-cost on obvious intents
-  - LLM layer fires only when keyword matching returns None
-  - When LLM returns intent=7 (out-of-scope), a descriptive unable-reply is surfaced
-    so the user knows what IS possible, not just a blank refusal
-
-Intent IDs:
+Intent IDs
   1  REPORT_GENERATE
   2  ISSUE_LIST
-  3  ISSUE_DETAIL / ISSUE_FILTER
-  4  PRIORITIZE / TRIAGE
+  3  ISSUE_FILTER
+  4  TRIAGE / PRIORITIZE
   5  CROSS_DATASET
   6  CLARIFY
   7  OUT_OF_SCOPE
   8  ADVERSARIAL
+
+Rules
+  • Returns None  →  chat_graph.py handles the message (navigation / buttons / data-source flow)
+  • Returns dict  →  a specialist should handle (only when an assessment exists in context)
+  • classify_intent() is the ONLY public entry-point used by chat_graph.py
+  • langchain_tool_router.py / langgraph_orchestrator.py must NOT be imported anywhere
+    in the active message path — they were added experimentally and break navigation
 """
 from __future__ import annotations
 
-import logging
 import re
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Navigation guard
+# Every value in _NAVIGATION_EXACT is the exact lowercased text sent when a
+# user clicks an option button in chat_graph.py  (_flow_options / send= values).
+# We also cover the common natural-language equivalents users might type.
+# For ALL of these → return None immediately so chat_graph.py handles them.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Graceful unable-reply — shown when LLM finds no matching tool
-# More helpful than a blank OOD refusal — tells user what THEY CAN ask
-# ---------------------------------------------------------------------------
-_UNABLE_REPLY = (
-    "I'm unable to help with that specific request. "
-    "Here's what I *can* do with your assessed datasets:\n\n"
-    "- 📋 **List issues** — *\"what are the top issues?\"*\n"
-    "- 🔍 **Filter by type** — *\"show only null issues\"* / *\"show duplicates\"*\n"
-    "- 🚦 **ETL triage** — *\"which datasets are safe to load?\"*\n"
-    "- 🔗 **Cross-dataset** — *\"compare customers and orders\"*\n"
-    "- 📄 **Generate report** — *\"generate a full data quality report\"*\n\n"
-    "Try rephrasing your question around one of these areas."
+_NAVIGATION_EXACT: frozenset = frozenset({
+    # ── Generic flow controls ──────────────────────────────────────────────
+    "back", "← back", "menu", "restart", "help", "cancel",
+    # ── Data-source selection / listing ───────────────────────────────────
+    "list files in blob", "list blob files", "list files",
+    "list local files", "list local",
+    "list tables", "list sources",
+    "select all files", "select all",
+    "view data", "view selection",
+    "selection status", "what is selected",
+    # ── Assessment triggers ────────────────────────────────────────────────
+    "run data quality assessment", "run assessment",
+    "assess selected files", "assess selected tables",
+    "assess selected local files",
+    "run dq", "start assessment", "check data quality",
+    # ── Post-assessment view actions (option buttons) ─────────────────────
+    "top issues (short list)", "top issues", "short list",
+    "narrative report summary", "narrative report",
+    "relationships / joins", "relationships/joins", "relationships",
+    "dq counts",
+    "generate report",
+    "show schema", "show metadata", "show preview",
+    "view top 10 rows",
+    "cleaning recommendations",
+    "suggested transformations",
+})
+
+_NAVIGATION_PREFIXES: tuple = (
+    # These are sent by dynamically-built option buttons
+    "select source",
+    "select table",
+    "select file",
+    "view data in",
+    "list files in",
+    "list tables in",
+    "list blobs in",
+    "assess ",
+    "run assessment on",
+    "preview ",
+    "show schema for",
+    "show preview of",
 )
 
 
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
+def _is_navigation(low: str) -> bool:
+    """Return True for any option-button send value or navigation phrase."""
+    s = low.strip()
+    if s in _NAVIGATION_EXACT:
+        return True
+    for prefix in _NAVIGATION_PREFIXES:
+        if s.startswith(prefix):
+            return True
+    # Dynamic numeric option selections: "select 2", "option 3"
+    if re.match(r"^(select|option|source|table|file)\s+\d+$", s):
+        return True
+    return False
 
-def select_best_response(specialist_outputs: List[str], message: str = "") -> str:
-    del message
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers kept for backward-compat (called from chat_graph.py in some builds)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def select_best_response(specialist_outputs: List[str], message: str = "") -> str:  # noqa: ARG001
     for s in specialist_outputs or []:
         if isinstance(s, str) and s.strip():
             return s.strip()
     return ""
 
 
-def fallback_router_intent(message: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def fallback_router_intent(message: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:  # noqa: ARG001
     low = (message or "").lower().strip()
     if not low:
         return None
-    if any(t in low for t in (" this", "this ", " this.", "fix this", " too", "too.")) and len(low) < 90:
-        return {"intent": 6, "reason": "fallback_short_deictic"}
-    if any(w in low for w in ("stock price", "reliance", "quantum", " ipl", "ipl ", "president", "fastapi")):
-        return {"intent": 7, "reason": "fallback_keyword_ood"}
+    if any(t in low for t in (" this", "this ", "fix this", " too", "too.")) and len(low) < 90:
+        return {"intent": 6, "reason": "fallback_deictic"}
+    if any(w in low for w in ("stock price", "quantum", " ipl", "fastapi")):
+        return {"intent": 7, "reason": "fallback_ood"}
     return None
-
-
-def get_unable_reply() -> str:
-    """Return the graceful unable-to-help message for truly out-of-scope requests."""
-    return _UNABLE_REPLY
 
 
 def _peek_assessment(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -91,9 +119,9 @@ def _peek_assessment(context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return r if isinstance(r, dict) else None
 
 
-# ---------------------------------------------------------------------------
-# Safety check functions (LAYER 1 — always run first, always rule-based)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Safety / domain guards
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _is_adversarial(low: str) -> bool:
     patterns = (
@@ -107,10 +135,6 @@ def _is_adversarial(low: str) -> bool:
 
 
 def _is_ood(low: str) -> bool:
-    """
-    Out-of-domain detection — catches anything not related to DQ assessment.
-    Covers: code generation, general knowledge, finance, sports, coding help.
-    """
     code_keys = (
         "generate code", "write code", "etl code", "generate etl code",
         "generate etl", "write etl", "create etl", "build etl",
@@ -125,16 +149,14 @@ def _is_ood(low: str) -> bool:
         "spark code", "pyspark", "pandas code", "write pandas",
         "write pyspark", "generate pyspark", "write spark",
         "write dbt", "generate dbt", "dbt model", "write dbt model",
-        "write airflow", "generate airflow", "airflow dag",
-        "write dag", "generate dag",
+        "write airflow", "generate airflow", "airflow dag", "write dag",
     )
     if any(k in low for k in code_keys):
         return True
-
     general_keys = (
         "stock price", "share price", "nifty", "sensex", "nyse", "nasdaq",
         "fastapi", "django app", "flask app",
-        "quantum computing", "quantum ", "explain quantum",
+        "quantum computing", "explain quantum",
         "president of the", "prime minister",
         "ipl match", "ipl ", "world cup", "super bowl",
         "latest news", "who won",
@@ -144,9 +166,9 @@ def _is_ood(low: str) -> bool:
     return any(k in low for k in general_keys)
 
 
-# ---------------------------------------------------------------------------
-# Keyword intent detectors (LAYER 2)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Intent detectors (unchanged from original working version)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _is_clarify(low: str, raw: str) -> bool:
     if len(raw.strip()) <= 28:
@@ -154,7 +176,7 @@ def _is_clarify(low: str, raw: str) -> bool:
             "fix this.", "fix this", "is it okay?", "is it okay",
             "compare these.", "compare these", "why is this bad?", "why is this bad",
             "what's the issue here?", "what is the issue here",
-            "check this one too", "check this one too."
+            "check this one too", "check this one too.",
         }
         if raw.strip().lower() in tiny:
             return True
@@ -172,6 +194,7 @@ def _is_cross_dataset(low: str) -> bool:
     return any(k in low for k in (
         "compare ", "between these", "cross-dataset", "cross dataset",
         "orphan foreign", "foreign keys between", "relationships between",
+        "join issues", "join problem", "joining",
         "across files", "across datasets", "schema naming",
         "naming problems across", "customers.csv", "orders.csv",
     ))
@@ -210,7 +233,7 @@ def _is_issue_filter(low: str) -> bool:
 def _is_issue_list(low: str) -> bool:
     if re.search(r"top\s*\d+", low):
         return True
-    if re.search(r"\btop\s+five\b", low) or re.search(r"\btop\s+5\b", low):
+    if re.search(r"\btop\s+(five|5)\b", low):
         return True
     keys = (
         "list issues", "red flags", "red flag", "what's wrong", "what is wrong",
@@ -242,72 +265,69 @@ def _is_issue_list(low: str) -> bool:
 
 
 def _is_full_report(low: str) -> bool:
-    """Only triggers on EXPLICIT report generation requests."""
     return any(k in low for k in (
-        "executive summary",
-        "full narrative",
-        "full report",
-        "detailed report",
-        "entire report",
-        "markdown report",
-        "html report",
-        "narrative summary",
-        "summarize the report",
-        "summary of the report",
-        "plain english summary of the report",
-        "engineer-focused summary",
+        "executive summary", "full narrative", "full report", "detailed report",
+        "entire report", "markdown report", "html report", "narrative summary",
+        "summarize the report", "summary of the report",
+        "plain english summary of the report", "engineer-focused summary",
         "rank issues by severity",
-        "generate a report",
-        "generate dq report",
-        "generate quality report",
-        "generate data quality report",
-        "create a report",
-        "create dq report",
-        "build a report",
-        "give me a report",
-        "show me a report",
-        "produce a report",
+        "generate a report", "generate dq report", "generate quality report",
+        "generate data quality report", "create a report", "create dq report",
+        "build a report", "give me a report", "show me a report", "produce a report",
     ))
 
 
-# ---------------------------------------------------------------------------
-# LAYER 2: Pure keyword classifier (no LLM, no cost)
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
 
 def classify_intent(message: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Layer 2: keyword-based intent classification.
+    Returns an intent dict when the message is a post-assessment analytical
+    question that a specialist should handle.
 
-    Returns a result dict when a keyword pattern matches, or None when no
-    keyword pattern matches (caller should escalate to LLM router).
-
-    Safety checks (adversarial / OOD) run here too so they are enforced even
-    when this function is called directly (e.g. from tests).
+    Returns None for everything else so chat_graph.py handles it normally:
+      • Option button clicks ("list files in blob", "top issues", "back" …)
+      • Data-source / dataset listing / selection
+      • SQL / code blocks
+      • Pre-assessment messages (no assessment in context yet)
     """
     raw = (message or "").strip()
     if not raw:
         return None
     low = raw.lower()
 
-    if low.startswith("select ") or low.startswith("insert ") or low.startswith("update "):
-        return None
-    if raw.strip().startswith("```"):
+    # ── 1. Navigation / button guard (MOST IMPORTANT) ──────────────────────
+    #    Must be FIRST — before any other check.
+    #    If True → chat_graph.py owns this message entirely.
+    if _is_navigation(low):
         return None
 
-    # Safety checks (LAYER 1) run before anything else
+    # ── 2. SQL / code blocks → chat_graph nl_query flow ───────────────────
+    if low.startswith(("select ", "insert ", "update ", "delete ", "with ")):
+        return None
+    if raw.startswith("```"):
+        return None
+
+    # ── 3. Adversarial — always block ─────────────────────────────────────
     if _is_adversarial(low):
         return {"intent": 8, "reason": "adversarial_policy"}
 
+    # ── 4. Out-of-domain — always block ───────────────────────────────────
     if _is_ood(low):
         return {"intent": 7, "reason": "out_of_domain"}
 
     has_assessment = _peek_assessment(context) is not None
 
+    # ── 5. Clarify (vague/deictic) ─────────────────────────────────────────
     if _is_clarify(low, raw):
         return {"intent": 6, "reason": "underspecified"}
+
+    # Cross-dataset without assessment → ask user to run one first
     if _is_cross_dataset(low) and not has_assessment:
         return {"intent": 6, "reason": "cross_dataset_needs_selection"}
 
+    # ── 6. Keyword matching (only when assessment exists) ──────────────────
     if has_assessment:
         if _is_cross_dataset(low):
             return {"intent": 5, "reason": "cross_dataset"}
@@ -319,127 +339,9 @@ def classify_intent(message: str, context: Dict[str, Any]) -> Optional[Dict[str,
             return {"intent": 2, "reason": "issue_list"}
         if _is_full_report(low):
             return {"intent": 1, "reason": "full_report"}
+        # Natural language question with a "?" — treat as issue list
+        if len(low.split()) >= 4 and "?" in raw:
+            return {"intent": 2, "reason": "nl_question_with_assessment"}
 
-    if has_assessment and len(low.split()) >= 4 and "?" in raw:
-        return {"intent": 2, "reason": "nl_question_with_assessment"}
-
-    # No keyword match → return None so caller escalates to LLM router
+    # ── 7. Default: let chat_graph.py handle ──────────────────────────────
     return None
-
-
-# ---------------------------------------------------------------------------
-# LAYER 3: LLM router (fires only when keyword matching returns None)
-# ---------------------------------------------------------------------------
-
-def _classify_via_llm(message: str, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Layer 3: LLM-based intent classification.
-
-    Tries LangChain ToolCallingAgent first, falls back to legacy LLM JSON router.
-    Sends ~100 tokens (user message only). Never sends raw dataset rows.
-
-    Returns:
-        dict  — intent classified by LLM
-        None  — LLM completely unavailable (both LangChain and legacy failed)
-    """
-    # Try LangChain ToolCallingAgent (PRIMARY)
-    try:
-        from agent.langchain_tool_router import classify_intent_via_langchain  # type: ignore
-        result = classify_intent_via_langchain(message, context)
-        if result is not None:
-            logger.info(
-                "[LLM-LAYER3] LangChain ToolCallingAgent → intent=%d source=%s",
-                result.get("intent", -1),
-                result.get("source", ""),
-            )
-            return result
-    except Exception as exc:
-        logger.warning("[LLM-LAYER3] LangChain ToolCallingAgent failed: %s — trying legacy fallback", exc)
-
-    # Try Legacy LLM JSON router (FALLBACK)
-    try:
-        from agent.llm_router import llm_classify_intent  # type: ignore
-        result = llm_classify_intent(message)
-        if result is not None:
-            logger.info(
-                "[LLM-LAYER3] Legacy LLM JSON router → intent=%d source=%s",
-                result.get("intent", -1),
-                result.get("source", ""),
-            )
-            return result
-    except Exception as exc:
-        logger.warning("[LLM-LAYER3] Legacy LLM JSON router failed: %s", exc)
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Main entry point — full 3-layer pipeline
-# ---------------------------------------------------------------------------
-
-def classify_intent_full(message: str, context: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Full 3-layer agentic routing pipeline.
-
-    Layer 1: Safety checks (adversarial / OOD) — rule-based, instant, zero cost
-    Layer 2: Keyword matching — fast, free, covers known exact patterns
-    Layer 3: LLM ToolCallingAgent → LLM JSON fallback → graceful unable-reply
-
-    Returns a dict ALWAYS (never None). Guaranteed keys: intent, reason, source.
-    Extra key `unable_reply` (str) is set when intent=7 and LLM determined OOS
-    so chat_graph can surface a helpful "here's what I can do" message.
-
-    This is the preferred entry point for chat_graph.py and any new code.
-    Legacy code may still call classify_intent() directly (keyword-only, returns None on miss).
-    """
-    raw = (message or "").strip()
-    if not raw:
-        return {"intent": 6, "reason": "empty_message", "source": "pre_check"}
-
-    low = raw.lower()
-
-    # ── LAYER 1: Safety (always first, rule-based) ─────────────────────
-    if _is_adversarial(low):
-        logger.info("[ROUTER] LAYER1 adversarial blocked")
-        return {"intent": 8, "reason": "adversarial_policy", "source": "safety_check"}
-
-    if _is_ood(low):
-        logger.info("[ROUTER] LAYER1 OOD blocked")
-        return {
-            "intent": 7,
-            "reason": "out_of_domain_keyword",
-            "source": "safety_check",
-            "unable_reply": _UNABLE_REPLY,
-        }
-
-    # ── LAYER 2: Keyword matching ─────────────────────────────────────
-    kw_result = classify_intent(message, context)
-    if kw_result is not None:
-        logger.info(
-            "[ROUTER] LAYER2 keyword match → intent=%d reason=%s",
-            kw_result.get("intent", -1),
-            kw_result.get("reason", ""),
-        )
-        kw_result.setdefault("source", "keyword")
-        return kw_result
-
-    # ── LAYER 3: LLM router (keyword miss → escalate to LLM) ──────────
-    logger.info("[ROUTER] LAYER2 keyword miss — escalating to LLM router for: %s", raw[:80])
-    llm_result = _classify_via_llm(message, context)
-
-    if llm_result is not None:
-        intent = llm_result.get("intent", 7)
-        if intent == 7:
-            # LLM deliberately found no matching tool — surface helpful reply
-            logger.info("[ROUTER] LAYER3 LLM → no matching tool, returning unable-reply")
-            llm_result["unable_reply"] = _UNABLE_REPLY
-        return llm_result
-
-    # ── LAYER 3c: LLM completely unavailable → graceful degradation ─────
-    logger.warning("[ROUTER] All layers failed (LLM unavailable) — returning unable-reply")
-    return {
-        "intent": 7,
-        "reason": "all_layers_failed",
-        "source": "graceful_degradation",
-        "unable_reply": _UNABLE_REPLY,
-    }
