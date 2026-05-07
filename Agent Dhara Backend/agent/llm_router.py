@@ -1,10 +1,23 @@
 """
-LLM Router — fallback intent classifier using the LLM.
+LLM Router — intent classifier for Agent Dhara chat.
 
-Called ONLY when keyword matching in conversational_intents.py fails.
-Sends ~100-150 tokens per call. Never sends raw dataset rows.
+## ROUTING STRATEGY (v2 — LangChain ToolCallingAgent primary)
 
-Integrates with the existing model_config.py LLM client.
+    User message
+        ↓
+    [LAYER 1] Safety checks — adversarial / OOD  (rule-based, free, instant)
+        ↓ (if safe)
+    [LAYER 2] LangChain ToolCallingAgent          (PRIMARY — LLM picks tool natively)
+        ↓ (if LangChain unavailable / error)
+    [LAYER 3] Legacy LLM JSON router              (FALLBACK — kept for reliability)
+        ↓ (if LLM unavailable)
+    [LAYER 4] Keyword matching in conversational_intents.py  ← COMMENTED OUT as primary,
+                                                               still importable if needed
+
+## TO RESTORE KEYWORD ROUTING AS PRIMARY:
+    In classify_intent_for_chat(), uncomment the block marked
+    "# ── [LEGACY KEYWORD ROUTER — uncomment to re-enable as primary] ──"
+    and comment out the langchain_tool_router call below it.
 """
 from __future__ import annotations
 import json
@@ -42,11 +55,11 @@ def _get_llm_client():
 
 def llm_classify_intent(message: str) -> Optional[Dict[str, Any]]:
     """
-    Send the user message to the LLM for intent classification.
+    Legacy LLM JSON router — FALLBACK only.
+    Called when LangChain ToolCallingAgent is unavailable or errors.
 
-    Returns:
-        dict with keys: intent (int), tool (str), reason (str), source="llm"
-        None if LLM is unavailable or response is unparseable.
+    Sends ~100-150 tokens per call. Never sends raw dataset rows.
+    Returns dict with keys: intent, tool, reason, source='llm'
     """
     client = _get_llm_client()
     if client is None:
@@ -58,10 +71,7 @@ def llm_classify_intent(message: str) -> Optional[Dict[str, Any]]:
             {"role": "user",   "content": f'Classify this message: "{message}"'},
         ])
 
-        # Handle both string and message-object responses
         raw = response if isinstance(response, str) else getattr(response, "content", str(response))
-
-        # Strip markdown code fences if present
         raw = raw.strip().strip("```json").strip("```").strip()
 
         parsed = json.loads(raw)
@@ -69,15 +79,62 @@ def llm_classify_intent(message: str) -> Optional[Dict[str, Any]]:
         reason = parsed.get("reason", "llm classified")
         intent = TOOL_TO_INTENT.get(tool, 7)
 
-        logger.info("LLM router → tool=%s intent=%d reason=%s", tool, intent, reason)
-        return {"intent": intent, "tool": tool, "reason": reason, "source": "llm"}
+        logger.info("[FALLBACK] Legacy LLM router → tool=%s intent=%d reason=%s", tool, intent, reason)
+        return {"intent": intent, "tool": tool, "reason": reason, "source": "llm_fallback"}
 
     except json.JSONDecodeError as exc:
-        logger.warning("LLM router returned non-JSON: %s | raw=%s", exc, raw[:200])
+        logger.warning("Legacy LLM router returned non-JSON: %s", exc)
         return None
     except Exception as exc:
-        logger.error("LLM router error: %s", exc)
+        logger.error("Legacy LLM router error: %s", exc)
         return None
+
+
+def classify_intent_for_chat(
+    message: str,
+    context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Main entry point for chat intent classification.
+
+    Routing order:
+        1. LangChain ToolCallingAgent (PRIMARY)
+        2. Legacy LLM JSON router (FALLBACK if LangChain fails)
+
+    NOTE — KEYWORD ROUTER:
+        The keyword-based classify_intent() from conversational_intents.py
+        is PRESERVED but commented out as primary router below.
+        To re-enable keyword routing as first pass, uncomment the block below.
+    """
+
+    # ── [LEGACY KEYWORD ROUTER — uncomment to re-enable as primary] ──────
+    # This was the original routing layer — fast, free, but brittle.
+    # Uncomment the lines below to restore keyword matching as Layer 1.
+    #
+    # from agent.conversational_intents import classify_intent as _kw_classify
+    # kw_result = _kw_classify(message, context)
+    # if kw_result is not None:
+    #     logger.info("[KEYWORD] Matched intent=%d reason=%s", kw_result["intent"], kw_result.get("reason"))
+    #     return kw_result
+    # ── end keyword router block ──────────────────────────────────────────
+
+    # ── [LAYER 1] LangChain ToolCallingAgent (PRIMARY) ────────────────────
+    try:
+        from agent.langchain_tool_router import classify_intent_via_langchain  # type: ignore
+        result = classify_intent_via_langchain(message, context)
+        if result is not None:
+            logger.info(
+                "[LANGCHAIN] ToolCallingAgent → intent=%d source=%s",
+                result.get("intent", -1),
+                result.get("source", ""),
+            )
+            return result
+    except Exception as exc:
+        logger.warning("[LANGCHAIN] ToolCallingAgent failed, falling back: %s", exc)
+
+    # ── [LAYER 2] Legacy LLM JSON router (FALLBACK) ───────────────────────
+    logger.info("[FALLBACK] LangChain unavailable — using legacy LLM JSON router.")
+    return llm_classify_intent(message)
 
 
 def get_out_of_scope_reply() -> str:
