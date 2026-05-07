@@ -51,7 +51,7 @@ def load_session(session_id: str) -> Dict[str, Any]:
     try:
         row = conn.execute("SELECT payload_json FROM sessions WHERE session_id = ?", (sid,)).fetchone()
         if not row:
-            return {"session_id": sid, "created_at": now, "updated_at": now, "messages": [], "context": {}}
+            return {"session_id": sid, "created_at": now, "updated_at": now, "messages": [], "context": {"last_step": "awaiting_source_selection"}}
         try:
             data = json.loads(row[0])
             if not isinstance(data, dict):
@@ -59,9 +59,11 @@ def load_session(session_id: str) -> Dict[str, Any]:
             data.setdefault("session_id", sid)
             data.setdefault("messages", [])
             data.setdefault("context", {})
+            # Ensure last_step is always present
+            data["context"].setdefault("last_step", "awaiting_source_selection")
             return data
         except Exception:
-            return {"session_id": sid, "created_at": now, "updated_at": now, "messages": [], "context": {}}
+            return {"session_id": sid, "created_at": now, "updated_at": now, "messages": [], "context": {"last_step": "awaiting_source_selection"}}
     finally:
         conn.close()
 
@@ -69,12 +71,28 @@ def load_session(session_id: str) -> Dict[str, Any]:
 def save_session(session: Dict[str, Any]) -> None:
     sid = (session.get("session_id") or "default").strip() or "default"
     now = time.time()
-    session["session_id"] = sid
-    session.setdefault("created_at", now)
-    session["updated_at"] = now
-    payload = json.dumps(session, ensure_ascii=False, default=str)
+
+    # --- FIX: Deep-merge context so individual keys set by nodes are never lost ---
     conn = _connect()
     try:
+        existing_row = conn.execute(
+            "SELECT payload_json FROM sessions WHERE session_id = ?", (sid,)
+        ).fetchone()
+        if existing_row:
+            try:
+                existing = json.loads(existing_row[0])
+                existing_ctx = existing.get("context") if isinstance(existing, dict) else {}
+                if isinstance(existing_ctx, dict):
+                    new_ctx = session.get("context") or {}
+                    # new_ctx wins on conflict, but existing keys are preserved
+                    session["context"] = {**existing_ctx, **new_ctx}
+            except Exception:
+                pass
+
+        session["session_id"] = sid
+        session.setdefault("created_at", now)
+        session["updated_at"] = now
+        payload = json.dumps(session, ensure_ascii=False, default=str)
         conn.execute(
             """
             INSERT INTO sessions(session_id, created_at, updated_at, payload_json)
@@ -107,7 +125,6 @@ def list_sessions(*, limit: int = 50) -> List[Dict[str, Any]]:
                 title = payload.get("title") if isinstance(payload, dict) else None
                 msgs = payload.get("messages") if isinstance(payload, dict) else None
                 if isinstance(msgs, list) and msgs:
-                    # pick last user message as preview
                     for m in reversed(msgs):
                         if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
                             last = str(m.get("content"))
@@ -120,7 +137,7 @@ def list_sessions(*, limit: int = 50) -> List[Dict[str, Any]]:
                     "created_at": created_at,
                     "updated_at": updated_at,
                     "title": title,
-                    "preview": (last[:120] + "…") if last and len(last) > 120 else last,
+                    "preview": (last[:120] + "\u2026") if last and len(last) > 120 else last,
                 }
             )
         return out
@@ -178,4 +195,3 @@ def list_recent_experiences(*, session_id: str, limit: int = 12) -> List[Dict[st
         return out
     finally:
         conn.close()
-
