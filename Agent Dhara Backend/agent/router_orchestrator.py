@@ -2,11 +2,14 @@
 Router Orchestrator — unified entry point for all intent routing.
 
 Layered routing strategy:
-  Layer 1 → Adversarial / safety guard        (rule-based, unbypassable)
-  Layer 1b→ Code generation guard             (rule-based, unbypassable)
-  Layer 2 → Keyword matching                  (existing code, free, 0ms)
-  Layer 3 → LLM Router                        (fallback, ~100-150 tokens)
-  Layer 4 → Final fallback                    (return None)
+  Layer 1  → Adversarial / safety guard        (rule-based, unbypassable)
+  Layer 1b → Code generation guard             (rule-based, unbypassable)
+  Layer 1c → General OOD keyword guard         (rule-based)
+  Layer 2a → Primary keyword classifier        (existing code, free, 0ms)
+  Layer 2b → Fallback keyword heuristics       (free, 0ms)
+  Layer 3  → LangChain ToolCallingAgent        (PRIMARY agentic router, ~100 tokens)
+             └─ Falls back to legacy LLM JSON router if LangChain unavailable
+  Layer 4  → Final fallback (return None)
 
 Usage:
     from agent.router_orchestrator import route_message
@@ -22,7 +25,7 @@ from agent.conversational_intents import (
     _is_adversarial,
     _is_ood,
 )
-from agent.llm_router import llm_classify_intent
+from agent.llm_router import classify_intent_for_chat
 from agent.agent_system_prompt import OUT_OF_SCOPE_REPLY, ADVERSARIAL_REPLY
 
 logger = logging.getLogger(__name__)
@@ -119,13 +122,15 @@ def route_message(
         logger.info("Router: keyword fallback → intent=%d", result.get("intent"))
         return result
 
-    # ── Layer 3: LLM Router (fires only on keyword miss) ─────────────────────
+    # ── Layer 3: Agentic LLM Router (fires only on keyword miss) ─────────────
+    # Uses LangChain ToolCallingAgent as primary; legacy JSON router as fallback.
+    # ~100-150 tokens per call. NEVER sends raw dataset rows to the LLM.
     if use_llm_fallback:
-        logger.info("Router: keyword missed → calling LLM router for: %s", message[:80])
-        result = llm_classify_intent(message)
+        logger.info("Router: keyword missed → calling agentic LLM router for: %s", message[:80])
+        result = classify_intent_for_chat(message, context)
         if result:
-            if result.get("tool") == "none":
-                result["reply"] = OUT_OF_SCOPE_REPLY
+            if result.get("tool") == "none" or result.get("intent") == 7:
+                result.setdefault("reply", OUT_OF_SCOPE_REPLY)
             return result
 
     # ── Layer 4: No match ────────────────────────────────────────────────────
